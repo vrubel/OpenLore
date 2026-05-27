@@ -475,7 +475,7 @@ export class OpenSpecFormatGenerator {
         for (const sub of service.subSpecs) {
           lines.push(`### Sub-component: ${this.formatRequirementName(sub.name)}`);
           lines.push('');
-          lines.push(`> Implements: \`${sub.callee}\``);
+          lines.push(t('spec.implementsHint', { callee: sub.callee }));
           lines.push('');
           lines.push(sub.purpose);
           lines.push('');
@@ -842,7 +842,7 @@ export class OpenSpecFormatGenerator {
       const order = { llm: 0, semantic: 1, heuristic: 2 };
       return (order[a.confidence] ?? 3) - (order[b.confidence] ?? 3);
     })[0];
-    lines.push(`> Implementation: \`${best.name}\` in \`${best.file}\` · confidence: ${best.confidence}`);
+    lines.push(t('spec.implementationHint', { name: best.name, file: best.file, confidence: best.confidence }));
     lines.push('');
   }
 
