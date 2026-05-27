@@ -8,6 +8,7 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import logger from '../../utils/logger.js';
+import { llmLanguageDirective } from '../../utils/i18n.js';
 import {
   CLAUDE_MAX_CONTEXT_TOKENS,
   CLAUDE_MAX_OUTPUT_TOKENS,
@@ -1593,6 +1594,13 @@ export class LLMService {
    * Generate a completion with retry logic
    */
   async complete(request: CompletionRequest): Promise<CompletionResponse> {
+    // i18n: force the output language for generated prose (no-op for default English).
+    // The directive itself keeps code identifiers / paths / RFC-2119 keywords in English.
+    const languageDirective = llmLanguageDirective();
+    if (languageDirective) {
+      request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${languageDirective}` };
+    }
+
     // Pre-calculate tokens and warn if approaching limit
     const inputTokens = this.countTokens(request.systemPrompt + request.userPrompt);
     const maxTokens = request.maxTokens ?? this.provider.maxOutputTokens;

@@ -46,6 +46,7 @@ import { panicCalibrateCommand } from './commands/panic-calibrate.js';
 import { panicReplayCommand } from './commands/panic-replay.js';
 import { gryphWatchCommand } from './commands/gryph-watch.js';
 import { configureLogger } from '../utils/logger.js';
+import { setLocale } from '../utils/i18n.js';
 
 // Read version from package.json at runtime so it never drifts from the published version
 const require = createRequire(import.meta.url);
@@ -63,6 +64,9 @@ program.hook('preAction', (thisCommand) => {
     noColor: opts.color === false,
     timestamps: process.env.CI === 'true' || opts.color === false,
   });
+
+  // Output language for generated docs/prose (default 'en' → unchanged behavior).
+  setLocale(opts.lang);
 
   // Warn when SSL verification is disabled — it's a security trade-off
   if (opts.insecure) {
@@ -95,6 +99,7 @@ program
   )
   .option('--insecure', 'Disable SSL certificate verification (for internal/self-signed certs)')
   .option('--timeout <ms>', 'LLM request timeout in milliseconds (default: 120000)', parseInt)
+  .option('--lang <code>', 'Language for generated documentation/prose: en, ru', 'en')
   .addHelpText(
     'after',
     `
