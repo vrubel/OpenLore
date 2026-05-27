@@ -30,6 +30,7 @@ import type { SchemaTable } from './schema-extractor.js';
 import type { RouteInventory } from './http-route-parser.js';
 import type { MiddlewareEntry } from './middleware-extractor.js';
 import type { EnvVar } from './env-extractor.js';
+import { t } from '../../utils/i18n.js';
 
 /**
  * Heuristic to detect test/spec files across languages.
@@ -792,36 +793,36 @@ export class AnalysisArtifactGenerator {
     const lines: string[] = [];
 
     // Header
-    lines.push(`# Repository Analysis: ${repoMap.metadata.projectName}`);
+    lines.push(t('summary.title', { name: repoMap.metadata.projectName }));
     lines.push('');
 
     // Overview
-    lines.push('## Overview');
-    lines.push(`- **Type**: ${this.formatProjectTypeReadable(repoMap.metadata.projectType)}`);
+    lines.push(t('summary.overview'));
+    lines.push(t('summary.fieldType', { value: this.formatProjectTypeReadable(repoMap.metadata.projectType) }));
     if (repoMap.summary.frameworks.length > 0) {
-      lines.push(`- **Frameworks**: ${repoMap.summary.frameworks.map(f => f.name).join(', ')}`);
+      lines.push(t('summary.fieldFrameworks', { value: repoMap.summary.frameworks.map(f => f.name).join(', ') }));
     }
-    lines.push(`- **Files Analyzed**: ${repoMap.summary.analyzedFiles} of ${repoMap.summary.totalFiles} (${repoMap.summary.skippedFiles} skipped)`);
-    lines.push(`- **Analysis Date**: ${repoMap.metadata.analyzedAt}`);
+    lines.push(t('summary.fieldFilesAnalyzed', { analyzed: repoMap.summary.analyzedFiles, total: repoMap.summary.totalFiles, skipped: repoMap.summary.skippedFiles }));
+    lines.push(t('summary.fieldAnalysisDate', { date: repoMap.metadata.analyzedAt }));
     lines.push('');
 
     // Architecture
-    lines.push('## Architecture Pattern');
-    lines.push(`This appears to be a **${repoStructure.architecture.pattern}** architecture.`);
+    lines.push(t('summary.architecturePattern'));
+    lines.push(t('summary.architecturePatternProse', { pattern: repoStructure.architecture.pattern }));
     if (repoStructure.architecture.layers.length > 0) {
       lines.push('');
-      lines.push('**Detected Layers:**');
+      lines.push(t('summary.detectedLayersLabel'));
       for (const layer of repoStructure.architecture.layers) {
-        lines.push(`- ${layer.name}: ${layer.purpose} (${layer.files.length} files)`);
+        lines.push(t('summary.layerLine', { name: layer.name, purpose: layer.purpose, count: layer.files.length }));
       }
     }
     lines.push('');
 
     // Languages
     if (repoMap.summary.languages.length > 0) {
-      lines.push('## Language Breakdown');
-      lines.push('| Language | Files | Percentage |');
-      lines.push('|----------|-------|------------|');
+      lines.push(t('summary.languageBreakdown'));
+      lines.push(t('summary.languageTableHeader'));
+      lines.push(t('summary.languageTableSep'));
       for (const lang of repoMap.summary.languages.slice(0, 5)) {
         lines.push(`| ${lang.language} | ${lang.fileCount} | ${lang.percentage.toFixed(1)}% |`);
       }
@@ -830,11 +831,11 @@ export class AnalysisArtifactGenerator {
 
     // Domains
     if (repoStructure.domains.length > 0) {
-      lines.push('## Detected Domains');
-      lines.push('These domains will become OpenSpec specifications:');
+      lines.push(t('summary.detectedDomains'));
+      lines.push(t('summary.detectedDomainsProse'));
       lines.push('');
-      lines.push('| Domain | Files | Key Entities | Spec Path |');
-      lines.push('|--------|-------|--------------|-----------|');
+      lines.push(t('summary.domainsTableHeader'));
+      lines.push(t('summary.domainsTableSep'));
       for (const domain of repoStructure.domains.slice(0, 10)) {
         const entities = domain.entities.slice(0, 3).join(', ') || '-';
         lines.push(`| ${domain.name} | ${domain.files.length} | ${entities} | \`${domain.suggestedSpecPath}\` |`);
@@ -843,18 +844,18 @@ export class AnalysisArtifactGenerator {
     }
 
     // Dependency insights
-    lines.push('## Dependency Insights');
+    lines.push(t('summary.dependencyInsights'));
 
     // Most connected
     const topConnected = depGraph.rankings.byConnectivity.slice(0, 3);
     if (topConnected.length > 0) {
       lines.push('');
-      lines.push('**Most Connected Files:**');
+      lines.push(t('summary.mostConnectedLabel'));
       for (const nodeId of topConnected) {
         const node = depGraph.nodes.find(n => n.id === nodeId);
         if (node) {
           const totalDegree = node.metrics.inDegree + node.metrics.outDegree;
-          lines.push(`- \`${node.file.path}\` (${totalDegree} connections)`);
+          lines.push(`- \`${node.file.path}\` ${t('summary.connectionsSuffix', { count: totalDegree })}`);
         }
       }
     }
@@ -862,7 +863,7 @@ export class AnalysisArtifactGenerator {
     // Cycles
     if (depGraph.cycles.length > 0) {
       lines.push('');
-      lines.push(`**Circular Dependencies**: ${depGraph.cycles.length} cycle(s) detected`);
+      lines.push(t('summary.circularDeps', { count: depGraph.cycles.length }));
       for (const cycle of depGraph.cycles.slice(0, 3)) {
         const cycleFiles = cycle.map(id => {
           const node = depGraph.nodes.find(n => n.id === id);
@@ -875,48 +876,48 @@ export class AnalysisArtifactGenerator {
     // HTTP cross-language edges
     if (depGraph.statistics.httpEdgeCount > 0) {
       lines.push('');
-      lines.push(`**HTTP Cross-Language Edges**: ${depGraph.statistics.httpEdgeCount} edge(s) detected between JS/TS callers and Python route handlers`);
-      lines.push(`  (${depGraph.statistics.importEdgeCount} static import edges + ${depGraph.statistics.httpEdgeCount} HTTP edges = ${depGraph.statistics.edgeCount} total)`);
+      lines.push(t('summary.httpEdges', { count: depGraph.statistics.httpEdgeCount }));
+      lines.push(t('summary.httpEdgesBreakdown', { importEdges: depGraph.statistics.importEdgeCount, httpEdges: depGraph.statistics.httpEdgeCount, total: depGraph.statistics.edgeCount }));
     }
 
     // Orphans
     if (depGraph.rankings.orphanNodes.length > 0) {
       lines.push('');
-      lines.push(`**Orphan Files**: ${depGraph.rankings.orphanNodes.length} file(s) with no imports or exports`);
+      lines.push(t('summary.orphanFiles', { count: depGraph.rankings.orphanNodes.length }));
     }
     lines.push('');
 
     // Top files
-    lines.push('## Files Selected for Deep Analysis');
-    lines.push('The following files were selected as most significant:');
+    lines.push(t('summary.filesForDeepAnalysis'));
+    lines.push(t('summary.filesForDeepAnalysisProse'));
     lines.push('');
     const topFiles = repoMap.highValueFiles.slice(0, 15);
     for (let i = 0; i < topFiles.length; i++) {
       const file = topFiles[i];
       const tags = file.tags.length > 0 ? ` - ${file.tags.join(', ')}` : '';
-      lines.push(`${i + 1}. \`${file.path}\` (score: ${file.score})${tags}`);
+      lines.push(t('summary.fileScoreLine', { index: i + 1, path: file.path, score: file.score, tags }));
     }
     lines.push('');
 
     // Recommendations
-    lines.push('## Recommendations');
+    lines.push(t('summary.recommendations'));
     const recommendations: string[] = [];
 
     if (depGraph.cycles.length > 0) {
-      recommendations.push(`- Consider breaking the ${depGraph.cycles.length} circular dependency cycle(s)`);
+      recommendations.push(t('summary.recBreakCycles', { count: depGraph.cycles.length }));
     }
     if (depGraph.rankings.orphanNodes.length > 0) {
-      recommendations.push(`- Review ${depGraph.rankings.orphanNodes.length} orphan file(s) that may be unused`);
+      recommendations.push(t('summary.recReviewOrphans', { count: depGraph.rankings.orphanNodes.length }));
     }
     if (depGraph.rankings.bridgeNodes.length > 0) {
-      recommendations.push(`- The following files are critical bridges: ${depGraph.rankings.bridgeNodes.slice(0, 3).map(id => {
+      recommendations.push(t('summary.recCriticalBridges', { value: depGraph.rankings.bridgeNodes.slice(0, 3).map(id => {
         const node = depGraph.nodes.find(n => n.id === id);
         return node ? `\`${basename(node.file.path)}\`` : '';
-      }).filter(Boolean).join(', ')}`);
+      }).filter(Boolean).join(', ') }));
     }
 
     if (recommendations.length === 0) {
-      recommendations.push('- No immediate architectural concerns detected');
+      recommendations.push(t('summary.recNoConcerns'));
     }
 
     for (const rec of recommendations) {
@@ -930,8 +931,8 @@ export class AnalysisArtifactGenerator {
       for (const c of repoStructure.uiComponents) {
         byFramework[c.framework] = (byFramework[c.framework] ?? 0) + 1;
       }
-      lines.push('## UI Components');
-      lines.push(`**Total**: ${repoStructure.uiComponents.length} component(s)`);
+      lines.push(t('summary.uiComponents'));
+      lines.push(t('summary.uiComponentsTotal', { count: repoStructure.uiComponents.length }));
       for (const [fw, count] of Object.entries(byFramework)) {
         lines.push(`- ${fw}: ${count}`);
       }
@@ -941,13 +942,13 @@ export class AnalysisArtifactGenerator {
     // ── Database Schemas ──────────────────────────────────────────────────────
     if (repoStructure.schemas.length > 0) {
       const byOrm: Record<string, number> = {};
-      for (const t of repoStructure.schemas) {
-        byOrm[t.orm] = (byOrm[t.orm] ?? 0) + 1;
+      for (const tbl of repoStructure.schemas) {
+        byOrm[tbl.orm] = (byOrm[tbl.orm] ?? 0) + 1;
       }
-      lines.push('## Database Schemas');
-      lines.push(`**Total tables/models**: ${repoStructure.schemas.length}`);
+      lines.push(t('summary.databaseSchemas'));
+      lines.push(t('summary.databaseSchemasTotal', { count: repoStructure.schemas.length }));
       for (const [orm, count] of Object.entries(byOrm)) {
-        lines.push(`- ${orm}: ${count} model(s)`);
+        lines.push(t('summary.ormModelLine', { orm, count }));
       }
       lines.push('');
     }
@@ -955,35 +956,35 @@ export class AnalysisArtifactGenerator {
     // ── Route Inventory ───────────────────────────────────────────────────────
     if (repoStructure.routeInventory.total > 0) {
       const inv = repoStructure.routeInventory;
-      lines.push('## API Routes');
-      lines.push(`**Total routes**: ${inv.total}`);
+      lines.push(t('summary.apiRoutes'));
+      lines.push(t('summary.apiRoutesTotal', { count: inv.total }));
       const methodSummary = Object.entries(inv.byMethod)
         .sort((a, b) => b[1] - a[1])
         .map(([m, n]) => `${m}: ${n}`)
         .join(', ');
-      if (methodSummary) lines.push(`- By method: ${methodSummary}`);
+      if (methodSummary) lines.push(t('summary.byMethod', { value: methodSummary }));
       const frameworkSummary = Object.entries(inv.byFramework)
         .sort((a, b) => b[1] - a[1])
         .map(([f, n]) => `${f}: ${n}`)
         .join(', ');
-      if (frameworkSummary) lines.push(`- By framework: ${frameworkSummary}`);
+      if (frameworkSummary) lines.push(t('summary.byFramework', { value: frameworkSummary }));
       lines.push('');
     }
 
     // ── Environment Variables ─────────────────────────────────────────────────
     if (repoStructure.envVars.length > 0) {
-      lines.push('## Environment Variables');
-      lines.push(`**Total**: ${repoStructure.envVars.length} variable(s)`);
+      lines.push(t('summary.environmentVariables'));
+      lines.push(t('summary.environmentVariablesTotal', { count: repoStructure.envVars.length }));
       const required = repoStructure.envVars.filter(v => v.required);
       if (required.length > 0) {
-        lines.push(`- Required (no default): ${required.map(v => v.name).join(', ')}`);
+        lines.push(t('summary.requiredNoDefault', { value: required.map(v => v.name).join(', ') }));
       }
       lines.push('');
     }
 
     // Footer
     lines.push('---');
-    lines.push(`*Generated by openlore v${repoMap.metadata.version}*`);
+    lines.push(t('summary.footer', { version: repoMap.metadata.version }));
 
     return lines.join('\n');
   }
