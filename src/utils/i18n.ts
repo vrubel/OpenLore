@@ -58,6 +58,26 @@ export function llmLanguageDirective(): string {
   return LLM_DIRECTIVES[currentLocale];
 }
 
+/**
+ * Directive appended to LLM system prompts that injects project-specific
+ * Gherkin authoring rules. The rules themselves are read from the
+ * `PDLC_GHERKIN_RULES` environment variable (the PDLC control plane reads the
+ * rules file and forwards its contents in env for the child process). When the
+ * env var is empty or unset the function returns `""` and nothing is injected,
+ * so behavior is unchanged unless a host explicitly opts in.
+ */
+export function llmGherkinDirective(): string {
+  const rules = process.env.PDLC_GHERKIN_RULES;
+  if (!rules) return '';
+  return (
+    'When generating Gherkin scenarios (#### Scenario: blocks with GIVEN/WHEN/THEN steps), ' +
+    'follow these project-specific authoring rules verbatim:\n\n' +
+    '---\n' +
+    rules +
+    '\n---'
+  );
+}
+
 // ============================================================================
 // STRING TABLE (hardcoded Markdown literals emitted into generated docs)
 // ============================================================================

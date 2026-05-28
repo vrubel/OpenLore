@@ -8,7 +8,7 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import logger from '../../utils/logger.js';
-import { llmLanguageDirective } from '../../utils/i18n.js';
+import { llmGherkinDirective, llmLanguageDirective } from '../../utils/i18n.js';
 import {
   CLAUDE_MAX_CONTEXT_TOKENS,
   CLAUDE_MAX_OUTPUT_TOKENS,
@@ -1566,6 +1566,12 @@ export class LLMService {
     const languageDirective = llmLanguageDirective();
     if (languageDirective) {
       request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${languageDirective}` };
+    }
+
+    // PDLC: project-specific Gherkin authoring rules (no-op when env unset).
+    const gherkinDirective = llmGherkinDirective();
+    if (gherkinDirective) {
+      request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${gherkinDirective}` };
     }
 
     // Pre-calculate tokens and warn if approaching limit
