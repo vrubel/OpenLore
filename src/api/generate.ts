@@ -129,7 +129,7 @@ export async function openloreGenerate(options: GenerateApiOptions = {}): Promis
   const geminiKey = process.env.GEMINI_API_KEY;
 
   const configuredProvider = options.provider ?? openloreConfig.generation.provider;
-  const noKeyProviders = ['claude-code', 'mistral-vibe', 'copilot', 'gemini-cli', 'cursor-agent'];
+  const noKeyProviders = ['claude-code', 'mistral-vibe', 'copilot', 'gemini-cli', 'cursor-agent', 'gigacode'];
 
   if (!noKeyProviders.includes(configuredProvider ?? '') && !anthropicKey && !openaiKey && !openaiCompatKey && !geminiKey) {
     throw new Error(
@@ -154,6 +154,7 @@ export async function openloreGenerate(options: GenerateApiOptions = {}): Promis
     'mistral-vibe': 'mistral-vibe',
     'gemini-cli': 'gemini-cli',
     'cursor-agent': 'cursor-agent',
+    'gigacode': 'gigacode',
   };
   const effectiveModel = options.model || openloreConfig.generation.model || defaultModels[effectiveProvider];
 
