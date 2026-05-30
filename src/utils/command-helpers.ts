@@ -63,7 +63,7 @@ export function parseList(value: string): string[] {
   return value.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'gemini' | 'claude-code' | 'mistral-vibe' | 'copilot' | 'gemini-cli' | 'cursor-agent' | 'gigacode';
+export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'gemini' | 'claude-code' | 'mistral-vibe' | 'copilot' | 'gemini-cli' | 'cursor-agent' | 'gigacode' | 'qwen';
 
 /**
  * Resolve the LLM provider and base URL from environment variables.
@@ -82,7 +82,7 @@ export function resolveLLMProvider(openloreConfig?: {
   const configProvider = openloreConfig?.generation?.provider as ProviderName | undefined;
 
   // These providers don't need an API key
-  if (configProvider === 'claude-code' || configProvider === 'mistral-vibe' || configProvider === 'copilot' || configProvider === 'gemini-cli' || configProvider === 'cursor-agent' || configProvider === 'gigacode') {
+  if (configProvider === 'claude-code' || configProvider === 'mistral-vibe' || configProvider === 'copilot' || configProvider === 'gemini-cli' || configProvider === 'cursor-agent' || configProvider === 'gigacode' || configProvider === 'qwen') {
     return { provider: configProvider };
   }
 

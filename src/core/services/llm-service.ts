@@ -186,6 +186,76 @@ export class GigaCodeProvider implements LLMProvider {
 }
 
 // ============================================================================
+// QWEN PROVIDER (uses local `qwen` CLI, no API key required)
+// ============================================================================
+
+/**
+ * Qwen CLI provider
+ *
+ * Routes LLM calls through the local `qwen` CLI binary. Identical to GigaCodeProvider
+ * except the binary + flags: qwen needs `--output-format text` for a non-interactive
+ * plain-text answer (the same invocation PDLC uses for commit-message generation),
+ * whereas gigacode is bare. No API key — model/auth come from qwen's host config
+ * (~/.qwen). Set QWEN_CLI to override the binary path.
+ */
+export class QwenProvider implements LLMProvider {
+  name = 'qwen';
+  maxContextTokens = CLAUDE_MAX_CONTEXT_TOKENS;
+  maxOutputTokens = CLAUDE_MAX_OUTPUT_TOKENS;
+  private model: string | undefined;
+
+  constructor(model?: string) {
+    // Ignore the sentinel 'qwen' string — qwen picks its model from its host config.
+    this.model = model && model !== 'qwen' ? model : undefined;
+  }
+
+  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+    const { execFileSync } = await import('child_process');
+
+    // qwen reads the prompt from STDIN; `--output-format text` makes it print a plain
+    // text answer non-interactively (no --yolo: the provider only needs an answer, not
+    // tool/file execution). Combine system + user prompts.
+    const fullPrompt = request.systemPrompt
+      ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
+      : request.userPrompt;
+
+    // Use QWEN_CLI if set (install not on PATH), else 'qwen'.
+    const qwenBin = process.env.QWEN_CLI ?? 'qwen';
+
+    let raw: string;
+    try {
+      raw = execFileSync(qwenBin, ['--output-format', 'text'], {
+        input: fullPrompt,
+        encoding: 'utf8',
+        maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
+        timeout: LLM_CLI_TIMEOUT_MS,
+      });
+    } catch (err: unknown) {
+      const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
+      const detail = e.stderr ?? e.stdout ?? e.message ?? String(err);
+      throw Object.assign(new Error(`qwen CLI failed: ${detail}`), { retryable: false });
+    }
+
+    // qwen prints plain text (no JSON envelope). Take stdout verbatim; the upper layer
+    // (LLMService.completeJSON) strips ```-fences and extracts/validates JSON.
+    const content = (raw ?? '').trim();
+    const inputTokens = estimateTokens(fullPrompt);
+    const outputTokens = estimateTokens(content);
+
+    return {
+      content,
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      model: this.model ?? 'qwen',
+      finishReason: 'stop',
+    };
+  }
+
+  countTokens(text: string): number {
+    return estimateTokens(text);
+  }
+}
+
+// ============================================================================
 // MISTRAL VIBE PROVIDER (uses local `mistral-vibe` CLI, no API key required)
 // ============================================================================
 
@@ -327,7 +397,7 @@ export interface LLMProvider {
   maxOutputTokens: number;
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent' | 'gigacode';
+export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent' | 'gigacode' | 'qwen';
 
 /**
  * Token usage tracking
@@ -1983,8 +2053,10 @@ export function createLLMService(options: LLMServiceOptions = {}): LLMService {
     provider = new CursorAgentProvider(options.model);
   } else if (providerName === 'gigacode') {
     provider = new GigaCodeProvider(options.model);
+  } else if (providerName === 'qwen') {
+    provider = new QwenProvider(options.model);
   } else {
-    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, copilot, gemini, gemini-cli, claude-code, mistral-vibe, cursor-agent, gigacode`);
+    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, copilot, gemini, gemini-cli, claude-code, mistral-vibe, cursor-agent, gigacode, qwen`);
   }
 
   if (!sslVerify) {
