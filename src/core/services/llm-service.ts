@@ -339,7 +339,7 @@ export interface LLMProvider {
   maxOutputTokens: number;
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
+export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent' | 'gigacode';
 
 /**
  * Token usage tracking
