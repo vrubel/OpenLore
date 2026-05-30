@@ -361,7 +361,7 @@ Each spec.md follows OpenSpec conventions:
         logger.discovery('  OPENAI_API_KEY       → https://platform.openai.com/');
         logger.discovery('  GEMINI_API_KEY       → https://aistudio.google.com/');
         logger.discovery('  OPENAI_COMPAT_API_KEY + OPENAI_COMPAT_BASE_URL  → Mistral, Groq, Ollama...');
-        logger.discovery('  Or set provider to "claude-code", "gemini-cli", "mistral-vibe", "cursor-agent", or "copilot" (no API key needed).');
+        logger.discovery('  Or set provider to "claude-code", "gemini-cli", "mistral-vibe", "cursor-agent", "gigacode", or "copilot" (no API key needed).');
         process.exitCode = 1;
         return;
       }
@@ -379,6 +379,7 @@ Each spec.md follows OpenSpec conventions:
         'mistral-vibe': 'mistral-vibe',
         'gemini-cli': 'gemini-cli',
         'cursor-agent': 'cursor-agent',
+        'gigacode': 'gigacode',
       };
       const effectiveModel = opts.model || openloreConfig.generation.model || defaultModels[effectiveProvider];
 
