@@ -171,6 +171,9 @@ export class GigaCodeProvider implements LLMProvider {
         encoding: 'utf8',
         maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
         timeout: LLM_CLI_TIMEOUT_MS,
+        // Windows: the binary is a `.cmd` shim; execFileSync without a shell cannot
+        // resolve it (spawnSync ENOENT). shell:true lets the CMD resolver find it.
+        shell: process.platform === 'win32',
       });
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
@@ -241,6 +244,8 @@ export class QwenProvider implements LLMProvider {
         encoding: 'utf8',
         maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
         timeout: LLM_CLI_TIMEOUT_MS,
+        // Windows: `qwen` is a `.cmd` shim; execFileSync without a shell hits ENOENT.
+        shell: process.platform === 'win32',
       });
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
