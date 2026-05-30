@@ -8,7 +8,7 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import logger from '../../utils/logger.js';
-import { llmLanguageDirective } from '../../utils/i18n.js';
+import { llmGherkinDirective, llmLanguageDirective } from '../../utils/i18n.js';
 import {
   CLAUDE_MAX_CONTEXT_TOKENS,
   CLAUDE_MAX_OUTPUT_TOKENS,
@@ -105,6 +105,77 @@ export class ClaudeCodeProvider implements LLMProvider {
       content: parsed.result ?? '',
       usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
       model: this.model ?? 'claude-code',
+      finishReason: 'stop',
+    };
+  }
+
+  countTokens(text: string): number {
+    return estimateTokens(text);
+  }
+}
+
+// ============================================================================
+// GIGACODE PROVIDER (uses local `gigacode` CLI, no API key required)
+// ============================================================================
+
+/**
+ * GigaCode CLI provider
+ *
+ * Routes LLM calls through the local `gigacode` CLI binary. The prompt is fed via
+ * STDIN and the CLI's stdout is taken verbatim as the completion (plain text —
+ * gigacode does not emit a JSON envelope). JSON extraction/validation is handled by
+ * the upper LLMService layer (completeJSON). No API key required — authentication
+ * and model selection come from gigacode's own host config.
+ * If the binary is not on PATH, set GIGACODE_CLI to its full path.
+ */
+export class GigaCodeProvider implements LLMProvider {
+  name = 'gigacode';
+  maxContextTokens = CLAUDE_MAX_CONTEXT_TOKENS;
+  maxOutputTokens = CLAUDE_MAX_OUTPUT_TOKENS;
+  private model: string | undefined;
+
+  constructor(model?: string) {
+    // Ignore the sentinel 'gigacode' string — gigacode picks its model from its host config.
+    this.model = model && model !== 'gigacode' ? model : undefined;
+  }
+
+  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+    const { execFileSync } = await import('child_process');
+
+    // gigacode reads the whole prompt from STDIN (the same bare invocation PDLC uses
+    // for commit-message generation). Combine system + user prompts.
+    const fullPrompt = request.systemPrompt
+      ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
+      : request.userPrompt;
+
+    // Use GIGACODE_CLI if set (install not on PATH), else 'gigacode'. No flags: gigacode
+    // takes auth and model from its own host config.
+    const gigacodeBin = process.env.GIGACODE_CLI ?? 'gigacode';
+
+    let raw: string;
+    try {
+      raw = execFileSync(gigacodeBin, [], {
+        input: fullPrompt,
+        encoding: 'utf8',
+        maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
+        timeout: LLM_CLI_TIMEOUT_MS,
+      });
+    } catch (err: unknown) {
+      const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
+      const detail = e.stderr ?? e.stdout ?? e.message ?? String(err);
+      throw Object.assign(new Error(`gigacode CLI failed: ${detail}`), { retryable: false });
+    }
+
+    // gigacode prints plain text (no JSON envelope). Take stdout verbatim; the upper
+    // layer (LLMService.completeJSON) strips ```-fences and extracts/validates JSON.
+    const content = (raw ?? '').trim();
+    const inputTokens = estimateTokens(fullPrompt);
+    const outputTokens = estimateTokens(content);
+
+    return {
+      content,
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      model: this.model ?? 'gigacode',
       finishReason: 'stop',
     };
   }
@@ -256,7 +327,7 @@ export interface LLMProvider {
   maxOutputTokens: number;
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
+export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent' | 'gigacode';
 
 /**
  * Token usage tracking
@@ -1568,6 +1639,12 @@ export class LLMService {
       request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${languageDirective}` };
     }
 
+    // PDLC: project-specific Gherkin authoring rules (no-op when env unset).
+    const gherkinDirective = llmGherkinDirective();
+    if (gherkinDirective) {
+      request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${gherkinDirective}` };
+    }
+
     // Pre-calculate tokens and warn if approaching limit
     const inputTokens = this.countTokens(request.systemPrompt + request.userPrompt);
     const maxTokens = request.maxTokens ?? this.provider.maxOutputTokens;
@@ -1904,8 +1981,10 @@ export function createLLMService(options: LLMServiceOptions = {}): LLMService {
     provider = new GeminiCLIProvider(options.model);
   } else if (providerName === 'cursor-agent') {
     provider = new CursorAgentProvider(options.model);
+  } else if (providerName === 'gigacode') {
+    provider = new GigaCodeProvider(options.model);
   } else {
-    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, copilot, gemini, gemini-cli, claude-code, mistral-vibe, cursor-agent`);
+    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, copilot, gemini, gemini-cli, claude-code, mistral-vibe, cursor-agent, gigacode`);
   }
 
   if (!sslVerify) {
