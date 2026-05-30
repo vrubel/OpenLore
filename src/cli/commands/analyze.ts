@@ -243,7 +243,7 @@ export const analyzeCommand = new Command('analyze')
   )
   .option(
     '--ai-configs',
-    'Generate AI tool config files (.cursorrules, .clinerules/openlore.md, CLAUDE.md) if they do not already exist',
+    'Generate AI tool config files (.cursorrules, .clinerules/openlore.md, CLAUDE.md, QWEN.md, GIGACODE.md) if they do not already exist',
     false
   )
   .addHelpText(
@@ -685,7 +685,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
         console.log(`    └─ ${opts.output}CODEBASE.md`);
         console.log('');
         console.log('  Agent setup (one-time):');
-        console.log(`    Add to your CLAUDE.md or .clinerules:`);
+        console.log(`    Add to your agent context file (CLAUDE.md / QWEN.md / GIGACODE.md / AGENTS.md / .clinerules):`);
         console.log('');
         console.log(`    @.openlore/analysis/CODEBASE.md`);
         console.log('');
@@ -708,7 +708,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
         }
       } else {
         console.log('  Agent config files: not generated');
-        console.log('    Tip: Re-run with --ai-configs to generate CLAUDE.md, .cursorrules, AGENTS.md, etc.');
+        console.log('    Tip: Re-run with --ai-configs to generate context files (CLAUDE.md / QWEN.md / GIGACODE.md / .cursorrules / AGENTS.md), etc.');
       }
       console.log('');
 
