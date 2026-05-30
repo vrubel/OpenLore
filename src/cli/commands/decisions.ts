@@ -260,6 +260,8 @@ export async function installPreCommitHook(rootPath: string): Promise<void> {
   // Inject record_decision instructions into existing agent context files
   const agentFiles = [
     { path: join(rootPath, 'CLAUDE.md'), label: 'CLAUDE.md' },
+    { path: join(rootPath, 'QWEN.md'), label: 'QWEN.md' },
+    { path: join(rootPath, 'GIGACODE.md'), label: 'GIGACODE.md' },
     { path: join(rootPath, 'AGENTS.md'), label: 'AGENTS.md' },
     { path: join(rootPath, '.cursorrules'), label: '.cursorrules' },
     { path: join(rootPath, '.clinerules', 'openlore.md'), label: '.clinerules/openlore.md' },

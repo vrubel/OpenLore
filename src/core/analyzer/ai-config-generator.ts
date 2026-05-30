@@ -21,7 +21,7 @@ import { fileExists } from '../../utils/command-helpers.js';
 // ============================================================================
 
 /** Supported AI assistant targets */
-export type AiTool = 'claude' | 'cursor' | 'cline' | 'copilot' | 'windsurf' | 'vibe' | 'agents';
+export type AiTool = 'claude' | 'cursor' | 'cline' | 'copilot' | 'windsurf' | 'vibe' | 'agents' | 'qwen' | 'gigacode';
 
 export interface AiConfigOptions {
   /** Absolute path to the project root */
@@ -59,6 +59,8 @@ export const AI_TOOL_TARGETS: ToolTarget[] = [
   { tool: 'windsurf', label: 'Windsurf       (.windsurf/rules.md)',               rel: '.windsurf/rules.md',                     forClaude: false },
   { tool: 'vibe',    label: 'Mistral Vibe   (.vibe/skills/openlore.md)',          rel: '.vibe/skills/openlore.md',               forClaude: false },
   { tool: 'agents',  label: 'OpenAI Codex  (AGENTS.md)',                          rel: 'AGENTS.md',                              forClaude: false },
+  { tool: 'qwen',     label: 'Qwen Code      (QWEN.md)',                           rel: 'QWEN.md',                                forClaude: true  },
+  { tool: 'gigacode', label: 'GigaCode       (GIGACODE.md)',                       rel: 'GIGACODE.md',                            forClaude: true  },
 ];
 
 // ============================================================================
