@@ -378,7 +378,11 @@ const STRINGS_RU: Record<StringKey, string> = {
   'spec.sourceFiles': '> Исходные файлы: {value}',
   'spec.generatedBy': '> Сгенерировано openlore v{version}, {date}',
   'spec.confidence': '> Уверенность: {pct}%',
-  'spec.purpose': '## Назначение',
+  // Структурный заголовок: парсер/валидатор OpenSpec матчит «## Purpose» буквально
+  // (markdown-parser требует /^##\s+Purpose\s*$/). Как и SHALL/GIVEN/WHEN/THEN и
+  // «## Requirements» ниже — держим английским в ОБЕИХ колонках (см. шапку файла),
+  // иначе `openspec validate` падает с «Spec must have a Purpose section».
+  'spec.purpose': '## Purpose',
   'spec.domains': '## Домены',
   'spec.domainsIntro': 'Система разделена на следующие домены:',
   'spec.domainsTableHeader': '| Домен | Описание | Спецификация |',
