@@ -23,7 +23,8 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 // ============================================================================
@@ -1056,4 +1057,52 @@ describe('RIG-19 — MCP e2e integration on real openlore codebase', () => {
     const ok = await client.callTool('get_critical_hubs', { directory: REPO_ROOT, minFanIn: 10 });
     expect(ok.result?.isError).toBeFalsy();
   });
+});
+
+// ============================================================================
+// REGRESSION — stdout purity (MCP stdio transport owns stdout)
+// ============================================================================
+
+/**
+ * The stdio transport reserves stdout for JSON-RPC frames. A handler that logs
+ * via the shared logger (console.log → stdout) corrupts the protocol stream:
+ * observed in the wild as the qwen client failing with
+ * `SyntaxError: Unexpected token 'o', "[ok] Succes"... is not valid JSON`,
+ * then dropping the openlore tools after 3 health-check failures.
+ *
+ * This guard runs WITHOUT a pre-existing analysis cache (so it does not skip
+ * like RIG-19): it points analyze_codebase at a throwaway project, which runs
+ * the full analysis pipeline — the very code that logs `[scan]/[analyze]/[ok] …`.
+ * If any log line leaks onto stdout, McpClient.request's per-line JSON.parse
+ * throws before the assertion is reached. A well-formed JSON-RPC payload proves
+ * stdout stayed clean.
+ */
+describe('MCP stdout purity — logger must not corrupt the JSON-RPC stream', () => {
+  let client: McpClient;
+  let tmpDir: string;
+
+  beforeAll(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'openlore-mcp-stdout-'));
+    // A trivial but real project so analyze has something to scan and log about.
+    writeFileSync(
+      join(tmpDir, 'sample.ts'),
+      'export function add(a: number, b: number): number { return a + b; }\n' +
+      'export function mul(a: number, b: number): number { return add(a, 0) + a * (b - 1); }\n',
+    );
+    client = spawnServer();
+    await client.initialize();
+  }, 30_000);
+
+  afterAll(() => {
+    client?.kill();
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('analyze_codebase (which logs progress) keeps stdout pure JSON-RPC', async () => {
+    const resp = await client.callTool('analyze_codebase', { directory: tmpDir, force: true });
+    // Reaching here means every stdout line parsed as JSON-RPC — no leaked log lines.
+    // Accept either result or error: both are valid JSON-RPC; the bug manifests as a
+    // JSON.parse throw inside McpClient.request, never as a structured error response.
+    expect(resp.result ?? resp.error, 'no JSON-RPC payload — stdout may be polluted by logs').toBeDefined();
+  }, 60_000);
 });

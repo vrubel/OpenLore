@@ -1290,6 +1290,21 @@ interface McpServerOptions {
 }
 
 async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
+  // MCP stdio transport OWNS stdout: every byte written there must be a JSON-RPC frame.
+  // Any stray write to stdout corrupts the protocol stream and the client drops the response —
+  // observed in the wild: a handler's `logger.success(...)` emitted "[ok] …" on stdout and the
+  // qwen MCP client failed with `SyntaxError: Unexpected token 'o', "[ok] Succes"... is not valid JSON`,
+  // then dropped the openlore tools after 3 health-check failures. Route every console write to
+  // stderr (the logger uses console.log for non-errors; stray libs use console.*). The SDK's
+  // StdioServerTransport writes protocol frames via process.stdout.write directly, so it is untouched.
+  const toStderr = (...args: unknown[]): void => {
+    process.stderr.write(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
+  };
+  console.log = toStderr;
+  console.info = toStderr;
+  console.debug = toStderr;
+  console.warn = toStderr;   // console.error already goes to stderr — leave it
+
   const activeTools = options.minimal
     ? TOOL_DEFINITIONS.filter(t => MINIMAL_TOOLS.has(t.name))
     : TOOL_DEFINITIONS;
