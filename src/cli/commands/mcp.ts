@@ -21,9 +21,13 @@ import { createRequire } from 'node:module';
 const _require = createRequire(import.meta.url);
 const _pkgVersion = (_require('../../../package.json') as { version: string }).version;
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+
 import { Command } from 'commander';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   InitializeRequestSchema,
@@ -32,6 +36,7 @@ import {
   ErrorCode,
   LATEST_PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
+  isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   validateToolArgs,
@@ -1806,24 +1811,19 @@ interface McpServerOptions {
   watchNoEmbed?: boolean;
   minimal?: boolean;
   preset?: string;
+  // --- Streamable HTTP transport (remote MCP, для изолированных агентов без stdio-канала) ---
+  http?: boolean;       // включить HTTP-транспорт вместо stdio
+  host?: string;        // интерфейс прослушивания (default 127.0.0.1)
+  port?: string;        // порт (default 7787; '0' — эфемерный)
+  token?: string;       // опц. Bearer-токен (если задан — auth обязателен; для изолированного контура)
 }
 
-async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
-  // The MCP stdio transport uses stdout EXCLUSIVELY for the JSON-RPC stream.
-  // Any stray write to stdout — e.g. logger.success("Successfully validated
-  // directory…") from validateDirectory(), which runs on nearly every tool
-  // call — corrupts the protocol and can break strict clients. Route all
-  // console diagnostics to stderr. The SDK transport writes protocol messages
-  // via process.stdout.write directly, so it is unaffected, and logger.error
-  // already uses console.error (stderr).
-  const toStderr = (...args: unknown[]): void => {
-    process.stderr.write(args.map(a => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
-  };
-  console.log = toStderr;
-  console.info = toStderr;
-  console.warn = toStderr;
-  console.debug = toStderr;
-
+/**
+ * Собрать настроенный openlore MCP Server (ТРАНСПОРТ-АГНОСТИЧНО): те же tool-хендлеры, что у stdio.
+ * Каждый вызов = СВЕЖЕЕ per-connection состояние (tracker/agentName/autoWatcher в замыкании) — в HTTP
+ * session-режиме на каждую сессию поднимается свой Server, состояние сессий не пересекается.
+ */
+function buildOpenloreServer(options: McpServerOptions = {}): Server {
   const activeTools = selectActiveTools(TOOL_DEFINITIONS, { minimal: options.minimal, preset: options.preset });
 
   // Report the real package version in the MCP initialize handshake rather
@@ -2127,31 +2127,197 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
     }
   });
 
+  return server;
+}
+
+/** Запустить watcher для явного --watch <dir> (общий для stdio/http). watch-auto живёт в самом сервере. */
+async function maybeStartWatcher(options: McpServerOptions): Promise<void> {
+  if (!options.watch) return;
+  const { resolve } = await import('node:path');
+  const watchDir = resolve(options.watch);
+  // Don't start a second watcher when a daemon is already watching this
+  // directory — that's exactly the invariant this PR establishes.
+  // Check discover-only (spawn:false): --watch is an explicit opt-in; if the
+  // user also started a daemon, they want delegation, not two watchers racing.
+  const existingDaemon = await ensureServeDaemon(watchDir, { spawn: false });
+  if (existingDaemon) return;
+  const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
+  const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
+  const watcher = new McpWatcher({
+    rootPath: watchDir,
+    debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
+    embed: !options.watchNoEmbed,
+  });
+  await watcher.start();
+  const cleanup = () => watcher.stop().then(() => process.exit(0));
+  process.on('SIGINT',  cleanup);
+  process.on('SIGTERM', cleanup);
+}
+
+/**
+ * stdio-транспорт (по умолчанию, для встроенных в редактор MCP-клиентов). stdout ПРИНАДЛЕЖИТ протоколу:
+ * каждый байт там — JSON-RPC-фрейм. Любой посторонний вывод в stdout рушит поток и клиент роняет ответ —
+ * наблюдалось: `logger.success(...)` напечатал "[ok] …" в stdout, qwen-клиент упал с
+ * `SyntaxError: Unexpected token 'o', "[ok] Succes"...` и выбросил openlore-инструменты после 3 health-check.
+ * Перенаправляем весь console-вывод в stderr (logger использует console.log для не-ошибок; чужие либы — console.*).
+ * SDK StdioServerTransport пишет фреймы через process.stdout.write напрямую — он не затронут.
+ */
+async function startStdioMcpServer(options: McpServerOptions = {}): Promise<void> {
+  const toStderr = (...args: unknown[]): void => {
+    process.stderr.write(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
+  };
+  console.log = toStderr;
+  console.info = toStderr;
+  console.debug = toStderr;
+  console.warn = toStderr;   // console.error already goes to stderr — leave it
+
+  const server = buildOpenloreServer(options);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  await maybeStartWatcher(options);
+}
 
-  if (options.watch) {
-    const { resolve } = await import('node:path');
-    const watchDir = resolve(options.watch);
-    // Don't start a second watcher when a daemon is already watching this
-    // directory — that's exactly the invariant this PR establishes.
-    // Check discover-only (spawn:false): --watch is an explicit opt-in; if the
-    // user also started a daemon, they want delegation, not two watchers racing.
-    const existingDaemon = await ensureServeDaemon(watchDir, { spawn: false });
-    if (!existingDaemon) {
-      const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
-      const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
-      const watcher = new McpWatcher({
-        rootPath: watchDir,
-        debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
-        embed: !options.watchNoEmbed,
-      });
-      await watcher.start();
-      const cleanup = () => watcher.stop().then(() => process.exit(0));
-      process.on('SIGINT',  cleanup);
-      process.on('SIGTERM', cleanup);
-    }
+/** Константно-временное сравнение Bearer-заголовка с ожидаемым токеном (без timing-side-channel). */
+function bearerOk(authHeader: string | undefined, token: string): boolean {
+  const expected = Buffer.from(`Bearer ${token}`);
+  const received = Buffer.from(authHeader ?? '');
+  return expected.length === received.length && timingSafeEqual(expected, received);
+}
+
+/**
+ * Streamable HTTP-транспорт (REMOTE MCP) — для ИЗОЛИРОВАННЫХ агентов: дерево/анализ остаются в зоне
+ * исполнителя, агент ходит к openlore по сети (а не stdio-ребёнком в своём контейнере). Session-режим
+ * по спеке MCP Streamable HTTP: initialize → сервер выдаёт Mcp-Session-Id, далее клиент носит его в заголовке;
+ * POST — запросы, GET — серверный SSE-стрим, DELETE — закрытие сессии. Каждая сессия = свой Server (изоляция
+ * состояния). Опц. Bearer-токен (--token): если задан, проверяется ПЕРВЫМ единообразным 401 (для закрытого
+ * контура) — он же реальная аутентификация (session-id сам по себе не секрет). stdout НЕ владеется протоколом
+ * (канал — HTTP), поэтому console не перенаправляем.
+ *
+ * МОДЕЛЬ ДОВЕРИЯ: ОДНОТЕНАНТНЫЙ инстанс (один прогон/агент). Не разделять между границами безопасности —
+ * для каждого изолированного прогона поднимается СВОЙ инстанс со своим токеном (per-run, blast-radius = 1).
+ */
+export interface HttpMcpHandle { port: number; close: () => Promise<void>; }
+
+export async function startHttpMcpServer(options: McpServerOptions = {}): Promise<HttpMcpHandle> {
+  const host = options.host ?? '127.0.0.1';
+  const port = parseInt(options.port ?? '7787', 10);
+  const token = options.token;                         // опц.: задан → auth обязателен
+  const mcpPath = '/mcp';
+  const MAX_BODY = 16 * 1024 * 1024;                   // лимит тела запроса (защита от исчерпания памяти)
+  const BODY_TIMEOUT_MS = 30000;                       // таймаут чтения тела (анти-slowloris)
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+  // watch-auto — editor/stdio-фича (инкрементальный реиндекс при правках в редакторе). У REMOTE-агента
+  // свежесть анализа держит ИСПОЛНИТЕЛЬ (пере-запуск analyze), а per-session-вотчеры бы текли — отключаем.
+  const httpOptions: McpServerOptions = { ...options, watchAuto: false };
+
+  // fail-loud: привязка к НЕ-loopback интерфейсу БЕЗ токена открыла бы анализ кода всем в сети.
+  const isLoopback = host === '127.0.0.1' || host === '::1' || host === 'localhost';
+  if (!isLoopback && !token) {
+    throw new Error(`openlore mcp --http --host ${host}: привязка к не-loopback интерфейсу без --token открыла бы доступ к анализу кода по сети. Задайте --token или используйте host 127.0.0.1.`);
   }
+
+  const readBody = (req: IncomingMessage): Promise<string> =>
+    new Promise((resolve, reject) => {
+      let body = '';
+      let len = 0;
+      const timer = setTimeout(() => { req.destroy(); reject(Object.assign(new Error('body read timeout'), { timeout: true })); }, BODY_TIMEOUT_MS);
+      req.on('data', (c) => {
+        len += c.length;
+        if (len > MAX_BODY) { clearTimeout(timer); req.destroy(); reject(Object.assign(new Error('body too large'), { tooLarge: true })); return; }
+        body += c;
+      });
+      req.on('end', () => { clearTimeout(timer); resolve(body); });
+      req.on('error', (e) => { clearTimeout(timer); reject(e); });
+    });
+  const sendJson = (res: ServerResponse, status: number, id: unknown, code: number, message: string): void => {
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ jsonrpc: '2.0', error: { code, message }, id: id ?? null }));
+  };
+
+  const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    try {
+      // auth ПЕРВОЙ (если задан токен): неавторизованный probe → 401 единообразно, без утечки наличия пути
+      if (token && !bearerOk(req.headers['authorization'], token)) {
+        return sendJson(res, 401, null, -32001, 'unauthorized');
+      }
+      if ((req.url ?? '').split('?')[0] !== mcpPath) { res.writeHead(404); return res.end(); }
+
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+      if (req.method === 'POST') {
+        let raw: string;
+        try { raw = await readBody(req); }
+        catch (e) {
+          const err = e as { tooLarge?: boolean; timeout?: boolean };
+          if (!res.headersSent) {
+            if (err.tooLarge) sendJson(res, 413, null, -32600, 'payload too large');
+            else if (err.timeout) sendJson(res, 408, null, -32600, 'request timeout');
+            else sendJson(res, 400, null, -32700, 'bad request body');
+          }
+          return;
+        }
+        let body: unknown;
+        try { body = raw ? JSON.parse(raw) : undefined; }
+        catch { return sendJson(res, 400, null, -32700, 'Parse error'); }
+
+        let transport = sessionId ? transports[sessionId] : undefined;
+        if (!transport) {
+          if (sessionId) return sendJson(res, 404, null, -32001, 'unknown session');   // неизвестная сессия
+          if (!isInitializeRequest(body)) return sendJson(res, 400, null, -32600, 'session required (initialize first)');
+          // новая сессия — только на initialize. Захват в const: ссылка стабильна для колбэков
+          // (onsessioninitialized/onclose), нет гонки и небезопасного non-null assertion.
+          const newTransport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid: string) => { transports[sid] = newTransport; },
+          });
+          newTransport.onclose = () => {
+            const sid = newTransport.sessionId;
+            if (sid) delete transports[sid];
+          };
+          const server = buildOpenloreServer(httpOptions);
+          await server.connect(newTransport);
+          transport = newTransport;
+        }
+        await transport.handleRequest(req, res, body);
+      } else if (req.method === 'GET' || req.method === 'DELETE') {
+        const transport = sessionId ? transports[sessionId] : undefined;
+        if (!transport) { res.writeHead(404); return res.end(); }
+        await transport.handleRequest(req, res);
+      } else {
+        res.writeHead(405, { allow: 'POST, GET, DELETE' });
+        res.end();
+      }
+    } catch (err) {
+      if (!res.headersSent) sendJson(res, 500, null, -32603, 'internal error');
+      process.stderr.write(`[openlore mcp http] request error: ${String((err as Error)?.message ?? err)}\n`);
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const onErr = (e: Error): void => { httpServer.removeListener('error', onErr); httpServer.close(() => {}); reject(e); };
+    httpServer.on('error', onErr);
+    httpServer.listen(port, host, () => { httpServer.removeListener('error', onErr); resolve(); });
+  });
+  const addr = httpServer.address();
+  const boundPort = typeof addr === 'object' && addr ? addr.port : port;
+  process.stderr.write(`openlore MCP (Streamable HTTP) слушает http://${host}:${boundPort}${mcpPath}${token ? ' (Bearer-auth)' : ''}\n`);
+  await maybeStartWatcher(options);
+
+  const close = async (): Promise<void> => {
+    for (const sid of Object.keys(transports)) {
+      const t = transports[sid];
+      delete transports[sid];          // снять из реестра ДО close
+      t.onclose = undefined;           // close() сам управляет cleanup — onclose не должен делить повторно
+      try { await t.close(); } catch { /* teardown best-effort */ }
+    }
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  };
+  return { port: boundPort, close };
+}
+
+async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
+  if (options.http) { await startHttpMcpServer(options); return; }
+  return startStdioMcpServer(options);
 }
 
 // ============================================================================
@@ -2159,7 +2325,7 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
 // ============================================================================
 
 export const mcpCommand = new Command('mcp')
-  .description('Start openlore as an MCP server (stdio transport, for Cline/Claude Code)')
+  .description('Start openlore as an MCP server (stdio by default, or --http for remote/isolated agents)')
   .option('--watch <directory>', 'Watch a project directory and incrementally re-index signatures on file changes')
   .option('--watch-auto', 'Auto-detect the project directory from the first tool call and start watching', true)
   .option('--no-watch-auto', 'Disable auto-watch (use for one-shot tool calls, e.g. the orient skill wrapper)')
@@ -2168,4 +2334,8 @@ export const mcpCommand = new Command('mcp')
   .option('--watch-no-embed', 'Watch signatures only — skip live vector re-embedding (embeddings refresh at commit). Large repos auto-degrade to this.')
   .option('--minimal', 'Expose only core 6 tools (orient, search_code, record_decision, detect_changes, check_spec_drift, get_health_map). Pair with alwaysLoad: true in Claude Code for always-visible core tools.')
   .option('--preset <name>', 'Expose a named tool preset instead of all 62. "minimal" = orient+search+governance; "navigation" = graph-traversal core (orient, search_code, get_subgraph, trace_execution_path, analyze_impact, suggest_insertion_points, get_function_skeleton, get_landmarks, get_map, find_path) for low-overhead code navigation; "memory" = orient+remember+recall; "federation" = orient + federation_status + spec_store_status + working_set_context + change_impact_certificate + the four cross-repo conclusion tools. Takes precedence over --minimal.')
+  .option('--http', 'Serve over Streamable HTTP (remote MCP) instead of stdio — for isolated agents that reach openlore over the network')
+  .option('--host <host>', 'HTTP bind interface (default: 127.0.0.1)')
+  .option('--port <port>', 'HTTP port (default: 7787; "0" = ephemeral)')
+  .option('--token <token>', 'Optional Bearer token for HTTP transport — when set, every request must carry "Authorization: Bearer <token>" (closed-contour isolation)')
   .action((options: McpServerOptions) => startMcpServer(options));
