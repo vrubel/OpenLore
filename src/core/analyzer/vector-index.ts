@@ -22,6 +22,7 @@ import type { FunctionNode } from './call-graph.js';
 import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { getSkeletonContent, isSkeletonWorthIncluding } from './code-shaper.js';
+import { openVectorBackend, type VectorBackend, type VectorRecord } from './vector-store.js';
 
 // ============================================================================
 // TYPES
@@ -242,8 +243,6 @@ export class VectorIndex {
     /** When true, reuse cached vectors for unchanged functions */
     incremental = false
   ): Promise<{ embedded: number; reused: number }> {
-    const { connect } = await import('@lancedb/lancedb');
-
     if (nodes.length === 0) {
       throw new Error('No functions to index');
     }
@@ -306,19 +305,17 @@ export class VectorIndex {
 
     // ── Incremental cache lookup ─────────────────────────────────────────────
     const dbPath = join(outputDir, DB_FOLDER);
+    const backend = openVectorBackend(dbPath, TABLE_NAME);   // LanceDB | Qdrant (по QDRANT_URL)
     let cachedVectors = new Map<string, number[]>(); // id → vector
 
-    if (incremental && VectorIndex.exists(outputDir)) {
+    if (incremental && backend.exists()) {
       try {
-        const db = await connect(dbPath);
-        const table = await db.openTable(TABLE_NAME);
-        // Full table scan to load existing vectors
-        const existing = await table.query().toArray();
+        // Загрузка существующих векторов (LanceDB: скан таблицы / Qdrant: scroll)
+        const existing = await backend.loadAll();
         for (const row of existing) {
           const id = row.id as string;
           const text = row.text as string;
-          // Convert Arrow typed arrays (Float32Array etc.) to plain number[]
-          // so LanceDB can re-infer the schema when writing back
+          // Нормализуем вектор к plain number[] (Arrow-типизированные массивы LanceDB)
           const vector = Array.from(row.vector as ArrayLike<number>);
           // Cache the vector keyed by "id::text" so a text change invalidates it
           cachedVectors.set(`${id}::${text}`, vector);
@@ -368,9 +365,8 @@ export class VectorIndex {
       fullRecords[idx] = { ...candidates[idx], vector: newVectors[i] };
     }
 
-    // ── Write table ──────────────────────────────────────────────────────────
-    const db = await connect(dbPath);
-    await db.createTable(TABLE_NAME, fullRecords as unknown as Record<string, unknown>[], { mode: 'overwrite' });
+    // ── Write store (overwrite) — LanceDB createTable / Qdrant recreate+upsert ────────────────────
+    await backend.build(fullRecords as unknown as VectorRecord[]);
 
     return { embedded: toEmbed.length, reused: cachedIdx.length };
   }
@@ -397,8 +393,6 @@ export class VectorIndex {
       hybrid?: boolean;
     } = {}
   ): Promise<SearchResult[]> {
-    const { connect } = await import('@lancedb/lancedb');
-
     const { limit = 10, language, minFanIn, hybrid = true } = opts;
 
     if (!VectorIndex.exists(outputDir)) {
@@ -406,12 +400,11 @@ export class VectorIndex {
     }
 
     const dbPath = join(outputDir, DB_FOLDER);
-    const db = await connect(dbPath);
-    const table = await db.openTable(TABLE_NAME);
+    const backend = openVectorBackend(dbPath, TABLE_NAME);   // LanceDB | Qdrant (по QDRANT_URL)
 
     // ── BM25-only path (no embedding service available) ───────────────────────
     if (!embedSvc) {
-      return VectorIndex._bm25Only(table, dbPath, query, limit, language, minFanIn);
+      return VectorIndex._bm25Only(backend, dbPath, query, limit, language, minFanIn);
     }
 
     // ── Dense recall ──────────────────────────────────────────────────────────
@@ -420,12 +413,12 @@ export class VectorIndex {
       [queryVector] = await embedSvc.embed([query]);
     } catch {
       // Embedding server unreachable — fall back to BM25
-      return VectorIndex._bm25Only(table, dbPath, query, limit, language, minFanIn);
+      return VectorIndex._bm25Only(backend, dbPath, query, limit, language, minFanIn);
     }
     if (!queryVector) throw new Error('Failed to embed query');
 
     const denseFetch = hybrid ? Math.min(limit * 5, 500) : Math.min(limit * 10, 1000);
-    const denseRows = await table.query().nearestTo(queryVector).limit(denseFetch).toArray();
+    const denseRows = await backend.searchDense(queryVector, denseFetch);
 
     const passesFilters = (row: Record<string, unknown>): boolean => {
       if (language && (row.language as string) !== language) return false;
@@ -446,7 +439,7 @@ export class VectorIndex {
     let allRows: Record<string, unknown>[];
 
     if (!cachedEntry) {
-      allRows = await table.query().toArray();
+      allRows = await backend.loadAll();
       const corpus = buildBm25Corpus(
         allRows.map(r => ({ id: r.id as string, text: r.text as string }))
       );
@@ -454,7 +447,7 @@ export class VectorIndex {
       _bm25Cache.set(dbPath, cachedEntry);
     } else {
       // Lightweight cache validation: re-scan only if row count has changed
-      allRows = await table.query().toArray();
+      allRows = await backend.loadAll();
       if (allRows.length !== cachedEntry.rowCount) {
         const corpus = buildBm25Corpus(
           allRows.map(r => ({ id: r.id as string, text: r.text as string }))
@@ -520,7 +513,7 @@ export class VectorIndex {
    * Scores the full corpus with BM25 and returns the top `limit` results.
    */
   private static async _bm25Only(
-    table: { query(): { toArray(): Promise<Record<string, unknown>[]> } },
+    backend: VectorBackend,
     dbPath: string,
     query: string,
     limit: number,
@@ -531,14 +524,14 @@ export class VectorIndex {
     let allRows: Record<string, unknown>[];
 
     if (!cachedEntry) {
-      allRows = await table.query().toArray();
+      allRows = await backend.loadAll();
       const corpus = buildBm25Corpus(
         allRows.map(r => ({ id: r.id as string, text: r.text as string }))
       );
       cachedEntry = { corpus, rowCount: allRows.length };
       _bm25Cache.set(dbPath, cachedEntry);
     } else {
-      allRows = await table.query().toArray();
+      allRows = await backend.loadAll();
       if (allRows.length !== cachedEntry.rowCount) {
         const corpus = buildBm25Corpus(
           allRows.map(r => ({ id: r.id as string, text: r.text as string }))

@@ -17,6 +17,7 @@
  */
 
 import { existsSync } from 'node:fs';
+import { openVectorBackend, type VectorRecord } from './vector-store.js';
 import { readdir, readFile } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
@@ -267,8 +268,6 @@ export class SpecVectorIndex {
     mappingJsonPath?: string,
     decisionsDir?: string
   ): Promise<{ recordCount: number }> {
-    const { connect } = await import('@lancedb/lancedb');
-
     // Load mapping index (optional)
     let mappingIndex = new Map<string, string[]>();
     if (mappingJsonPath && await fileExists(mappingJsonPath)) {
@@ -345,10 +344,9 @@ export class SpecVectorIndex {
       vector: vectors[i],
     }));
 
-    // Write to LanceDB (same DB folder, table "specs")
+    // Write store (same DB folder, table "specs") — LanceDB | Qdrant (по QDRANT_URL)
     const dbPath = join(outputDir, DB_FOLDER);
-    const db = await connect(dbPath);
-    await db.createTable(TABLE_NAME, fullRecords as unknown as Record<string, unknown>[], { mode: 'overwrite' });
+    await openVectorBackend(dbPath, TABLE_NAME).build(fullRecords as unknown as VectorRecord[]);
 
     return { recordCount: fullRecords.length };
   }
@@ -366,8 +364,6 @@ export class SpecVectorIndex {
       section?: string;
     } = {}
   ): Promise<SpecSearchResult[]> {
-    const { connect } = await import('@lancedb/lancedb');
-
     const { limit = 10, domain, section } = opts;
 
     if (!SpecVectorIndex.exists(outputDir)) {
@@ -378,11 +374,10 @@ export class SpecVectorIndex {
     if (!queryVector) throw new Error('Failed to embed query');
 
     const dbPath = join(outputDir, DB_FOLDER);
-    const db = await connect(dbPath);
-    const table = await db.openTable(TABLE_NAME);
+    const backend = openVectorBackend(dbPath, TABLE_NAME);   // LanceDB | Qdrant (по QDRANT_URL)
 
     const fetchLimit = Math.min(limit * 10, 500);
-    const rows = await table.query().nearestTo(queryVector).limit(fetchLimit).toArray();
+    const rows = await backend.searchDense(queryVector, fetchLimit);
 
     const filtered = rows
       .filter(row => {
@@ -416,8 +411,8 @@ export class SpecVectorIndex {
    * Returns true if the spec index table exists.
    */
   static exists(outputDir: string): boolean {
-    // LanceDB stores each table as a subfolder inside the DB folder
-    return existsSync(join(outputDir, DB_FOLDER, `${TABLE_NAME}.lance`));
+    // LanceDB: <db>/specs.lance · Qdrant: маркер <db>/.qdrant-specs (backend.exists, table-specific)
+    return openVectorBackend(join(outputDir, DB_FOLDER), TABLE_NAME).exists();
   }
 }
 
