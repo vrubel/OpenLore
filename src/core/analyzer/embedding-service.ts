@@ -29,6 +29,15 @@ export interface EmbeddingConfig {
   batchSize?: number;
   /** Disable SSL certificate verification (e.g. self-signed certs on local servers) */
   skipSslVerify?: boolean;
+  /**
+   * Distributed mode (PDLC §12, D7 axis A): when set, embeddings are computed by routing chunks to the
+   * brain-zone EMBEDDER service (`POST {embedderUrl}/embed {chunks}` → `{vectors}`) instead of calling the
+   * model provider directly. The analyst stays in the factory zone (no egress to the model); only the
+   * embedder (brain) holds embedding egress. When unset → direct `/embeddings` as before (backward-compatible).
+   */
+  embedderUrl?: string;
+  /** Bearer token the embedder requires (optional; loopback/no-auth if unset). */
+  embedderToken?: string;
 }
 
 // ============================================================================
@@ -40,6 +49,8 @@ export class EmbeddingService {
   private model: string;
   private apiKey: string;
   private batchSize: number;
+  private embedderUrl: string;
+  private embedderToken: string;
 
   /**
    * Maximum characters per text before truncation.
@@ -53,6 +64,8 @@ export class EmbeddingService {
     this.model = config.model;
     this.apiKey = config.apiKey ?? '';
     this.batchSize = config.batchSize ?? 64;
+    this.embedderUrl = (config.embedderUrl ?? '').replace(/\/$/, '');
+    this.embedderToken = config.embedderToken ?? '';
     if (config.skipSslVerify && process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0') {
       process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
     }
@@ -68,6 +81,19 @@ export class EmbeddingService {
    * Throws if EMBED_BASE_URL or EMBED_MODEL are not set.
    */
   static fromEnv(): EmbeddingService {
+    // Distributed (PDLC §12, D7 axis A): EMBEDDER_URL routes through the brain-zone embedder. Detection by
+    // presence; backward-compatible (no EMBEDDER_URL → direct provider as before). EMBED_MODEL optional here
+    // (the embedder carries its own model; passed through if set).
+    const embedderUrl = process.env.EMBEDDER_URL;
+    if (embedderUrl) {
+      return new EmbeddingService({
+        baseUrl: embedderUrl,
+        model: process.env.EMBED_MODEL ?? '',
+        embedderUrl,
+        embedderToken: process.env.EMBEDDER_TOKEN,
+        skipSslVerify: process.env.EMBED_SKIP_SSL_VERIFY === '1' || process.env.EMBED_SKIP_SSL_VERIFY === 'true',
+      });
+    }
     const baseUrl = process.env.EMBED_BASE_URL;
     const model = process.env.EMBED_MODEL;
     if (!baseUrl) throw new Error('EMBED_BASE_URL environment variable is required');
@@ -114,8 +140,6 @@ export class EmbeddingService {
   }
 
   private async callEmbeddingsApi(texts: string[]): Promise<number[][]> {
-    const url = `${this.baseUrl}/embeddings`;
-
     // Truncate each text to stay within the model's token limit.
     // Most embedding models (nomic-embed-text, text-embedding-3-small…) cap at
     // 8 192 tokens. Slicing at MAX_CHARS_PER_TEXT characters is a safe
@@ -126,6 +150,10 @@ export class EmbeddingService {
         : t
     );
 
+    // Distributed (D7 axis A): route through the brain-zone embedder instead of the provider directly.
+    if (this.embedderUrl) return this.callEmbedderApi(truncated);
+
+    const url = `${this.baseUrl}/embeddings`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
@@ -157,5 +185,37 @@ export class EmbeddingService {
     // Sort by index to guarantee order matches input
     const sorted = [...json.data].sort((a, b) => a.index - b.index);
     return sorted.map(d => d.embedding);
+  }
+
+  /**
+   * Distributed embed (D7 axis A): the brain-zone embedder computes vectors (PDLC contract
+   * `POST {embedderUrl}/embed {chunks, model?} → {vectors, dimension}`). The analyst (factory) never
+   * touches the model provider — only the embedder (brain) does. fail-loud: non-2xx / vector count mismatch.
+   */
+  private async callEmbedderApi(texts: string[]): Promise<number[][]> {
+    const url = `${this.embedderUrl}/embed`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.embedderToken) headers['Authorization'] = `Bearer ${this.embedderToken}`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      // model optional — the embedder carries its own EMBED_MODEL; pass through only if configured.
+      body: JSON.stringify(this.model ? { chunks: texts, model: this.model } : { chunks: texts }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Embedder error ${response.status} from ${url}: ${body.slice(0, 200)}`);
+    }
+
+    const json = (await response.json()) as { vectors?: number[][] };
+    if (!Array.isArray(json.vectors)) {
+      throw new Error(`Unexpected embedder response: missing "vectors" array (from ${url})`);
+    }
+    if (json.vectors.length !== texts.length) {
+      throw new Error(`Embedder returned ${json.vectors.length} vectors for ${texts.length} chunks (count mismatch)`);
+    }
+    return json.vectors;
   }
 }

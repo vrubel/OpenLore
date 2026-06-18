@@ -238,4 +238,64 @@ describe('EmbeddingService', () => {
       expect(svc).toBeNull();
     });
   });
+
+  // D7 ось A (PDLC §12): при EMBEDDER_URL embed маршрутизируется через brain-зонный ЭМБЕДДЕР
+  // (POST {embedderUrl}/embed {chunks}→{vectors}) вместо прямого {baseUrl}/embeddings. Аналитик (фабрика)
+  // к модели не ходит. Обратносовместимо: без embedderUrl — прямой провайдер как раньше.
+  describe('D7 axis A — embedder indirection', () => {
+    it('routes embed via {embedderUrl}/embed (not /embeddings) and returns json.vectors', async () => {
+      mockFetch({ model: 'embedder', dimension: 3, vectors: [[1, 1, 1], [1, 1, 1]], usage: { total_tokens: 1 } });
+      const svc = new EmbeddingService({ baseUrl: 'http://provider/v1', model: 'm', embedderUrl: 'http://embedder:7991' });
+      const vecs = await svc.embed(['a', 'b']);
+      expect(vecs).toEqual([[1, 1, 1], [1, 1, 1]]);
+      const [url, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(url).toBe('http://embedder:7991/embed');
+      expect(JSON.parse((init as RequestInit).body as string).chunks).toEqual(['a', 'b']);
+    });
+
+    it('sends Bearer embedderToken to the embedder', async () => {
+      mockFetch({ vectors: [[1, 1, 1]] });
+      const svc = new EmbeddingService({ baseUrl: 'http://p/v1', model: 'm', embedderUrl: 'http://e:7991', embedderToken: 'tok-x' });
+      await svc.embed(['a']);
+      const init = (fetch as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit;
+      expect((init.headers as Record<string, string>)['Authorization']).toBe('Bearer tok-x');
+    });
+
+    it('strips trailing slash from embedderUrl', async () => {
+      mockFetch({ vectors: [[1, 1, 1]] });
+      const svc = new EmbeddingService({ baseUrl: 'http://p/v1', model: 'm', embedderUrl: 'http://e:7991/' });
+      await svc.embed(['a']);
+      expect((fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('http://e:7991/embed');
+    });
+
+    it('fromEnv: EMBEDDER_URL selects the embedder branch', async () => {
+      vi.stubEnv('EMBEDDER_URL', 'http://e:7991');
+      vi.stubEnv('EMBEDDER_TOKEN', 'tok-env');
+      mockFetch({ vectors: [[1, 1, 1]] });
+      const svc = EmbeddingService.fromEnv();
+      await svc.embed(['x']);
+      const [url, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(url).toBe('http://e:7991/embed');
+      expect(((init as RequestInit).headers as Record<string, string>)['Authorization']).toBe('Bearer tok-env');
+    });
+
+    it('fail-loud: vector count mismatch → throws', async () => {
+      mockFetch({ vectors: [[1, 1, 1]] });   // 1 вектор на 2 чанка
+      const svc = new EmbeddingService({ baseUrl: 'http://p/v1', model: 'm', embedderUrl: 'http://e:7991' });
+      await expect(svc.embed(['a', 'b'])).rejects.toThrow(/mismatch/i);
+    });
+
+    it('fail-loud: missing vectors array → throws', async () => {
+      mockFetch({ data: [] });
+      const svc = new EmbeddingService({ baseUrl: 'http://p/v1', model: 'm', embedderUrl: 'http://e:7991' });
+      await expect(svc.embed(['a'])).rejects.toThrow(/vectors/i);
+    });
+
+    it('backward-compatible: without embedderUrl uses /embeddings', async () => {
+      mockFetch(makeEmbedResponse(['a']));
+      const svc = new EmbeddingService({ baseUrl: 'http://p/v1', model: 'm' });
+      await svc.embed(['a']);
+      expect((fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('http://p/v1/embeddings');
+    });
+  });
 });
