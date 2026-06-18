@@ -1217,9 +1217,9 @@ export async function writeEdgesToSQLite(
   rootPath?: string
 ): Promise<void> {
   const { EdgeStore } = await import('../services/edge-store.js');
-  const store = EdgeStore.open(dbPath);
+  const store = await EdgeStore.open(dbPath);
   try {
-    store.clearAll();
+    await store.clearAll();
 
     // Normalize absolute paths to relative — vector index uses relative IDs; DB must match.
     const prefix = rootPath ? (rootPath.endsWith('/') ? rootPath : rootPath + '/') : '';
@@ -1241,12 +1241,12 @@ export async function writeEdgesToSQLite(
     const hubIds   = new Set(callGraph.hubFunctions.map(n => norm(n.id)));
     const entryIds = new Set(callGraph.entryPoints.map(n => norm(n.id)));
 
-    store.insertNodes(nodes, hubIds, entryIds);
-    store.insertEdges(edges);
-    store.insertInheritanceEdges(inheritanceEdges);
-    store.insertClasses(classes);
+    await store.insertNodes(nodes, hubIds, entryIds);
+    await store.insertEdges(edges);
+    await store.insertInheritanceEdges(inheritanceEdges);
+    await store.insertClasses(classes);
   } finally {
-    store.close();
+    await store.close();
   }
 }
 

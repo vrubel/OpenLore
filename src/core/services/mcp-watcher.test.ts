@@ -256,15 +256,15 @@ describe('McpWatcher.handleChange', () => {
     const { rootPath, outputPath } = await setupProject(ctx);
 
     // Seed the DB with a stale edge from src/a.ts to src/b.ts (relative paths — DB convention)
-    const store = EdgeStore.open(EdgeStore.dbPath(outputPath));
+    const store = await EdgeStore.open(EdgeStore.dbPath(outputPath));
     const staleEdge: CallEdge = {
       callerId: 'src/a.ts::foo',
       calleeId: 'src/b.ts::bar',
       calleeName: 'bar',
       confidence: 'name_only',
     };
-    store.insertEdges([staleEdge]);
-    store.close();
+    await store.insertEdges([staleEdge]);
+    await store.close();
 
     await mkdir(join(rootPath, 'src'), { recursive: true });
     const srcFile = join(rootPath, 'src', 'a.ts');
@@ -276,9 +276,9 @@ describe('McpWatcher.handleChange', () => {
     await watcher.handleChange(srcFile);
 
     // Stale edge (foo → bar) should be gone since we deleted edges for src/a.ts
-    const store2 = EdgeStore.open(EdgeStore.dbPath(outputPath));
-    const { outgoing } = store2.getEdgesForFile('src/a.ts');
-    store2.close();
+    const store2 = await EdgeStore.open(EdgeStore.dbPath(outputPath));
+    const { outgoing } = await store2.getEdgesForFile('src/a.ts');
+    await store2.close();
     // baz() doesn't call anything → 0 outgoing edges; stale edge was removed
     expect(outgoing.filter(e => e.calleeName === 'bar')).toHaveLength(0);
   });
@@ -293,10 +293,10 @@ describe('McpWatcher.handleChange', () => {
     await writeFile(srcFile, content, 'utf-8');
 
     // Seed hash cache with the same content (relative path — DB convention)
-    const store = EdgeStore.open(EdgeStore.dbPath(outputPath));
+    const store = await EdgeStore.open(EdgeStore.dbPath(outputPath));
     const { createHash } = await import('node:crypto');
-    store.setFileHash('src/stable.ts', createHash('sha256').update(content).digest('hex'));
-    store.close();
+    await store.setFileHash('src/stable.ts', createHash('sha256').update(content).digest('hex'));
+    await store.close();
 
     const before = await readFile(contextPath, 'utf-8');
 

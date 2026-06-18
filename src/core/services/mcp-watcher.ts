@@ -158,38 +158,38 @@ export class McpWatcher {
     }
 
     // ── Incremental edge update (CGC _handle_modification algorithm) ──────────
-    if (EdgeStore.exists(this.outputPath)) {
-      const store = EdgeStore.open(EdgeStore.dbPath(this.outputPath));
+    if (await EdgeStore.exists(this.outputPath)) {
+      const store = await EdgeStore.open(EdgeStore.dbPath(this.outputPath));
       try {
         // Content hash — skip entirely on no-op IDE autosaves
         const newHash = createHash('sha256').update(content).digest('hex');
-        if (store.getFileHash(rel) === newHash) return;
+        if (await store.getFileHash(rel) === newHash) return;
 
         // Reverse lookup BEFORE delete so we know which files call into this one
         // callerFiles are relative paths (DB stores relative paths)
-        const callerFiles = store.getCallerFiles(rel);
+        const callerFiles = await store.getCallerFiles(rel);
 
         // Re-parse BEFORE mutating DB — graph stays readable (old state) during parse
         const { edges: newEdges, nodes: newNodes } = await buildGraphSubset(rel, content, callerFiles, this.rootPath);
 
         // Atomic swap: delete stale data and insert fresh data in one transaction
         // so concurrent MCP reads never see a torn graph
-        store.transaction(() => {
-          store.deleteEdgesForFile(rel);
+        await store.transaction(async () => {
+          await store.deleteEdgesForFile(rel);
           for (const cf of callerFiles.slice(0, CALLER_REPARSE_LIMIT)) {
-            store.deleteOutgoingEdgesForFile(cf);
+            await store.deleteOutgoingEdgesForFile(cf);
           }
-          store.deleteNodesForFile(rel);
-          store.insertNodes(newNodes);
-          store.insertEdges(newEdges);
-          store.setFileHash(rel, newHash);
+          await store.deleteNodesForFile(rel);
+          await store.insertNodes(newNodes);
+          await store.insertEdges(newEdges);
+          await store.setFileHash(rel, newHash);
         });
 
         process.stderr.write(
           `[mcp-watcher] updated graph: ${rel} (+${newNodes.length} nodes, +${newEdges.length} edges, ${callerFiles.length} callers re-parsed)\n`
         );
       } finally {
-        store.close();
+        await store.close();
       }
     }
 

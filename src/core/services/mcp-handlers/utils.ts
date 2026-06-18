@@ -115,8 +115,8 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
       const raw = await readFile(join(analysisDir, ARTIFACT_LLM_CONTEXT), 'utf-8');
       const ctx = JSON.parse(raw) as CachedContext;
       // Attach EdgeStore when call-graph.db is present (incremental edge updates)
-      if (EdgeStore.exists(analysisDir)) {
-        ctx.edgeStore = EdgeStore.open(EdgeStore.dbPath(analysisDir));
+      if (await EdgeStore.exists(analysisDir)) {
+        ctx.edgeStore = await EdgeStore.open(EdgeStore.dbPath(analysisDir));
       }
       emit(directory, 'cache', { event: 'cache_read', hit: true });
       return ctx;

@@ -580,22 +580,22 @@ describe('handleGetSubgraph — edgeStore fast path', () => {
   let store: EdgeStore;
 
   // Graph: entry → middle → leaf (downstream chain)
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'graph-subgraph-test-'));
-    store = EdgeStore.open(join(dir, 'call-graph.db'));
-    store.insertNodes([
+    store = await EdgeStore.open(join(dir, 'call-graph.db'));
+    await store.insertNodes([
       makeNode({ id: 'src/a.ts::entry',  fanOut: 1 }),
       makeNode({ id: 'src/b.ts::middle', fanOut: 1 }),
       makeNode({ id: 'src/c.ts::leaf',   fanOut: 0 }),
     ]);
-    store.insertEdges([
+    await store.insertEdges([
       makeEdge('src/a.ts::entry',  'src/b.ts::middle'),
       makeEdge('src/b.ts::middle', 'src/c.ts::leaf'),
     ]);
   });
 
-  afterEach(() => {
-    store.close();
+  afterEach(async () => {
+    await store.close();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -651,22 +651,22 @@ describe('handleAnalyzeImpact — edgeStore fast path', () => {
   let dir: string;
   let store: EdgeStore;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'graph-impact-test-'));
-    store = EdgeStore.open(join(dir, 'call-graph.db'));
-    store.insertNodes([
+    store = await EdgeStore.open(join(dir, 'call-graph.db'));
+    await store.insertNodes([
       makeNode({ id: 'src/a.ts::entry',  fanOut: 2 }),
       makeNode({ id: 'src/b.ts::middle', fanIn: 1, fanOut: 1 }),
       makeNode({ id: 'src/c.ts::leaf',   fanIn: 1, fanOut: 0 }),
     ]);
-    store.insertEdges([
+    await store.insertEdges([
       makeEdge('src/a.ts::entry',  'src/b.ts::middle'),
       makeEdge('src/b.ts::middle', 'src/c.ts::leaf'),
     ]);
   });
 
-  afterEach(() => {
-    store.close();
+  afterEach(async () => {
+    await store.close();
     rmSync(dir, { recursive: true, force: true });
   });
 

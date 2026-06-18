@@ -452,13 +452,13 @@ describe('handleSearchCode — success paths', () => {
     });
     {
       const analysisDir = join(tmpDir, '.openlore', 'analysis');
-      const store = EdgeStore.open(EdgeStore.dbPath(analysisDir));
-      store.insertNodes([
+      const store = await EdgeStore.open(EdgeStore.dbPath(analysisDir));
+      await store.insertNodes([
         { id: 'src/a.ts::doA', name: 'doA', filePath: 'src/a.ts', language: 'TypeScript', fanIn: 1, fanOut: 0, isAsync: false, startIndex: 0, endIndex: 100 },
         { id: 'src/b.ts::doB', name: 'doB', filePath: 'src/b.ts', language: 'TypeScript', fanIn: 0, fanOut: 1, isAsync: false, startIndex: 0, endIndex: 100 },
       ]);
-      store.insertEdges([{ callerId: 'src/b.ts::doB', calleeId: 'src/a.ts::doA', calleeName: 'doA', confidence: 'name_only' as const }]);
-      store.close();
+      await store.insertEdges([{ callerId: 'src/b.ts::doB', calleeId: 'src/a.ts::doA', calleeName: 'doA', confidence: 'name_only' as const }]);
+      await store.close();
     }
 
     const { handleSearchCode } = await import('./semantic.js');
@@ -591,13 +591,13 @@ describe('handleSuggestInsertionPoints — success paths', () => {
     });
     {
       const analysisDir = join(tmpDir, '.openlore', 'analysis');
-      const store = EdgeStore.open(EdgeStore.dbPath(analysisDir));
-      store.insertNodes([
+      const store = await EdgeStore.open(EdgeStore.dbPath(analysisDir));
+      await store.insertNodes([
         { id: 'seed::fn', name: 'seedFn', filePath: 'src/seed.ts', language: 'TypeScript', fanIn: 1, fanOut: 0, isAsync: false, startIndex: 0, endIndex: 100 },
         { id: 'caller::fn', name: 'callerFn', filePath: 'src/caller.ts', language: 'TypeScript', fanIn: 0, fanOut: 1, isAsync: false, startIndex: 0, endIndex: 100 },
       ]);
-      store.insertEdges([{ callerId: 'caller::fn', calleeId: 'seed::fn', calleeName: 'seedFn', confidence: 'name_only' as const }]);
-      store.close();
+      await store.insertEdges([{ callerId: 'caller::fn', calleeId: 'seed::fn', calleeName: 'seedFn', confidence: 'name_only' as const }]);
+      await store.close();
     }
 
     const { handleSuggestInsertionPoints } = await import('./semantic.js');
@@ -721,7 +721,7 @@ describe('handleSearchCode — edgeStore fast path', () => {
   let tmpDir: string;
   let store: EdgeStore;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'semantic-edgestore-test-'));
     const analysisDir = join(tmpDir, '.openlore', 'analysis');
     rmSync(analysisDir, { recursive: true, force: true });
@@ -731,13 +731,13 @@ describe('handleSearchCode — edgeStore fast path', () => {
       join(analysisDir, 'llm-context.json'),
       JSON.stringify({ phase1_survey: { purpose: '', files: [], totalTokens: 0 }, phase2_deep: { purpose: '', files: [], totalTokens: 0 }, phase3_validation: { purpose: '', files: [], totalTokens: 0 } })
     );
-    store = EdgeStore.open(join(analysisDir, 'call-graph.db'));
-    store.insertNodes([
+    store = await EdgeStore.open(join(analysisDir, 'call-graph.db'));
+    await store.insertNodes([
       { id: 'src/a.ts::doA', name: 'doA', filePath: 'src/a.ts', isAsync: false, language: 'TypeScript', startIndex: 0, endIndex: 10, fanIn: 1, fanOut: 0 },
       { id: 'src/b.ts::doB', name: 'doB', filePath: 'src/b.ts', isAsync: false, language: 'TypeScript', startIndex: 0, endIndex: 10, fanIn: 0, fanOut: 1 },
     ]);
-    store.insertEdges([{ callerId: 'src/b.ts::doB', calleeId: 'src/a.ts::doA', calleeName: 'doA', confidence: 'import' }]);
-    store.close();
+    await store.insertEdges([{ callerId: 'src/b.ts::doB', calleeId: 'src/a.ts::doA', calleeName: 'doA', confidence: 'import' }]);
+    await store.close();
   });
 
   afterEach(() => {
@@ -767,7 +767,7 @@ describe('handleSearchCode — edgeStore fast path', () => {
 describe('handleSuggestInsertionPoints — edgeStore RIG-13 fast path', () => {
   let tmpDir: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'semantic-suggest-edgestore-test-'));
     const analysisDir = join(tmpDir, '.openlore', 'analysis');
     mkdirSync(analysisDir, { recursive: true });
@@ -776,13 +776,13 @@ describe('handleSuggestInsertionPoints — edgeStore RIG-13 fast path', () => {
       JSON.stringify({ phase1_survey: { purpose: '', files: [], totalTokens: 0 }, phase2_deep: { purpose: '', files: [], totalTokens: 0 }, phase3_validation: { purpose: '', files: [], totalTokens: 0 } })
     );
     // orchestrator → handler (caller expands handler's insertion candidates)
-    const s = EdgeStore.open(join(analysisDir, 'call-graph.db'));
-    s.insertNodes([
+    const s = await EdgeStore.open(join(analysisDir, 'call-graph.db'));
+    await s.insertNodes([
       { id: 'src/a.ts::handler',     name: 'handler',     filePath: 'src/a.ts', isAsync: false, language: 'TypeScript', startIndex: 0, endIndex: 10, fanIn: 1, fanOut: 0 },
       { id: 'src/b.ts::orchestrate', name: 'orchestrate', filePath: 'src/b.ts', isAsync: false, language: 'TypeScript', startIndex: 0, endIndex: 10, fanIn: 0, fanOut: 5 },
     ]);
-    s.insertEdges([{ callerId: 'src/b.ts::orchestrate', calleeId: 'src/a.ts::handler', calleeName: 'handler', confidence: 'import' }]);
-    s.close();
+    await s.insertEdges([{ callerId: 'src/b.ts::orchestrate', calleeId: 'src/a.ts::handler', calleeName: 'handler', confidence: 'import' }]);
+    await s.close();
   });
 
   afterEach(() => {

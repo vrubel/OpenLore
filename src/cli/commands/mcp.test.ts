@@ -145,12 +145,12 @@ async function writeCacheFixture(
   // Write call-graph.db so handlers that require edgeStore work
   const cg = callGraph as SerializedCallGraph;
   if (cg.nodes) {
-    const store = EdgeStore.open(EdgeStore.dbPath(analysisDir));
+    const store = await EdgeStore.open(EdgeStore.dbPath(analysisDir));
     const hubIds   = new Set((cg.hubFunctions   ?? []).map(n => n.id));
     const entryIds = new Set((cg.entryPoints     ?? []).map(n => n.id));
-    store.insertNodes(cg.nodes, hubIds, entryIds);
-    if (cg.edges) store.insertEdges(cg.edges);
-    store.close();
+    await store.insertNodes(cg.nodes, hubIds, entryIds);
+    if (cg.edges) await store.insertEdges(cg.edges);
+    await store.close();
   }
 }
 

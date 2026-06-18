@@ -252,21 +252,27 @@ export async function handleOrient(
     .map(([domain, { specFile, matchCount }]) => ({ domain, specFile, matchCount }));
 
   // ── Call paths for each top function ──────────────────────────────────────
-  const callPaths: OrientCallPath[] = topResults.map(r => {
+  const callPaths: OrientCallPath[] = [];
+  for (const r of topResults) {
     if (!llmCtx?.edgeStore) {
-      return { function: r.record.name, filePath: r.record.filePath, callers: [], callees: [] };
+      callPaths.push({ function: r.record.name, filePath: r.record.filePath, callers: [], callees: [] });
+      continue;
     }
     const es = llmCtx.edgeStore;
-    const callers = es.getCallers(r.record.id)
-      .map(e => { const n = es.getNode(e.callerId); return n && !n.isExternal ? { name: n.name, filePath: n.filePath } : null; })
-      .filter((x): x is CallNeighbour => x !== null)
-      .slice(0, 5);
-    const callees = es.getCallees(r.record.id)
-      .map(e => { const n = es.getNode(e.calleeId); return n && !n.isExternal ? { name: n.name, filePath: n.filePath } : null; })
-      .filter((x): x is CallNeighbour => x !== null)
-      .slice(0, 5);
-    return { function: r.record.name, filePath: r.record.filePath, callers, callees };
-  });
+    const callers: CallNeighbour[] = [];
+    for (const e of await es.getCallers(r.record.id)) {
+      if (callers.length >= 5) break;
+      const n = await es.getNode(e.callerId);
+      if (n && !n.isExternal) callers.push({ name: n.name, filePath: n.filePath });
+    }
+    const callees: CallNeighbour[] = [];
+    for (const e of await es.getCallees(r.record.id)) {
+      if (callees.length >= 5) break;
+      const n = await es.getNode(e.calleeId);
+      if (n && !n.isExternal) callees.push({ name: n.name, filePath: n.filePath });
+    }
+    callPaths.push({ function: r.record.name, filePath: r.record.filePath, callers, callees });
+  }
 
   // ── Insertion points (lightweight: reuse rawResults with structural scoring) ──
   // Normalise search scores to [0, 1] for compositeScore (scores are RRF/BM25: higher = better)

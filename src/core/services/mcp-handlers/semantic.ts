@@ -200,16 +200,24 @@ export async function handleSearchCode(
     }
   }
 
-  return {
-    query,
-    searchMode,
-    ...(searchMode === 'bm25_fallback'
-      ? {
-          note: 'Embedding server unavailable — results based on keyword matching only. Configure EMBED_BASE_URL + EMBED_MODEL for semantic search.',
-        }
-      : {}),
-    count: results.length,
-    results: results.map((r) => ({
+  const resultsOut = [];
+  for (const r of results) {
+    let callers: Neighbour[] | undefined;
+    let callees: Neighbour[] | undefined;
+    if (llmCtx?.edgeStore) {
+      const es = llmCtx.edgeStore;
+      callers = [];
+      for (const e of await es.getCallers(r.record.id)) {
+        const n = await es.getNode(e.callerId);
+        if (n && !n.isExternal) callers.push({ name: n.name, filePath: n.filePath });
+      }
+      callees = [];
+      for (const e of await es.getCallees(r.record.id)) {
+        const n = await es.getNode(e.calleeId);
+        if (n && !n.isExternal) callees.push({ name: n.name, filePath: n.filePath });
+      }
+    }
+    resultsOut.push({
       score: r.score,
       name: r.record.name,
       filePath: r.record.filePath,
@@ -222,17 +230,21 @@ export async function handleSearchCode(
       isHub: r.record.isHub,
       isEntryPoint: r.record.isEntryPoint,
       linkedSpecs: mappingIdx ? specsForFile(mappingIdx, r.record.filePath) : undefined,
-      callers: llmCtx?.edgeStore
-        ? llmCtx.edgeStore.getCallers(r.record.id)
-            .map(e => { const n = llmCtx!.edgeStore!.getNode(e.callerId); return n && !n.isExternal ? { name: n.name, filePath: n.filePath } : null; })
-            .filter((x): x is Neighbour => x !== null)
-        : undefined,
-      callees: llmCtx?.edgeStore
-        ? llmCtx.edgeStore.getCallees(r.record.id)
-            .map(e => { const n = llmCtx!.edgeStore!.getNode(e.calleeId); return n && !n.isExternal ? { name: n.name, filePath: n.filePath } : null; })
-            .filter((x): x is Neighbour => x !== null)
-        : undefined,
-    })),
+      callers,
+      callees,
+    });
+  }
+
+  return {
+    query,
+    searchMode,
+    ...(searchMode === 'bm25_fallback'
+      ? {
+          note: 'Embedding server unavailable — results based on keyword matching only. Configure EMBED_BASE_URL + EMBED_MODEL for semantic search.',
+        }
+      : {}),
+    count: results.length,
+    results: resultsOut,
     ...(specPeers.length > 0 ? { specLinkedFunctions: specPeers } : {}),
   };
 }
@@ -327,9 +339,9 @@ export async function handleSuggestInsertionPoints(
     const existingIds = new Set(candidates.map((c) => `${c.filePath}::${c.name}`));
 
     for (const seedResult of rawResults) {
-      const callerIds = llmCtx.edgeStore.getCallers(seedResult.record.id).map(e => e.callerId);
+      const callerIds = (await llmCtx.edgeStore.getCallers(seedResult.record.id)).map(e => e.callerId);
       for (const callerId of callerIds) {
-        const callerNode = llmCtx.edgeStore.getNode(callerId);
+        const callerNode = await llmCtx.edgeStore.getNode(callerId);
         if (!callerNode) continue;
         const key = `${callerNode.filePath}::${callerNode.name}`;
         if (existingIds.has(key) || seedIds.has(callerId)) continue;
