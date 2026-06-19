@@ -256,7 +256,10 @@ class PgBackend implements EdgeStore {
   private q(sql: string, params: unknown[] = []): Promise<{ rows: any[] }> { return this.pool.query(sql, params); }
 
   static async create(dbPath: string): Promise<PgBackend> {
-    const pg = (await import('pg')).default as any;
+    // спецификатор за переменной: tsc НЕ резолвит динамический импорт по не-литералу → 'pg' не требуется
+    // ни как модуль, ни как @types на СБОРКЕ (standalone собирается без pg). В рантайме нужен только в distributed.
+    const pgSpec = 'pg';
+    const pg = (await import(pgSpec)).default as any;
     const pool = new pg.Pool({ connectionString: process.env.OPENLORE_PG_URL });
     const ws = createHash('sha1').update(dbPath).digest('hex').slice(0, 16);
     await PgBackend.ensureSchema(pool);
@@ -430,7 +433,10 @@ export const EdgeStore = {
   async exists(outputDir: string): Promise<boolean> {
     if (process.env.OPENLORE_PG_URL) {
       try {
-        const pg = (await import('pg')).default as any;
+        // спецификатор за переменной: tsc НЕ резолвит динамический импорт по не-литералу → 'pg' не требуется
+    // ни как модуль, ни как @types на СБОРКЕ (standalone собирается без pg). В рантайме нужен только в distributed.
+    const pgSpec = 'pg';
+    const pg = (await import(pgSpec)).default as any;
         const pool = new pg.Pool({ connectionString: process.env.OPENLORE_PG_URL });
         try {
           await PgBackend.ensureSchema(pool);
