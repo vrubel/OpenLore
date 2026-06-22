@@ -1,7 +1,12 @@
 /**
  * VectorStore backend — хранилище векторного индекса за единым интерфейсом (D7 ось B, PDLC §12).
- *   QDRANT_URL не задан → LanceDB (standalone, как раньше: папка <dbPath>/, таблица tableName).
- *   QDRANT_URL задан    → Qdrant (distributed): коллекция openlore_<table>_<hash(dbPath)>, точки {id,vector,payload}.
+ *   QDRANT_URL задан    → Qdrant: коллекция openlore_<table>_<hash(dbPath)>, точки {id,vector,payload}.
+ *   QDRANT_URL не задан → LanceDB (папка <dbPath>/, таблица tableName) — ТОЛЬКО если пакет установлен.
+ *
+ * @lancedb/lancedb теперь optionalDependencies: дистрибутив PDLC (single-installer) собирается `--omit=optional`
+ * и нативный 129-МБ napi-бинарь LanceDB в поставку НЕ входит (он один форсил per-OS-разбиение артефакта);
+ * семантика в поставке = внешний Qdrant. Где lancedb установлен (dev/integration) — LanceBackend работает как
+ * раньше; где нет и запрошен embed без QDRANT_URL — fail-loud (см. LanceBackend.lance), не тихий BM25.
  *
  * Контракт наружу один (VectorIndex/SpecVectorIndex используют его, не зная бэкенд): build (overwrite), loadAll
  * (все строки id+payload+vector — для BM25-корпуса и инкрементального кэша), searchDense (ANN best-first c _distance),
@@ -41,17 +46,35 @@ export function openVectorBackend(dbPath: string, tableName: string): VectorBack
 }
 
 // ── LanceDB (standalone, поведение прежнее) ───────────────────────────────────────────────────────
+// @lancedb/lancedb — НЕ обязательная зависимость (optionalDependencies): дистрибутив PDLC собирается с
+// `--omit=optional` и НЕ несёт 129-МБ нативный napi-бинарь (он один форсил per-OS-разбиение артефакта).
+// Семантический индекс в поставке идёт через внешний Qdrant (QDRANT_URL). LanceBackend остаётся рабочим
+// там, где lancedb установлен (dev/integration без Qdrant); если пакета нет — fail-loud с понятной причиной,
+// а НЕ тихий BM25-fallback (принцип «без fallback'ов»). Импорт ленивый: на --no-embed-пути не вызывается.
 class LanceBackend implements VectorBackend {
   constructor(private dbPath: string, private tableName: string) {}
 
+  /** Ленивая загрузка опционального lancedb. Нет пакета → громкая ошибка с указанием задать QDRANT_URL. */
+  private async lance(): Promise<typeof import('@lancedb/lancedb')> {
+    try {
+      return await import('@lancedb/lancedb');
+    } catch {
+      throw new Error(
+        'Семантический индекс запрошен, но локальный LanceDB (@lancedb/lancedb) не установлен. ' +
+        'Сборка PDLC идёт без него (single-installer, без 129-МБ нативного бинаря) — задайте QDRANT_URL ' +
+        '(внешний Qdrant) для семантического поиска, либо запускайте analyze без --embed (только BM25).',
+      );
+    }
+  }
+
   async build(records: VectorRecord[]): Promise<void> {
-    const { connect } = await import('@lancedb/lancedb');
+    const { connect } = await this.lance();
     const db = await connect(this.dbPath);
     await db.createTable(this.tableName, records as unknown as Record<string, unknown>[], { mode: 'overwrite' });
   }
 
   async loadAll(): Promise<Record<string, unknown>[]> {
-    const { connect } = await import('@lancedb/lancedb');
+    const { connect } = await this.lance();
     const db = await connect(this.dbPath);
     const table = await db.openTable(this.tableName);
     const rows = await table.query().toArray();
@@ -60,7 +83,7 @@ class LanceBackend implements VectorBackend {
   }
 
   async searchDense(queryVector: number[], limit: number): Promise<Record<string, unknown>[]> {
-    const { connect } = await import('@lancedb/lancedb');
+    const { connect } = await this.lance();
     const db = await connect(this.dbPath);
     const table = await db.openTable(this.tableName);
     return table.query().nearestTo(queryVector).limit(limit).toArray();
