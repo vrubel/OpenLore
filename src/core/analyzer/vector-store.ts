@@ -1,12 +1,16 @@
 /**
  * VectorStore backend — хранилище векторного индекса за единым интерфейсом (D7 ось B, PDLC §12).
- *   QDRANT_URL задан    → Qdrant: коллекция openlore_<table>_<hash(dbPath)>, точки {id,vector,payload}.
- *   QDRANT_URL не задан → LanceDB (папка <dbPath>/, таблица tableName) — ТОЛЬКО если пакет установлен.
+ *   QDRANT_URL задан           → Qdrant: коллекция openlore_<table>_<hash(dbPath)>, точки {id,vector,payload}.
+ *   нет QDRANT_URL, есть lancedb→ LanceDB (папка <dbPath>/, таблица tableName) — ANN, как раньше (dev/integration).
+ *   нет ни того, ни другого    → File: <dbPath>/<table>.records.json — слим-дистрибутив без 129-МБ напи и без
+ *                                Qdrant. BM25 (loadAll) работает «из коробки»; dense — brute-force cosine.
  *
  * @lancedb/lancedb теперь optionalDependencies: дистрибутив PDLC (single-installer) собирается `--omit=optional`
- * и нативный 129-МБ napi-бинарь LanceDB в поставку НЕ входит (он один форсил per-OS-разбиение артефакта);
- * семантика в поставке = внешний Qdrant. Где lancedb установлен (dev/integration) — LanceBackend работает как
- * раньше; где нет и запрошен embed без QDRANT_URL — fail-loud (см. LanceBackend.lance), не тихий BM25.
+ * и нативный 129-МБ napi-бинарь LanceDB в поставку НЕ входит (он один форсил per-OS-разбиение артефакта).
+ * РАНЬШЕ его отсутствие без QDRANT_URL = fail-loud (orient/BM25 падал «задайте QDRANT_URL» даже без --embed,
+ * т.к. _bm25Only зовёт backend.loadAll()). Теперь при отсутствии lancedb выбирается FileBackend — навигация
+ * (orient/search_code) работает на standalone БЕЗ Qdrant и БЕЗ 129-МБ нативки; семантика большого масштаба —
+ * внешний Qdrant (QDRANT_URL). Где lancedb установлен (dev/integration) — LanceBackend остаётся ANN, как раньше.
  *
  * Контракт наружу один (VectorIndex/SpecVectorIndex используют его, не зная бэкенд): build (overwrite), loadAll
  * (все строки id+payload+vector — для BM25-корпуса и инкрементального кэша), searchDense (ANN best-first c _distance),
@@ -16,9 +20,10 @@
  * <dbPath>/.qdrant — existsSync(dbPath) истинно для обоих бэкендов; данные при этом в Qdrant.
  * fail-loud: Qdrant не-2xx → throw (НЕ молчаливый пустой результат).
  */
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 
 export interface VectorRecord extends Record<string, unknown> {
   id: string;
@@ -39,10 +44,43 @@ export interface VectorBackend {
 
 const qdrantUrl = (): string | null => (process.env.QDRANT_URL ? process.env.QDRANT_URL.replace(/\/+$/, '') : null);
 
-/** Выбор бэкенда по env. QDRANT_URL → Qdrant, иначе LanceDB. */
+/**
+ * Можно ли РЕАЛЬНО использовать LanceBackend (синхронно, без загрузки нативки).
+ * Резолвим И @lancedb/lancedb, И его peerDependency apache-arrow: openlore объявляет lancedb лишь как
+ * optionalDependency, а apache-arrow (peer @lancedb, >=15 <=18.1) штатный npm-install НЕ тянет → `import
+ * ('@lancedb/lancedb')` падает 'Cannot find module apache-arrow' даже когда сам @lancedb на месте. Поэтому
+ * LanceBackend выбираем ТОЛЬКО когда резолвится весь стек; иначе → FileBackend (BM25 без нативки и без arrow).
+ */
+function hasLancedb(): boolean {
+  try {
+    const req = createRequire(import.meta.url);
+    req.resolve('@lancedb/lancedb');
+    req.resolve('apache-arrow');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Выбор бэкенда (чистая функция — без env/fs, тестируется напрямую):
+ *   QDRANT_URL          → 'qdrant'
+ *   иначе есть lancedb  → 'lance'
+ *   иначе               → 'file' (слим-standalone: BM25 без Qdrant и без 129-МБ напи)
+ */
+export function selectBackendKind(opts: { qdrantUrl: string | null; hasLancedb: boolean }): 'qdrant' | 'lance' | 'file' {
+  if (opts.qdrantUrl) return 'qdrant';
+  return opts.hasLancedb ? 'lance' : 'file';
+}
+
+/** Выбор бэкенда по окружению (Qdrant → LanceDB → File). */
 export function openVectorBackend(dbPath: string, tableName: string): VectorBackend {
   const url = qdrantUrl();
-  return url ? new QdrantBackend(url, dbPath, tableName) : new LanceBackend(dbPath, tableName);
+  switch (selectBackendKind({ qdrantUrl: url, hasLancedb: hasLancedb() })) {
+    case 'qdrant': return new QdrantBackend(url as string, dbPath, tableName);
+    case 'lance':  return new LanceBackend(dbPath, tableName);
+    default:       return new FileBackend(dbPath, tableName);
+  }
 }
 
 // ── LanceDB (standalone, поведение прежнее) ───────────────────────────────────────────────────────
@@ -91,6 +129,51 @@ class LanceBackend implements VectorBackend {
 
   // table-specific: LanceDB createTable создаёт <dbPath>/<table>.lance (для specs совпадает с прежним check)
   exists(): boolean { return existsSync(join(this.dbPath, `${this.tableName}.lance`)); }
+}
+
+// ── File (lancedb-free standalone: BM25 без Qdrant и без 129-МБ напи) ───────────────────────────────
+// Выбирается, когда нет ни QDRANT_URL, ни установленного @lancedb (слим single-installer). Записи индекса
+// (id+payload+vector) храним в локальном JSON-файле <dbPath>/<table>.records.json. BM25-путь orient/search
+// (без --embed) читает корпус через loadAll() — нативный lancedb НЕ нужен. Dense (если задан embed-сервис)
+// — точный brute-force по косинусу над загруженными векторами (без ANN; приемлемо для типового репозитория;
+// для большого масштаба — внешний Qdrant). exists() синхронный — наличие файла записей.
+// Экспортируется для прямого юнит-теста (в dev-окружении форка @lancedb установлен → авто-выбор даёт Lance).
+export class FileBackend implements VectorBackend {
+  private file: string;
+  constructor(private dbPath: string, private tableName: string) {
+    this.file = join(dbPath, `${tableName}.records.json`);
+  }
+
+  async build(records: VectorRecord[]): Promise<void> {
+    mkdirSync(this.dbPath, { recursive: true });   // папка vector-index/ → VectorIndex.exists() (проверка папки) истинно
+    writeFileSync(this.file, JSON.stringify(records));   // overwrite: id+payload+vector (vector — plain number[])
+  }
+
+  async loadAll(): Promise<Record<string, unknown>[]> {
+    if (!existsSync(this.file)) return [];
+    const rows = JSON.parse(readFileSync(this.file, 'utf8')) as Record<string, unknown>[];
+    for (const r of rows) if (r.vector) r.vector = Array.from(r.vector as ArrayLike<number>);
+    return rows;
+  }
+
+  async searchDense(queryVector: number[], limit: number): Promise<Record<string, unknown>[]> {
+    const rows = await this.loadAll();
+    const qn = Math.sqrt(queryVector.reduce((s, v) => s + v * v, 0)) || 1;
+    // _distance = 1 − cosine (меньше = ближе, как у Lance/Qdrant); записи без вектора уходят в конец.
+    const scored = rows.map((r) => {
+      const v = (r.vector as number[]) || [];
+      if (v.length === 0) return { r, _distance: 2 };
+      let dot = 0, vv = 0;
+      const n = Math.min(v.length, queryVector.length);
+      for (let i = 0; i < n; i++) { dot += v[i] * queryVector[i]; vv += v[i] * v[i]; }
+      const cos = dot / ((Math.sqrt(vv) || 1) * qn);
+      return { r, _distance: 1 - cos };
+    });
+    scored.sort((a, b) => a._distance - b._distance);
+    return scored.slice(0, limit).map(({ r, _distance }) => ({ ...r, _distance }));
+  }
+
+  exists(): boolean { return existsSync(this.file); }
 }
 
 // ── Qdrant (distributed) ──────────────────────────────────────────────────────────────────────────
