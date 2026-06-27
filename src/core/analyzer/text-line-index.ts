@@ -32,6 +32,7 @@ import {
   bm25Score,
   type Bm25Corpus,
 } from './vector-index.js';
+import { openVectorBackend, type VectorRecord } from './vector-store.js';
 
 // ============================================================================
 // TYPES
@@ -105,19 +106,6 @@ export function extractLines(filePath: string, content: string): TextLineRecord[
   return out;
 }
 
-/**
- * Build a LanceDB `` `filePath` IN (...) `` predicate, SQL-escaping each path.
- * Backtick-quoting is required to bind to the camelCase column (see the matching
- * note in vector-index.ts).
- */
-function filePathInPredicate(paths: Set<string>): string | null {
-  if (paths.size === 0) return null;
-  const list = Array.from(paths)
-    .map((p) => `'${p.replace(/'/g, "''")}'`)
-    .join(', ');
-  return `\`filePath\` IN (${list})`;
-}
-
 function recordsToCorpusInput(rows: TextLineRecord[]): Array<{ id: string; text: string }> {
   return rows.map((r) => ({ id: r.id, text: r.text }));
 }
@@ -147,26 +135,16 @@ export class TextLineIndex {
     }
 
     const dbPath = join(outputDir, DB_FOLDER);
-    const { connect } = await import('@lancedb/lancedb');
-    const db = await connect(dbPath);
-
-    if (records.length === 0) {
-      // Nothing to index. If a stale table exists, overwrite it with an empty
-      // schema-bearing row set by dropping it; otherwise leave it absent.
-      _bm25Cache.delete(dbPath);
-      try {
-        await db.dropTable(TABLE_NAME);
-      } catch {
-        /* table did not exist */
-      }
-      return { lines: 0, files: 0 };
-    }
-
-    await db.createTable(TABLE_NAME, records as unknown as Record<string, unknown>[], {
-      mode: 'overwrite',
-    });
+    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant), text-line всегда BM25-only
+    // (вектора нет). Пустой набор = overwrite пустым корпусом: FileBackend пишет []
+    // (+ создаёт папку), LanceBackend сносит устаревшую таблицу. В обоих случаях папка
+    // <dbPath> остаётся → exists() (по папке) истинно, search вернёт пусто.
+    const backend = openVectorBackend(dbPath, TABLE_NAME);
+    await backend.build(records as unknown as VectorRecord[]);
     _bm25Cache.delete(dbPath);
-    return { lines: records.length, files: indexedFiles };
+    return records.length === 0
+      ? { lines: 0, files: 0 }
+      : { lines: records.length, files: indexedFiles };
   }
 
   /**
@@ -182,17 +160,7 @@ export class TextLineIndex {
     if (!TextLineIndex.exists(outputDir)) return { lines: 0 };
 
     const dbPath = join(outputDir, DB_FOLDER);
-    const { connect } = await import('@lancedb/lancedb');
-    const db = await connect(dbPath);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let table: any;
-    try {
-      table = await db.openTable(TABLE_NAME);
-    } catch {
-      // No table yet (e.g. previous build had zero lines) — build from scratch
-      // using just the changed files.
-      return TextLineIndex.build(outputDir, changed).then((r) => ({ lines: r.lines }));
-    }
+    const backend = openVectorBackend(dbPath, TABLE_NAME);
 
     const affectedPaths = new Set<string>([
       ...changed.map((c) => c.filePath),
@@ -204,11 +172,18 @@ export class TextLineIndex {
       for (const l of extractLines(f.filePath, f.content)) newRecords.push(l);
     }
 
-    const predicate = filePathInPredicate(affectedPaths);
-    if (predicate) await table.delete(predicate);
-    if (newRecords.length > 0) {
-      await table.add(newRecords as unknown as Record<string, unknown>[]);
+    // load → splice → overwrite через бэкенд (нет row-level delete/add; PDLC watch
+    // не гоняет). loadAll может бросить, если папка есть, а таблицы нет (пустой build) —
+    // тогда корпус пуст, перезаписываем только изменёнными строками (как прежний
+    // build-from-scratch при openTable-промахе).
+    let existing: TextLineRecord[];
+    try {
+      existing = (await backend.loadAll()) as unknown as TextLineRecord[];
+    } catch {
+      existing = [];
     }
+    const survivors = existing.filter((r) => !affectedPaths.has(r.filePath));
+    await backend.build([...survivors, ...newRecords] as unknown as VectorRecord[]);
 
     TextLineIndex._patchCache(dbPath, affectedPaths, newRecords);
     return { lines: newRecords.length };
@@ -229,16 +204,13 @@ export class TextLineIndex {
     const dbPath = join(outputDir, DB_FOLDER);
     let cached = _bm25Cache.get(dbPath);
     if (!cached) {
-      const { connect } = await import('@lancedb/lancedb');
-      const db = await connect(dbPath);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let table: any;
+      const backend = openVectorBackend(dbPath, TABLE_NAME);
+      let rows: Record<string, unknown>[];
       try {
-        table = await db.openTable(TABLE_NAME);
+        rows = await backend.loadAll();
       } catch {
         return [];
       }
-      const rows = (await table.query().toArray()) as Record<string, unknown>[];
       const records: TextLineRecord[] = rows.map((r) => ({
         id: r.id as string,
         filePath: r.filePath as string,

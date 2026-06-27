@@ -16,12 +16,13 @@
  *   const results = await SpecVectorIndex.search(outputDir, "email validation", embedSvc);
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { tokenize, buildBm25Corpus, bm25Score } from './vector-index.js';
+import { openVectorBackend, type VectorBackend, type VectorRecord } from './vector-store.js';
 
 // ============================================================================
 // TYPES
@@ -302,8 +303,6 @@ export class SpecVectorIndex {
     mappingJsonPath?: string,
     decisionsDir?: string
   ): Promise<{ recordCount: number; hasEmbeddings: boolean }> {
-    const { connect } = await import('@lancedb/lancedb');
-
     // Load mapping index (optional)
     let mappingIndex = new Map<string, string[]>();
     if (mappingJsonPath && await fileExists(mappingJsonPath)) {
@@ -374,16 +373,13 @@ export class SpecVectorIndex {
     }
 
     const dbPath = join(outputDir, DB_FOLDER);
+    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant) — выбор по окружению.
+    const backend = openVectorBackend(dbPath, TABLE_NAME);
 
     // ── BM25-only build (no embedding service) ───────────────────────────────
     // Write records without a `vector` column and record hasEmbeddings:false.
     if (!embedSvc) {
-      const db = await connect(dbPath);
-      await db.createTable(
-        TABLE_NAME,
-        records as unknown as Record<string, unknown>[],
-        { mode: 'overwrite' }
-      );
+      await backend.build(records as unknown as VectorRecord[]);
       await writeSpecMeta(outputDir, {
         hasEmbeddings: false,
         dim: 0,
@@ -407,9 +403,8 @@ export class SpecVectorIndex {
       vector: vectors[i],
     }));
 
-    // Write to LanceDB (same DB folder, table "specs")
-    const db = await connect(dbPath);
-    await db.createTable(TABLE_NAME, fullRecords as unknown as Record<string, unknown>[], { mode: 'overwrite' });
+    // Write store (same DB folder, table "specs") — File / LanceDB / Qdrant (overwrite)
+    await backend.build(fullRecords as unknown as VectorRecord[]);
 
     await writeSpecMeta(outputDir, {
       hasEmbeddings: true,
@@ -435,8 +430,6 @@ export class SpecVectorIndex {
       section?: string;
     } = {}
   ): Promise<SpecSearchResult[]> {
-    const { connect } = await import('@lancedb/lancedb');
-
     const { limit = 10, domain, section } = opts;
 
     if (!SpecVectorIndex.exists(outputDir)) {
@@ -444,9 +437,8 @@ export class SpecVectorIndex {
     }
 
     const dbPath = join(outputDir, DB_FOLDER);
-    const db = await connect(dbPath);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const table: any = await db.openTable(TABLE_NAME);
+    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant) — выбор по окружению.
+    const backend = openVectorBackend(dbPath, TABLE_NAME);
 
     // ── BM25-only path ─────────────────────────────────────────────────────────
     // Force BM25 when no embedder is available OR the spec index was built
@@ -454,14 +446,14 @@ export class SpecVectorIndex {
     const meta = readSpecMeta(outputDir);
     const indexHasEmbeddings = meta === null ? true : meta.hasEmbeddings;
     if (!embedSvc || !indexHasEmbeddings) {
-      return SpecVectorIndex._bm25Only(table, query, limit, domain, section);
+      return SpecVectorIndex._bm25Only(backend, query, limit, domain, section);
     }
 
     const [queryVector] = await embedSvc.embed([query]);
     if (!queryVector) throw new Error('Failed to embed query');
 
     const fetchLimit = Math.min(limit * 10, 500);
-    const rows = await table.query().nearestTo(queryVector).limit(fetchLimit).toArray();
+    const rows = await backend.searchDense(queryVector, fetchLimit);
 
     const filtered = rows
       .filter((row: Record<string, unknown>) => {
@@ -497,13 +489,13 @@ export class SpecVectorIndex {
    * corpus with BM25 and returns the top `limit` matching sections.
    */
   private static async _bm25Only(
-    table: { query(): { toArray(): Promise<Record<string, unknown>[]> } },
+    backend: VectorBackend,
     query: string,
     limit: number,
     domain?: string,
     section?: string,
   ): Promise<SpecSearchResult[]> {
-    const allRows = await table.query().toArray() as Record<string, unknown>[];
+    const allRows = await backend.loadAll();
     const corpus = buildBm25Corpus(
       allRows.map(r => ({ id: r.id as string, text: r.text as string }))
     );
@@ -549,8 +541,9 @@ export class SpecVectorIndex {
    * Returns true if the spec index table exists.
    */
   static exists(outputDir: string): boolean {
-    // LanceDB stores each table as a subfolder inside the DB folder
-    return existsSync(join(outputDir, DB_FOLDER, `${TABLE_NAME}.lance`));
+    // Table-specific существование через бэкенд: LanceDB → <db>/specs.lance,
+    // File → <db>/specs.records.json, Qdrant → маркер <db>/.qdrant-specs.
+    return openVectorBackend(join(outputDir, DB_FOLDER), TABLE_NAME).exists();
   }
 }
 
