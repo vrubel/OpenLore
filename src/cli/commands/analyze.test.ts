@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { analyzeCommand, runAnalysis } from './analyze.js';
+import { analyzeCommand, runAnalysis, isEmbedConfigured } from './analyze.js';
 
 // ============================================================================
 // MOCKS
@@ -135,6 +135,38 @@ describe('analyze command', () => {
       const forceOption = analyzeCommand.options.find(o => o.long === '--force');
       expect(forceOption).toBeDefined();
       expect(forceOption?.description).toContain('Force');
+    });
+  });
+
+  describe('isEmbedConfigured — auto-enable embed (D7 ось A)', () => {
+    // fromConfig читает cfg.embedding?.baseUrl/model; этого достаточно для предиката.
+    const NO_EMBED  = { embedding: undefined } as any;                               // нет embedding в конфиге
+    const CFG_EMBED = { embedding: { baseUrl: 'http://c:1', model: 'm' } } as any;   // embedding в конфиге
+
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    it('EMBEDDER_URL (brain-зонный эмбеддер, distributed) → embed сконфигурирован', () => {
+      vi.stubEnv('EMBED_BASE_URL', '');
+      vi.stubEnv('EMBEDDER_URL', 'http://embedder:7991');
+      expect(isEmbedConfigured(NO_EMBED)).toBe(true);
+    });
+
+    it('EMBED_BASE_URL (прямой провайдер) → embed сконфигурирован', () => {
+      vi.stubEnv('EMBEDDER_URL', '');
+      vi.stubEnv('EMBED_BASE_URL', 'http://embed:8080');
+      expect(isEmbedConfigured(NO_EMBED)).toBe(true);
+    });
+
+    it('embedding в openlore-конфиге → embed сконфигурирован (env пуст)', () => {
+      vi.stubEnv('EMBEDDER_URL', '');
+      vi.stubEnv('EMBED_BASE_URL', '');
+      expect(isEmbedConfigured(CFG_EMBED)).toBe(true);
+    });
+
+    it('ни env, ни конфиг → embed НЕ сконфигурирован (не авто-включаем)', () => {
+      vi.stubEnv('EMBEDDER_URL', '');
+      vi.stubEnv('EMBED_BASE_URL', '');
+      expect(isEmbedConfigured(NO_EMBED)).toBe(false);
     });
   });
 

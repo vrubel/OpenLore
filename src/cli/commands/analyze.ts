@@ -90,6 +90,21 @@ function collect(value: string, previous: string[]): string[] {
 // ============================================================================
 
 /**
+ * Whether an embedding backend is configured (→ `analyze` auto-enables `--embed`).
+ * Any of three sources is valid:
+ *   - EMBEDDER_URL    — brain-zone embedder (distributed, PDLC §12 / D7 axis A);
+ *   - EMBED_BASE_URL  — direct embedding provider (env);
+ *   - `embedding` in the OpenLore config file (EmbeddingService.fromConfig).
+ */
+export function isEmbedConfigured(config: OpenLoreConfig): boolean {
+  return (
+    !!process.env.EMBEDDER_URL ||
+    !!process.env.EMBED_BASE_URL ||
+    !!EmbeddingService.fromConfig(config)
+  );
+}
+
+/**
  * Run the complete analysis pipeline
  */
 export async function runAnalysis(
@@ -316,12 +331,8 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       }
 
       // Auto-enable --embed when embedding is configured but flag wasn't passed explicitly.
-      if (!options.embed) {
-        const embedConfigured =
-          !!process.env.EMBED_BASE_URL ||
-          !!EmbeddingService.fromConfig(openloreConfig);
-        if (embedConfigured) opts.embed = true;
-      }
+      // D7 ось A: EMBEDDER_URL (brain-зонный эмбеддер, distributed) — тоже валидная конфигурация embed.
+      if (!options.embed && isEmbedConfigured(openloreConfig)) opts.embed = true;
 
       logger.info('Project', openloreConfig.projectType);
       logger.info('Output', opts.output);
