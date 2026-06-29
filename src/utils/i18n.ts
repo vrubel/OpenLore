@@ -78,6 +78,26 @@ export function llmGherkinDirective(): string {
   );
 }
 
+/**
+ * Weak-model directive appended to LLM system prompts when `OPENLORE_WEAK_MODEL`
+ * is set (the PDLC control plane forwards it in env when the project opts into
+ * "weak model" mode). Weak/local models often REPORT "file created / done"
+ * without actually invoking a file-write tool (hallucinated completion) — which
+ * fails downstream (the spec files never get written). This directive insists the
+ * model write files via real tool calls. Empty/unset env → "" (no-op), so strong
+ * models keep a clean prompt and behavior is unchanged unless a host opts in.
+ */
+export function llmWeakModelDirective(): string {
+  if (!process.env.OPENLORE_WEAK_MODEL) return '';
+  return (
+    'CRITICAL — write files, do not narrate: produce every output file (e.g. ' +
+    'openspec/specs/<domain>/spec.md) with a REAL file-write tool call. A text ' +
+    'report that you "created the file" WITHOUT an actual write is a FAILURE — the ' +
+    'pipeline checks files on disk, not your words. After writing, verify the file ' +
+    'exists. Do not plan or describe instead of writing.'
+  );
+}
+
 // ============================================================================
 // STRING TABLE (hardcoded Markdown literals emitted into generated docs)
 // ============================================================================
