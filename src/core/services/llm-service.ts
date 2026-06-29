@@ -8,7 +8,7 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import logger from '../../utils/logger.js';
-import { llmGherkinDirective, llmLanguageDirective } from '../../utils/i18n.js';
+import { llmGherkinDirective, llmWeakModelDirective, llmLanguageDirective } from '../../utils/i18n.js';
 import {
   CLAUDE_MAX_CONTEXT_TOKENS,
   CLAUDE_MAX_OUTPUT_TOKENS,
@@ -1718,6 +1718,12 @@ export class LLMService {
     const gherkinDirective = llmGherkinDirective();
     if (gherkinDirective) {
       request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${gherkinDirective}` };
+    }
+
+    // PDLC: weak-model directive — "write files, don't narrate" (no-op unless OPENLORE_WEAK_MODEL set).
+    const weakModelDirective = llmWeakModelDirective();
+    if (weakModelDirective) {
+      request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${weakModelDirective}` };
     }
 
     // Pre-calculate tokens and warn if approaching limit
