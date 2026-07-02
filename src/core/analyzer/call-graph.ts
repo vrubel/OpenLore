@@ -2365,7 +2365,11 @@ const CSHARP_SPEC: QueryLangSpec = {
 // ── Kotlin ──────────────────────────────────────────────────────────────────
 const KOTLIN_SPEC: QueryLangSpec = {
   language: 'Kotlin',
-  loader: () => loadGrammarSoft('Kotlin', () => import('tree-sitter-kotlin'), m => m.default),
+  // WASM loader (portable) instead of native `tree-sitter-kotlin`: the native package
+  // ships NO prebuilt binary (only build-only parser.c), so native Kotlin never loaded
+  // under --ignore-scripts anyway. web-tree-sitter + tree-sitter-kotlin.wasm parse Kotlin
+  // portably (no per-OS .node), which is what the slim distribution keeps. Mirrors LUA_SPEC/Dart.
+  loader: () => loadWasmGrammarSoft('Kotlin', 'tree-sitter-wasms/out/tree-sitter-kotlin.wasm'),
   classTypes: new Set(['class_declaration', 'object_declaration', 'interface_declaration', 'companion_object']),
   // Extension functions: `fun Foo.bar()` — the receiver user_type becomes the className.
   // The receiver is the user_type that appears BEFORE the function name. A user_type
