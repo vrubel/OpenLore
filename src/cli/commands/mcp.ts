@@ -1816,6 +1816,7 @@ interface McpServerOptions {
   host?: string;        // интерфейс прослушивания (default 127.0.0.1)
   port?: string;        // порт (default 7787; '0' — эфемерный)
   token?: string;       // опц. Bearer-токен (если задан — auth обязателен; для изолированного контура)
+  sseKeepAliveMs?: number;  // интервал SSE-heartbeat для GET-стрима (default 25000; тест задаёт малый)
 }
 
 /**
@@ -2205,6 +2206,12 @@ export async function startHttpMcpServer(options: McpServerOptions = {}): Promis
   const mcpPath = '/mcp';
   const MAX_BODY = 16 * 1024 * 1024;                   // лимит тела запроса (защита от исчерпания памяти)
   const BODY_TIMEOUT_MS = 30000;                       // таймаут чтения тела (анти-slowloris)
+  // SSE-heartbeat для standalone GET-стрима: openlore server→client нотификаций почти не шлёт, поэтому
+  // GET-SSE висит всю сессию молча. undici-клиент (qwen/gigacode MCP) рвёт молчащий idle-стрим по
+  // своему bodyTimeout (~300с) → «SSE stream disconnected: TypeError: terminated» в логе прогона.
+  // Шлём SSE-комментарий каждые SSE_KEEPALIVE_MS — сбрасывает таймаут; строки «: …» клиент игнорирует
+  // по спеке SSE. С запасом ниже 300с, чтобы переживать дрожание/паузы медленной модели.
+  const SSE_KEEPALIVE_MS = options.sseKeepAliveMs ?? 25000;
   const transports: Record<string, StreamableHTTPServerTransport> = {};
   // watch-auto — editor/stdio-фича (инкрементальный реиндекс при правках в редакторе). У REMOTE-агента
   // свежесть анализа держит ИСПОЛНИТЕЛЬ (пере-запуск analyze), а per-session-вотчеры бы текли — отключаем.
@@ -2279,7 +2286,21 @@ export async function startHttpMcpServer(options: McpServerOptions = {}): Promis
           transport = newTransport;
         }
         await transport.handleRequest(req, res, body);
-      } else if (req.method === 'GET' || req.method === 'DELETE') {
+      } else if (req.method === 'GET') {
+        const transport = sessionId ? transports[sessionId] : undefined;
+        if (!transport) { res.writeHead(404); return res.end(); }
+        // Пока GET-стрим открыт, шлём комментарий-пинг, чтобы undici-клиент не рвал молчащий idle-SSE.
+        // Чистим на закрытии соединения (клиент ушёл / teardown t.close()); unref — не держать event-loop
+        // при остановке сервера. res.write(': …') между SSE-фреймами SDK безопасен: записи в res
+        // сериализуются, а строка-комментарий валидна по спеке и игнорируется клиентом.
+        const keepAlive: ReturnType<typeof setInterval> = setInterval(() => {
+          if (res.writableEnded || res.destroyed) { clearInterval(keepAlive); return; }
+          try { res.write(': keepalive\n\n'); } catch { clearInterval(keepAlive); }
+        }, SSE_KEEPALIVE_MS);
+        keepAlive.unref();
+        res.on('close', () => clearInterval(keepAlive));
+        await transport.handleRequest(req, res);
+      } else if (req.method === 'DELETE') {
         const transport = sessionId ? transports[sessionId] : undefined;
         if (!transport) { res.writeHead(404); return res.end(); }
         await transport.handleRequest(req, res);
