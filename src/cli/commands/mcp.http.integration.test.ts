@@ -52,7 +52,7 @@ describe('openlore mcp --http (Streamable HTTP transport)', () => {
     try {
       const { tools } = await client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual(
-        ['check_spec_drift', 'detect_changes', 'orient', 'record_decision', 'search_code'].sort(),
+        ['check_spec_drift', 'detect_changes', 'get_health_map', 'orient', 'record_decision', 'search_code'].sort(),
       );
     } finally {
       await client.close();
