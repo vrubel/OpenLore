@@ -9,6 +9,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 import { startHttpMcpServer, type HttpMcpHandle } from './mcp.js';
 
 let handle: HttpMcpHandle | undefined;
@@ -119,5 +120,48 @@ describe('openlore mcp --http (Streamable HTTP transport)', () => {
     const client = await connect(handle.port);
     try { expect((await client.listTools()).tools.length).toBeGreaterThan(0); }
     finally { await client.close(); }
+  });
+
+  it('SSE-heartbeat: молчащий GET-стрим шлёт keepalive-пинги (не даёт undici-клиенту рвать idle-SSE)', async () => {
+    // малый интервал вместо дефолтных 25с — чтобы тест был быстрым
+    handle = await startHttpMcpServer({ http: true, port: '0', watchAuto: false, sseKeepAliveMs: 60 });
+    const url = `http://127.0.0.1:${handle.port}/mcp`;
+
+    // 1) initialize RAW (не через SDK-клиент — иначе он сам займёт единственный standalone GET) → session-id из заголовка
+    const init = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: LATEST_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'hb-test', version: '1.0.0' } },
+      }),
+    });
+    const sid = init.headers.get('mcp-session-id');
+    if (!sid) throw new Error('initialize не вернул mcp-session-id');
+    await init.body?.cancel();   // не течь телом initialize
+
+    // 2) открываем standalone GET-SSE и слушаем несколько интервалов — должен прийти комментарий-пинг «: keepalive»
+    const ac = new AbortController();
+    const stop = setTimeout(() => ac.abort(), 1000);
+    let seen = '';
+    try {
+      const get = await fetch(url, { headers: { 'mcp-session-id': sid, accept: 'text/event-stream' }, signal: ac.signal });
+      expect(get.headers.get('content-type')).toMatch(/text\/event-stream/);
+      if (!get.body) throw new Error('нет тела SSE-ответа');
+      const reader = get.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        seen += decoder.decode(value, { stream: true });
+        if (seen.includes(': keepalive')) break;
+      }
+    } catch (e) {
+      if (!ac.signal.aborted) throw e;   // abort по таймауту — ожидаемо; прочее — реальная ошибка
+    } finally {
+      clearTimeout(stop);
+      ac.abort();
+    }
+    expect(seen).toContain(': keepalive');
   });
 });
