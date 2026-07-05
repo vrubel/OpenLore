@@ -398,6 +398,28 @@ export class McpWatcher {
   }
 
   /**
+   * One-shot headless re-index of an EXPLICIT delta — no chokidar, no debounce,
+   * no live session. Drives the same incremental pipeline the file watcher uses
+   * (deletions first to drop stale state, then changed/added files as ONE batch
+   * with syncFlush so the update is on disk before this resolves). This is the
+   * primitive behind the `openlore reindex` command, which computes {changed,
+   * deleted} from git and calls this directly instead of running a watcher.
+   *
+   * Preconditions (the caller MUST enforce fail-loud): a prior `analyze` exists
+   * (EdgeStore.exists + llm-context present). Without them handleBatch degrades to
+   * a signatures-only no-op with a "run analyze first" note — reindex is a delta
+   * catch-up, not a cold build. Paths are ABSOLUTE (same contract as handleBatch/
+   * handleDeletions). Returns the applied counts for the command summary.
+   */
+  async reindexDelta(delta: { changed?: string[]; deleted?: string[] }): Promise<{ changed: number; deleted: number }> {
+    const deleted = delta.deleted ?? [];
+    const changed = delta.changed ?? [];
+    if (deleted.length > 0) await this.handleDeletions(deleted);
+    if (changed.length > 0) await this.handleBatch(changed, { syncFlush: true });
+    return { changed: changed.length, deleted: deleted.length };
+  }
+
+  /**
    * Process a coalesced batch of changed files as ONE pipeline pass:
    *   • per-file incremental edge update (content-hash skip), all under one open
    *     EdgeStore;
