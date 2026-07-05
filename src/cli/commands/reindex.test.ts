@@ -67,6 +67,23 @@ describe('splitDelta — git diff → {changed, deleted} absolute source paths',
     expect(deleted).toEqual([]); // yarn.lock is skippable → not queued for deletion either
   });
 
+  it('non-source files git reports but the pipeline drops (.md/.json/.yaml) are excluded, so counts = applied', () => {
+    const { changed, deleted } = splitDelta(
+      [cf('README.md', 'modified'), cf('data.json', 'added'), cf('ci.yaml', 'modified'), cf('src/real.ts', 'modified'), cf('notes.txt', 'deleted')],
+      ROOT,
+    );
+    expect(changed).toEqual(['/repo/src/real.ts']); // only the graphable source
+    expect(deleted).toEqual([]);                     // notes.txt is not source → not counted as a deletion
+  });
+
+  it('graphable source across languages is kept (py/go/rs/…)', () => {
+    const { changed } = splitDelta(
+      [cf('app/main.py', 'modified'), cf('svc/handler.go', 'added'), cf('lib/core.rs', 'modified')],
+      ROOT,
+    );
+    expect(changed.sort()).toEqual(['/repo/app/main.py', '/repo/lib/core.rs', '/repo/svc/handler.go']);
+  });
+
   it('duplicate paths collapse (a path listed twice stays once)', () => {
     const { changed } = splitDelta(
       [cf('src/a.ts', 'added'), cf('src/a.ts', 'modified')],

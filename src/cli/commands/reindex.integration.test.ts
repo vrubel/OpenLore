@@ -11,7 +11,7 @@
  * minimal prior analysis (empty EdgeStore + seed signatures), which is exactly
  * the state reindex assumes.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -19,7 +19,38 @@ import { join } from 'node:path';
 import { McpWatcher } from '../../core/services/mcp-watcher.js';
 import { EdgeStore } from '../../core/services/edge-store.js';
 import { getChangedFiles } from '../../core/drift/git-diff.js';
-import { splitDelta } from './reindex.js';
+import { fileExists } from '../../utils/command-helpers.js';
+import { splitDelta, reindexCommand } from './reindex.js';
+
+/** Seed a minimal prior analysis (committed source + context + empty graph). Returns the base commit. */
+async function seedAnalyzed(entries: Array<{ path: string; names: string[] }>): Promise<string> {
+  for (const e of entries) {
+    await writeFile(join(root, e.path), `export function ${e.names[0]}() {}\n`, 'utf-8');
+  }
+  git(['add', '-A']);
+  git(['commit', '-m', 'init']);
+  await seedContext(entries);
+  EdgeStore.open(EdgeStore.dbPath(analysisDir)).close();
+  return git(['rev-parse', 'HEAD']);
+}
+
+/** Run the real reindex command action in-process against the temp repo. */
+async function runReindexCmd(args: string[]): Promise<{ exitCode: number; stdout: string }> {
+  const prevCwd = process.cwd();
+  const prevExit = process.exitCode;
+  const out: string[] = [];
+  const spy = vi.spyOn(process.stdout, 'write').mockImplementation((c: string | Uint8Array): boolean => { out.push(String(c)); return true; });
+  try {
+    process.chdir(root);
+    process.exitCode = 0;
+    await reindexCommand.parseAsync(args, { from: 'user' });
+    return { exitCode: process.exitCode ?? 0, stdout: out.join('') };
+  } finally {
+    spy.mockRestore();
+    process.chdir(prevCwd);
+    process.exitCode = prevExit; // don't leak the command's exit code to the runner
+  }
+}
 
 let root: string;
 let analysisDir: string;
@@ -126,5 +157,34 @@ describe('reindex — incremental delta lands in graph + signatures (real stores
     const applied = await watcher.reindexDelta({ changed, deleted });
     expect(applied).toEqual({ changed: 0, deleted: 0 });
     expect((await onDiskSigPaths()).get('a.ts')).toEqual(['foo']);
+  });
+});
+
+describe('reindex command — fail-loud edges + accurate counts', () => {
+  it('refuses a base ref that does not resolve — exit 1, no marker written (no silent stale index)', async () => {
+    await seedAnalyzed([{ path: 'a.ts', names: ['foo'] }]);
+    const bogus = '0000000000000000000000000000000000000000'; // valid syntax, unreachable
+    const { exitCode } = await runReindexCmd(['--since', bogus, '--no-embed']);
+    expect(exitCode).toBe(1);
+    // A refused run must NOT advance the marker (would skip the real delta forever).
+    expect(await fileExists(join(analysisDir, 'reindex-state.json'))).toBe(false);
+  });
+
+  it('--json reports APPLIED counts — a non-source file git also changed is not counted', async () => {
+    const base = await seedAnalyzed([{ path: 'a.ts', names: ['foo'] }]);
+    // change one SOURCE file and one NON-source file
+    await writeFile(join(root, 'a.ts'), 'export function foo() {}\nexport function baz() {}\n', 'utf-8');
+    await writeFile(join(root, 'README.md'), '# docs\n', 'utf-8');
+    git(['add', '-A']);
+    git(['commit', '-m', 'change + docs']);
+
+    const { exitCode, stdout } = await runReindexCmd(['--since', base, '--no-embed', '--json']);
+    expect(exitCode).toBe(0);
+    const line = stdout.split('\n').map((l) => l.trim()).find((l) => l.startsWith('{'));
+    const result = JSON.parse(line!) as { changed: number; deleted: number };
+    expect(result.changed).toBe(1); // ONLY a.ts — README.md excluded (applied, not submitted)
+    expect(result.deleted).toBe(0);
+    // marker advanced on success
+    expect(await fileExists(join(analysisDir, 'reindex-state.json'))).toBe(true);
   });
 });

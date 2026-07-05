@@ -40,7 +40,7 @@ import {
   ARTIFACT_FINGERPRINT,
 } from '../../constants.js';
 import { EdgeStore } from '../../core/services/edge-store.js';
-import { McpWatcher } from '../../core/services/mcp-watcher.js';
+import { McpWatcher, SOURCE_EXTENSIONS, HTML_EXTENSIONS } from '../../core/services/mcp-watcher.js';
 import {
   getChangedFiles,
   isGitRepository,
@@ -100,19 +100,23 @@ export function splitDelta(files: ChangedFile[], rootPath: string): { changed: s
   // llm-context.json, …): if the tree isn't gitignoring it, it would otherwise
   // leak into the delta. (git emits '/'-separated paths on every platform.)
   const inOpenlore = (p: string) => p === OPENLORE_DIR || p.startsWith(OPENLORE_DIR + '/');
+  // Keep ONLY files the incremental pipeline actually acts on (graphable source +
+  // HTML) — the same gate the watcher uses. Without this, non-source noise
+  // (.md/.json/…) that git reports but handleBatch silently drops would inflate
+  // the reported/`--json` counts (they must be applied, not merely submitted).
+  const isSource = (p: string) => SOURCE_EXTENSIONS.test(p) || HTML_EXTENSIONS.test(p);
+  const keep = (p: string) => !inOpenlore(p) && !isSkippableFile(p) && !classifyFile(p).isTest && isSource(p);
   const changedRel = new Set<string>();
   const deletedRel = new Set<string>();
   for (const f of files) {
-    if (inOpenlore(f.path)) continue;
-    if (classifyFile(f.path).isTest) continue;
     if (f.status === 'deleted') {
-      if (!isSkippableFile(f.path)) deletedRel.add(f.path);
+      if (keep(f.path)) deletedRel.add(f.path);
     } else if (f.status === 'renamed') {
-      if (f.oldPath && !inOpenlore(f.oldPath) && !isSkippableFile(f.oldPath)) deletedRel.add(f.oldPath);
-      if (!isSkippableFile(f.path)) changedRel.add(f.path);
+      if (f.oldPath && keep(f.oldPath)) deletedRel.add(f.oldPath);
+      if (keep(f.path)) changedRel.add(f.path);
     } else {
       // added | modified
-      if (!isSkippableFile(f.path)) changedRel.add(f.path);
+      if (keep(f.path)) changedRel.add(f.path);
     }
   }
   return {
@@ -128,6 +132,16 @@ async function currentHead(rootPath: string): Promise<string | null> {
     return stdout.trim() || null;
   } catch {
     return null; // e.g. a repo with no commits yet — marker stays unset, next run re-diffs
+  }
+}
+
+/** True iff `ref` resolves to a real commit in this repo (no fallback). */
+async function refResolves(rootPath: string, ref: string): Promise<boolean> {
+  try {
+    await execFileAsync('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: rootPath });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -165,6 +179,22 @@ export const reindexCommand = new Command('reindex')
         process.exitCode = 1;
         return;
       }
+      // A call-graph SCHEMA bump wipes the DB the first time it is opened. An
+      // incremental pass on a wiped store would apply nothing (the partial-graph
+      // guard in handleBatch) — so fail loud here rather than silently "succeed"
+      // and advance the marker over an unindexed delta. Opening is what triggers
+      // the reset, so this both detects it and leaves a clean (empty) store the
+      // full analyze will rebuild.
+      {
+        const store = EdgeStore.open(EdgeStore.dbPath(outputPath));
+        const wasReset = store.wasReset;
+        store.close();
+        if (wasReset) {
+          logger.error('The call-graph index schema was upgraded — the incremental graph is stale. Run "openlore analyze --force" to rebuild before reindexing.');
+          process.exitCode = 1;
+          return;
+        }
+      }
 
       // ── Compute the delta ──────────────────────────────────────────────────
       // Base ref precedence: explicit --since > last reindex marker > the commit
@@ -173,6 +203,18 @@ export const reindexCommand = new Command('reindex')
       const fpCommit = await analysisCommit(outputPath);
       const baseRef = options.since ?? state?.baseRef ?? fpCommit ?? 'HEAD';
       const baseSource = options.since ? '--since' : state ? 'last reindex' : fpCommit ? 'analyze commit' : 'working tree';
+      // Verify the chosen base BEFORE diffing. getChangedFiles → resolveBaseRef
+      // silently falls back (main → master → HEAD~1 → empty-tree) for an
+      // unresolvable ref, which would diff against the WRONG base and leave a
+      // stale index while reporting success — exactly the failure this tool
+      // exists to prevent. An explicit/persisted base MUST resolve (a shallow
+      // clone, rebase, or gc can orphan it); only the implicit HEAD default is
+      // allowed to pass through. Fail loud, no silent fallback.
+      if (baseRef !== 'HEAD' && !(await refResolves(rootPath, baseRef))) {
+        logger.error(`Base ref "${baseRef}" (${baseSource}) does not resolve to a commit here — a shallow clone, rebase, or gc can orphan it. Run a full "openlore analyze", or pass --since <reachable-ref>. Refusing to diff against a silent fallback (it would leave a stale index).`);
+        process.exitCode = 1;
+        return;
+      }
       const diff = await getChangedFiles({ rootPath, baseRef, includeUnstaged: true });
 
       const { changed, deleted } = splitDelta(diff.files, rootPath);

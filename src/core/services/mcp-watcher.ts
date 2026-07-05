@@ -102,14 +102,14 @@ interface ChangedFile {
   content: string;
 }
 
-const SOURCE_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|rs|rb|java|kt|php|cs|cpp|cc|cxx|h|hpp|c|swift)$/;
+export const SOURCE_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|rs|rb|java|kt|php|cs|cpp|cc|cxx|h|hpp|c|swift)$/;
 // HTML is watched too. detectLanguage() returns 'unknown' for it, so it takes a
 // dedicated path: an edit refreshes the literal-text line index, the inline-
 // <script> call-graph nodes (blanked → JavaScript in buildGraphSubset), and the
 // dependency-graph asset edges (<script src>/<link rel=stylesheet>). Letting HTML
 // into the call-graph loop REQUIRES the buildGraphSubset blanking — otherwise the
 // atomic swap would delete a page's inline-script nodes on every edit.
-const HTML_EXTENSIONS = /\.html?$/i;
+export const HTML_EXTENSIONS = /\.html?$/i;
 
 // Directory NAMES that must never be watched. Build-output and dependency
 // directories can hold hundreds of thousands of files (a Rust `target/` is
