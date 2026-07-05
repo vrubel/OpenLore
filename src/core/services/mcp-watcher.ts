@@ -102,14 +102,14 @@ interface ChangedFile {
   content: string;
 }
 
-const SOURCE_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|rs|rb|java|kt|php|cs|cpp|cc|cxx|h|hpp|c|swift)$/;
+export const SOURCE_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|rs|rb|java|kt|php|cs|cpp|cc|cxx|h|hpp|c|swift)$/;
 // HTML is watched too. detectLanguage() returns 'unknown' for it, so it takes a
 // dedicated path: an edit refreshes the literal-text line index, the inline-
 // <script> call-graph nodes (blanked → JavaScript in buildGraphSubset), and the
 // dependency-graph asset edges (<script src>/<link rel=stylesheet>). Letting HTML
 // into the call-graph loop REQUIRES the buildGraphSubset blanking — otherwise the
 // atomic swap would delete a page's inline-script nodes on every edit.
-const HTML_EXTENSIONS = /\.html?$/i;
+export const HTML_EXTENSIONS = /\.html?$/i;
 
 // Directory NAMES that must never be watched. Build-output and dependency
 // directories can hold hundreds of thousands of files (a Rust `target/` is
@@ -395,6 +395,28 @@ export class McpWatcher {
    */
   async handleChange(absPath: string): Promise<void> {
     await this.handleBatch([absPath], { syncFlush: true });
+  }
+
+  /**
+   * One-shot headless re-index of an EXPLICIT delta — no chokidar, no debounce,
+   * no live session. Drives the same incremental pipeline the file watcher uses
+   * (deletions first to drop stale state, then changed/added files as ONE batch
+   * with syncFlush so the update is on disk before this resolves). This is the
+   * primitive behind the `openlore reindex` command, which computes {changed,
+   * deleted} from git and calls this directly instead of running a watcher.
+   *
+   * Preconditions (the caller MUST enforce fail-loud): a prior `analyze` exists
+   * (EdgeStore.exists + llm-context present). Without them handleBatch degrades to
+   * a signatures-only no-op with a "run analyze first" note — reindex is a delta
+   * catch-up, not a cold build. Paths are ABSOLUTE (same contract as handleBatch/
+   * handleDeletions). Returns the applied counts for the command summary.
+   */
+  async reindexDelta(delta: { changed?: string[]; deleted?: string[] }): Promise<{ changed: number; deleted: number }> {
+    const deleted = delta.deleted ?? [];
+    const changed = delta.changed ?? [];
+    if (deleted.length > 0) await this.handleDeletions(deleted);
+    if (changed.length > 0) await this.handleBatch(changed, { syncFlush: true });
+    return { changed: changed.length, deleted: deleted.length };
   }
 
   /**

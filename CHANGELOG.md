@@ -3,6 +3,28 @@
 All notable changes to OpenLore are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`openlore reindex` — one-shot incremental delta catch-up** (ru line). Brings
+  the code knowledge base current for only the files that changed since the last
+  analysis — WITHOUT a full `analyze --force` and WITHOUT a long-lived watcher. It
+  computes the delta from git and drives the same incremental pipeline the MCP
+  watch mode uses (a new public `McpWatcher.reindexDelta({changed, deleted})`),
+  so freshness is O(change), not O(repo): per-file call-graph swap (incl.
+  cross-file caller edges), signatures, text-line + dependency-edge lanes, and an
+  incremental vector update (`--no-embed` to skip). The batch-mode counterpart to
+  `openlore mcp --watch-auto` (Spec 13.1) — the right fit for discrete,
+  between-run refreshes (e.g. a control plane re-indexing a target after pulling
+  new commits). Base ref precedence: `--since <ref>` > last reindex marker
+  (`.openlore/analysis/reindex-state.json`) > the commit `analyze` stamped in
+  `fingerprint.json` > HEAD; the analysis dir (`.openlore/`) is never re-indexed.
+  Precondition: a prior `analyze` (fails loud if the base index is missing) — it
+  is a delta catch-up, not a cold build. Boundary (by design): repo-LEVEL
+  aggregates (architecture pattern, domains, high-value ranking) are whole-tree
+  derivations and refresh on the next full `analyze --force` "by cadence".
+
 ## [2.1.3] - 2026-06-22
 
 Everything merged since v2.1.2: a batch of new agent-facing capabilities plus a
