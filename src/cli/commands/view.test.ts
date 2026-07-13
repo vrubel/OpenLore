@@ -29,7 +29,7 @@ vi.mock('vite', () => ({
   }),
 }));
 
-vi.mock('@vitejs/plugin-react', () => ({
+vi.mock('@vitejs/plugin-react-swc', () => ({
   default: vi.fn().mockReturnValue({ name: 'vite:react' }),
 }));
 

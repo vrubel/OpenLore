@@ -119,10 +119,10 @@ export const viewCommand = new Command('view')
       logger.info('Analysis', analysisDir);
       logger.info('Graph', graphPath);
 
-      // Dynamic imports — vite and @vitejs/plugin-react are only needed for `openlore view`,
+      // Dynamic imports — vite and @vitejs/plugin-react-swc are only needed for `openlore view`,
       // so we load them at runtime to avoid ERR_MODULE_NOT_FOUND for other commands (#24).
       const { createServer } = await import('vite');
-      const { default: react } = await import('@vitejs/plugin-react');
+      const { default: react } = await import('@vitejs/plugin-react-swc');
 
       const server = await createServer({
         root: viewerRoot,
