@@ -98,6 +98,29 @@ export function llmWeakModelDirective(): string {
   );
 }
 
+/**
+ * Doc-context directive appended to LLM system prompts when `OPENLORE_DOC_CONTEXT`
+ * is set (the PDLC control plane forwards a distillate of the project's
+ * human-readable documentation in env when doc-grounding is enabled). Purpose /
+ * motivation / architectural decisions are otherwise GUESSED from code; this
+ * directive grounds them in documented facts instead. Advisory: code remains the
+ * authority on BEHAVIOR, the facts explain INTENT ("why"). Empty/unset env → ""
+ * (no-op), so behavior is unchanged unless a host explicitly opts in.
+ */
+export function llmDocContextDirective(): string {
+  const facts = process.env.OPENLORE_DOC_CONTEXT;
+  if (!facts) return '';
+  return (
+    'Project documentation facts follow. Ground Purpose / motivation / architectural ' +
+    'decisions in these facts where they apply — cite the documented "why" instead of ' +
+    'inferring intent from code. Code and its behavior remain the authority on WHAT the ' +
+    'system does; these facts explain the INTENT. Do not invent facts beyond those given.\n\n' +
+    '---\n' +
+    facts +
+    '\n---'
+  );
+}
+
 // ============================================================================
 // STRING TABLE (hardcoded Markdown literals emitted into generated docs)
 // ============================================================================

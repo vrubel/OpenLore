@@ -8,7 +8,7 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import logger from '../../utils/logger.js';
-import { llmGherkinDirective, llmWeakModelDirective, llmLanguageDirective } from '../../utils/i18n.js';
+import { llmGherkinDirective, llmWeakModelDirective, llmLanguageDirective, llmDocContextDirective } from '../../utils/i18n.js';
 import {
   CLAUDE_MAX_CONTEXT_TOKENS,
   CLAUDE_MAX_OUTPUT_TOKENS,
@@ -1757,6 +1757,13 @@ export class LLMService {
     const weakModelDirective = llmWeakModelDirective();
     if (weakModelDirective) {
       request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${weakModelDirective}` };
+    }
+
+    // PDLC: doc-context directive — ground Purpose/motivation/decisions in documented facts
+    // (no-op unless OPENLORE_DOC_CONTEXT set). [Ф4-gen: doc-facts as input to generate]
+    const docContextDirective = llmDocContextDirective();
+    if (docContextDirective) {
+      request = { ...request, systemPrompt: `${request.systemPrompt}\n\n${docContextDirective}` };
     }
 
     // Pre-calculate tokens and warn if approaching limit
