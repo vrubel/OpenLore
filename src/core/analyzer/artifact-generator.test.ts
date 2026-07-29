@@ -9,7 +9,9 @@ import { tmpdir } from 'node:os';
 import {
   generateArtifacts,
   generateAndSaveArtifacts,
+  repoStructureToRepoMap,
 } from './artifact-generator.js';
+import type { RepoStructure } from './artifact-generator.js';
 import type { RepositoryMap, DetectedFramework, LanguageBreakdown, DirectoryStats } from './repository-mapper.js';
 import type { DependencyGraphResult, DependencyNode, DependencyEdge, FileCluster } from './dependency-graph.js';
 import type { ScoredFile, ProjectType } from '../../types/index.js';
@@ -211,6 +213,120 @@ describe('AnalysisArtifactGenerator', () => {
       expect(artifacts.repoStructure).toBeDefined();
       expect(artifacts.repoStructure.projectName).toBe('test-project');
       expect(artifacts.repoStructure.projectType).toBe('node-typescript');
+    });
+
+    describe('project type classification (JavaScript vs TypeScript)', () => {
+      // Regression: the `nodejs` project type used to be printed as
+      // `node-typescript` unconditionally, so a plain JavaScript repository was
+      // reported to downstream consumers as a TypeScript one.
+
+      function nodeRepoMap(files: ScoredFile[], projectType: ProjectType = 'nodejs'): RepositoryMap {
+        return createMockRepoMap({
+          metadata: {
+            projectName: 'test-project',
+            projectType,
+            rootPath: '/test',
+            analyzedAt: '2024-01-15T10:00:00Z',
+            version: '1.0.0',
+          },
+          allFiles: files,
+          highValueFiles: files,
+          entryPoints: [files[0]],
+          schemaFiles: [],
+          configFiles: [],
+        });
+      }
+
+      async function classify(
+        files: ScoredFile[],
+        projectType: ProjectType = 'nodejs'
+      ): Promise<{ type: string; summary: string }> {
+        const artifacts = await generateArtifacts(nodeRepoMap(files, projectType), createMockDepGraph(), {
+          rootDir: tempDir,
+          outputDir,
+        });
+        return { type: artifacts.repoStructure.projectType, summary: artifacts.summaryMarkdown };
+      }
+
+      it('should report a pure JavaScript project as node-javascript', async () => {
+        const files = [
+          createScoredFile({ name: 'index.js', path: 'src/index.js', extension: '.js', directory: 'src', isEntryPoint: true }),
+          createScoredFile({ name: 'server.js', path: 'src/server.js', extension: '.js', directory: 'src' }),
+          createScoredFile({ name: 'utils.mjs', path: 'src/utils.mjs', extension: '.mjs', directory: 'src' }),
+          createScoredFile({ name: 'package.json', path: 'package.json', extension: '.json', isConfig: true }),
+        ];
+
+        const { type, summary } = await classify(files);
+
+        expect(type).toBe('node-javascript');
+        expect(summary).toContain('Node.js/JavaScript');
+        expect(summary).not.toContain('Node.js/TypeScript');
+      });
+
+      it('should not be fooled by shipped *.d.ts typings in a JavaScript project', async () => {
+        const files = [
+          createScoredFile({ name: 'index.js', path: 'src/index.js', extension: '.js', directory: 'src', isEntryPoint: true }),
+          createScoredFile({ name: 'lib.js', path: 'src/lib.js', extension: '.js', directory: 'src' }),
+          createScoredFile({ name: 'index.d.ts', path: 'types/index.d.ts', extension: '.ts', directory: 'types' }),
+        ];
+
+        expect((await classify(files)).type).toBe('node-javascript');
+      });
+
+      it('should not flip on a single stray .ts tooling file', async () => {
+        const files = [
+          ...Array.from({ length: 20 }, (_, i) =>
+            createScoredFile({ name: `mod${i}.js`, path: `src/mod${i}.js`, extension: '.js', directory: 'src' })
+          ),
+          createScoredFile({ name: 'gen.ts', path: 'scripts/gen.ts', extension: '.ts', directory: 'scripts' }),
+        ];
+
+        expect((await classify(files)).type).toBe('node-javascript');
+      });
+
+      it('should report node-typescript when tsconfig.json is present', async () => {
+        const files = [
+          createScoredFile({ name: 'index.js', path: 'src/index.js', extension: '.js', directory: 'src', isEntryPoint: true }),
+          createScoredFile({ name: 'tsconfig.json', path: 'tsconfig.json', extension: '.json', isConfig: true }),
+        ];
+
+        const { type, summary } = await classify(files);
+
+        expect(type).toBe('node-typescript');
+        expect(summary).toContain('Node.js/TypeScript');
+      });
+
+      it('should report node-typescript when TypeScript sources dominate', async () => {
+        const files = [
+          createScoredFile({ name: 'index.ts', path: 'src/index.ts', extension: '.ts', directory: 'src', isEntryPoint: true }),
+          createScoredFile({ name: 'app.tsx', path: 'src/app.tsx', extension: '.tsx', directory: 'src' }),
+          createScoredFile({ name: 'legacy.js', path: 'src/legacy.js', extension: '.js', directory: 'src' }),
+        ];
+
+        expect((await classify(files)).type).toBe('node-typescript');
+      });
+
+      it('should leave non-Node project types untouched', async () => {
+        const files = [
+          createScoredFile({ name: 'main.py', path: 'src/main.py', extension: '.py', directory: 'src', isEntryPoint: true }),
+        ];
+
+        expect((await classify(files, 'python')).type).toBe('python');
+      });
+
+      it('should map both node labels back to the nodejs project type', () => {
+        const rs = (projectType: string): RepoStructure =>
+          ({
+            projectName: 'p',
+            projectType,
+            frameworks: [],
+            statistics: { totalFiles: 1, analyzedFiles: 1, skippedFiles: 0 },
+          } as unknown as RepoStructure);
+
+        expect(repoStructureToRepoMap(rs('node-javascript')).metadata.projectType).toBe('nodejs');
+        expect(repoStructureToRepoMap(rs('node-typescript')).metadata.projectType).toBe('nodejs');
+        expect(repoStructureToRepoMap(rs('python')).metadata.projectType).toBe('python');
+      });
     });
 
     it('should include frameworks list', async () => {
