@@ -39,6 +39,73 @@ export { isTestFile } from './test-file.js';
 import { isTestFile } from './test-file.js';
 
 // ============================================================================
+// PROJECT TYPE (public artifact labels)
+// ============================================================================
+
+/**
+ * Public (artifact-level) labels for a Node.js project. The internal
+ * {@link ProjectType} only knows the ecosystem (`nodejs`); the language the
+ * project is actually written in is decided by looking at the repository map,
+ * never assumed.
+ */
+export const PROJECT_TYPE_NODE_TYPESCRIPT = 'node-typescript';
+export const PROJECT_TYPE_NODE_JAVASCRIPT = 'node-javascript';
+
+/** All public labels that map back to the internal `nodejs` project type. */
+const NODE_PROJECT_TYPE_LABELS = new Set<string>([
+  PROJECT_TYPE_NODE_TYPESCRIPT,
+  PROJECT_TYPE_NODE_JAVASCRIPT,
+]);
+
+/** Source extensions that count as TypeScript. */
+const TYPESCRIPT_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.cts']);
+
+/** Source extensions that count as JavaScript. */
+const JAVASCRIPT_SOURCE_EXTENSIONS = new Set(['.js', '.jsx', '.mjs', '.cjs']);
+
+/**
+ * Minimum share of TypeScript among all JS/TS sources for a project without a
+ * tsconfig to still be called a TypeScript project. Guards against a handful of
+ * stray `.ts` files (tooling, a single script) flipping a JavaScript codebase.
+ */
+const TYPESCRIPT_SOURCE_SHARE_THRESHOLD = 0.1;
+
+/** `tsconfig.json`, `tsconfig.build.json`, `tsconfig.app.json`, … */
+const TSCONFIG_FILE_RE = /^tsconfig(\..+)?\.json$/i;
+
+/**
+ * Decide whether a Node.js repository is a TypeScript one.
+ *
+ * Evidence, in order:
+ *  1. a `tsconfig*.json` anywhere in the map — the project is compiled by tsc;
+ *  2. otherwise the share of TypeScript sources among all JS/TS sources.
+ *
+ * Ambient declaration files (`*.d.ts`) are deliberately NOT counted: plain
+ * JavaScript packages routinely ship hand-written typings, and counting those
+ * is exactly how a JavaScript project gets mislabelled as TypeScript.
+ */
+export function isTypeScriptRepository(repoMap: RepositoryMap): boolean {
+  const files = repoMap.allFiles;
+
+  if (files.some(f => TSCONFIG_FILE_RE.test(f.name))) {
+    return true;
+  }
+
+  let tsCount = 0;
+  let jsCount = 0;
+  for (const file of files) {
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.d.ts') || name.endsWith('.d.mts') || name.endsWith('.d.cts')) continue;
+    const ext = file.extension.toLowerCase();
+    if (TYPESCRIPT_SOURCE_EXTENSIONS.has(ext)) tsCount++;
+    else if (JAVASCRIPT_SOURCE_EXTENSIONS.has(ext)) jsCount++;
+  }
+
+  if (tsCount === 0) return false;
+  return tsCount / (tsCount + jsCount) >= TYPESCRIPT_SOURCE_SHARE_THRESHOLD;
+}
+
+// ============================================================================
 // TYPES
 // ============================================================================
 
@@ -212,7 +279,7 @@ export function repoStructureToRepoMap(rs: RepoStructure): RepositoryMap {
   return {
     metadata: {
       projectName: rs.projectName,
-      projectType: (rs.projectType === 'node-typescript' ? 'nodejs' : rs.projectType) as import('../../types/index.js').ProjectType,
+      projectType: (NODE_PROJECT_TYPE_LABELS.has(rs.projectType) ? 'nodejs' : rs.projectType) as import('../../types/index.js').ProjectType,
       rootPath: '',
       analyzedAt: '',
       version: '',
@@ -406,7 +473,7 @@ export class AnalysisArtifactGenerator {
 
     return {
       projectName: repoMap.metadata.projectName,
-      projectType: this.formatProjectType(repoMap.metadata.projectType),
+      projectType: this.formatProjectType(repoMap),
       frameworks: repoMap.summary.frameworks.map(f => f.name),
       architecture: {
         pattern: architecturePattern,
@@ -437,9 +504,15 @@ export class AnalysisArtifactGenerator {
   /**
    * Format project type for display
    */
-  private formatProjectType(type: ProjectType): string {
-    const mapping: Record<ProjectType, string> = {
-      nodejs: 'node-typescript',
+  private formatProjectType(repoMap: RepositoryMap): string {
+    const type = repoMap.metadata.projectType;
+    if (type === 'nodejs') {
+      // The ecosystem is Node.js; the language is decided by evidence, not assumed.
+      return isTypeScriptRepository(repoMap)
+        ? PROJECT_TYPE_NODE_TYPESCRIPT
+        : PROJECT_TYPE_NODE_JAVASCRIPT;
+    }
+    const mapping: Record<Exclude<ProjectType, 'nodejs'>, string> = {
       python: 'python',
       rust: 'rust',
       go: 'go',
@@ -795,7 +868,7 @@ export class AnalysisArtifactGenerator {
 
     // Overview
     lines.push(t('summary.overview'));
-    lines.push(t('summary.fieldType', { value: this.formatProjectTypeReadable(repoMap.metadata.projectType) }));
+    lines.push(t('summary.fieldType', { value: this.formatProjectTypeReadable(repoMap) }));
     if (repoMap.summary.frameworks.length > 0) {
       lines.push(t('summary.fieldFrameworks', { value: repoMap.summary.frameworks.map(f => f.name).join(', ') }));
     }
@@ -989,9 +1062,12 @@ export class AnalysisArtifactGenerator {
   /**
    * Format project type for human reading
    */
-  private formatProjectTypeReadable(type: ProjectType): string {
-    const mapping: Record<ProjectType, string> = {
-      nodejs: 'Node.js/TypeScript',
+  private formatProjectTypeReadable(repoMap: RepositoryMap): string {
+    const type = repoMap.metadata.projectType;
+    if (type === 'nodejs') {
+      return isTypeScriptRepository(repoMap) ? 'Node.js/TypeScript' : 'Node.js/JavaScript';
+    }
+    const mapping: Record<Exclude<ProjectType, 'nodejs'>, string> = {
       python: 'Python',
       rust: 'Rust',
       go: 'Go',

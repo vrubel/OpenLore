@@ -105,6 +105,60 @@ describe('FileWalker', () => {
       expect(result.files[0].name).toBe('app.ts');
     });
 
+    it('should skip the .git FILE of a git worktree', async () => {
+      // Regression: in a git worktree `.git` is a plain file holding a
+      // `gitdir: …` pointer, not a directory — the dot-prefix rule of
+      // shouldSkipDirectory never saw it, so it leaked into the analysed set.
+      await writeFile(join(testDir, '.git'), 'gitdir: /home/u/repo/.git/worktrees/wt\n');
+      await writeFile(join(testDir, 'app.ts'), '');
+
+      const result = await walkDirectory(testDir);
+
+      expect(result.files.map((f) => f.name)).not.toContain('.git');
+      expect(result.files.map((f) => f.path)).not.toContain('.git');
+      expect(result.files).toHaveLength(1);
+      expect(result.files[0].name).toBe('app.ts');
+    });
+
+    it('should skip a nested .git file (submodule worktree)', async () => {
+      await mkdir(join(testDir, 'libs', 'sub'), { recursive: true });
+      await writeFile(join(testDir, 'libs', 'sub', '.git'), 'gitdir: ../../.git/modules/sub\n');
+      await writeFile(join(testDir, 'libs', 'sub', 'index.ts'), '');
+
+      const result = await walkDirectory(testDir);
+
+      expect(result.files.map((f) => f.name)).not.toContain('.git');
+      expect(result.files.map((f) => f.name)).toContain('index.ts');
+    });
+
+    it('should skip the .git file even when includePatterns are set', async () => {
+      await writeFile(join(testDir, '.git'), 'gitdir: /elsewhere\n');
+      await writeFile(join(testDir, 'app.ts'), '');
+
+      const result = await walkDirectory(testDir, { includePatterns: ['**/*'] });
+
+      expect(result.files.map((f) => f.name)).not.toContain('.git');
+      expect(result.files.map((f) => f.name)).toContain('app.ts');
+    });
+
+    it('should keep .gitignore, .gitattributes and .github while skipping .git', async () => {
+      // The exclusion is exact-name only — dot-files/dirs that merely START with
+      // ".git" stay analysable.
+      await writeFile(join(testDir, '.git'), 'gitdir: /elsewhere\n');
+      await writeFile(join(testDir, '.gitattributes'), '* text=auto\n');
+      await mkdir(join(testDir, '.github', 'workflows'), { recursive: true });
+      await writeFile(join(testDir, '.github', 'workflows', 'ci.yml'), 'name: ci\n');
+      await writeFile(join(testDir, 'app.ts'), '');
+
+      const result = await walkDirectory(testDir);
+      const names = result.files.map((f) => f.name);
+
+      expect(names).not.toContain('.git');
+      expect(names).toContain('.gitattributes');
+      expect(names).toContain('ci.yml');
+      expect(names).toContain('app.ts');
+    });
+
     it('should skip dist and build directories', async () => {
       await mkdir(join(testDir, 'dist'));
       await mkdir(join(testDir, 'build'));

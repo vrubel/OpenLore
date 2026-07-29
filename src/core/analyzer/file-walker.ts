@@ -41,9 +41,18 @@ export interface FileWalkerProgress {
 }
 
 /**
+ * Git's own metadata entry. In a normal clone `.git` is a DIRECTORY, but in a
+ * git worktree (which is what PDLC analyses) it is a plain FILE containing a
+ * `gitdir: …` pointer. It must be excluded in both shapes — matched by exact
+ * name only, so `.gitignore`, `.github` and `.gitlab` are untouched.
+ */
+const GIT_METADATA_ENTRY = '.git';
+
+/**
  * Built-in directories to always skip
  */
 const SKIP_DIRECTORIES = new Set([
+  GIT_METADATA_ENTRY,
   'node_modules',
   'dist',
   'build',
@@ -439,7 +448,15 @@ export class FileWalker {
   /**
    * Check if we should skip a file
    */
-  private shouldSkipFile(relativePath: string, _fileName: string): boolean {
+  private shouldSkipFile(relativePath: string, fileName: string): boolean {
+    // Git metadata is never source. In a worktree `.git` is a FILE (`gitdir: …`),
+    // so shouldSkipDirectory's dot-prefix rule never sees it. Exact-name match:
+    // `.gitignore` / `.gitattributes` / `.gitmodules` stay analysable.
+    // Checked before includePatterns — VCS internals are not opt-in-able.
+    if (fileName === GIT_METADATA_ENTRY) {
+      return true;
+    }
+
     // includePatterns override all exclusions — check first
     if (this.igInclude && this.igInclude.ignores(relativePath)) {
       return false;
