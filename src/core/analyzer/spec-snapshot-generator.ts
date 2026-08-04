@@ -23,6 +23,7 @@ import type { SpecSnapshot, SpecSnapshotDomain, SpecSnapshotHub } from '../../ty
 import type { LLMContext } from './artifact-generator.js';
 import type { MappingArtifact } from '../generator/mapping-generator.js';
 import type { SerializedCallGraph, FunctionNode } from './call-graph.js';
+import { attachCallGraphFromStore } from '../services/call-graph-loader.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -152,7 +153,11 @@ export class SpecSnapshotGenerator {
       discoverSpecDomains(openspecPath, this.rootPath),
     ]);
 
-    const llmContext = llmContextRaw ? JSON.parse(llmContextRaw) as LLMContext : null;
+    // The graph lives in call-graph.db, not in the artifact (PDLC-156) — attach it.
+    const llmContext = attachCallGraphFromStore(
+      llmContextRaw ? JSON.parse(llmContextRaw) as LLMContext : null,
+      analysisDir,
+    );
     const mapping = mappingRaw ? JSON.parse(mappingRaw) as MappingArtifact : null;
 
     const callGraph = llmContext?.callGraph as SerializedCallGraph | undefined;

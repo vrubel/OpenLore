@@ -51,6 +51,7 @@ import { extractMiddleware } from '../../core/analyzer/middleware-extractor.js';
 import { extractEnvVars } from '../../core/analyzer/env-extractor.js';
 import { generateAiConfigs, AI_TOOL_TARGETS, type AiTool, type AiConfigResult } from '../../core/analyzer/ai-config-generator.js';
 import { stringifyArtifact } from '../../core/analyzer/artifact-json.js';
+import { attachCallGraphFromStore } from '../../core/services/call-graph-loader.js';
 
 // ============================================================================
 // TYPES
@@ -825,11 +826,13 @@ async function runEmbedStep(
       }
     }
 
-    // Load context from disk if not provided (cache hit path)
+    // Load context from disk if not provided (cache hit path). The call graph is
+    // not in the artifact any more (PDLC-156) — attach it from call-graph.db, or
+    // the cached path would index signatures only.
     if (!llmContext) {
       try {
         const raw = await readFile(join(outputPath, 'llm-context.json'), 'utf-8');
-        llmContext = JSON.parse(raw);
+        llmContext = attachCallGraphFromStore(JSON.parse(raw), outputPath);
       } catch {
         console.log('    ⚠ Could not read llm-context.json — run openlore analyze --force');
         return;

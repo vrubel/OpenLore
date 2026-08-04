@@ -47,6 +47,7 @@ import {
   OPENLORE_CONFIG_REL_PATH,
 } from '../../constants.js';
 import { stringifyArtifact } from '../analyzer/artifact-json.js';
+import { attachCallGraphFromStore } from './call-graph-loader.js';
 
 // Languages the watcher incrementally re-graphs on edit. MUST include every
 // graphable language whose extension is in SOURCE_EXTENSIONS, otherwise editing
@@ -625,16 +626,32 @@ export class McpWatcher {
   private async loadContext(): Promise<CachedContext | null> {
     try {
       const raw = await readFile(this.contextPath, 'utf-8');
-      return JSON.parse(raw) as CachedContext;
+      const ctx = JSON.parse(raw) as CachedContext;
+      // The graph is not in the artifact any more (PDLC-156) — attach it from
+      // call-graph.db, NON-enumerably: the embed lane reads `context.callGraph`,
+      // while persistContext must never write it back into the artifact. Lazy, so
+      // a pass that only touches signatures never materializes the graph.
+      return attachCallGraphFromStore(ctx, this.outputPath, { enumerable: false });
     } catch {
       return null;
     }
   }
 
   private async persistContext(context: CachedContext): Promise<void> {
-    // Strip the runtime-only EdgeStore handle before serializing.
-    const { edgeStore: _edgeStore, ...serializable } = context as CachedContext & { edgeStore?: unknown };
-    void _edgeStore;
+    // Strip the runtime-only EdgeStore handle and the DB-only CFG overlay before
+    // serializing. Copy-then-delete rather than destructuring: the call graph is a
+    // lazy getter over call-graph.db (PDLC-156), and naming it in a destructuring
+    // pattern would materialize the whole graph on every incremental write only to
+    // throw it away. The spread skips it — it is deliberately non-enumerable — so a
+    // freshly-analyzed context stays graph-free on disk without a `delete` here.
+    //
+    // An analysis taken by an OLDER version is the opposite case: its graph is a
+    // real inline property with no copy in any database, so the spread keeps it and
+    // we leave it alone. Deleting it would destroy the only copy on the first
+    // autosave — turning "old analysis still works" into a silent data loss.
+    const serializable = { ...context } as Partial<CachedContext> & { edgeStore?: unknown };
+    delete serializable.edgeStore;
+    delete serializable.cfgs;
     // Same writer as `analyze` (artifact-generator): compact, and loud about the
     // V8 string ceiling. This path rewrites the WHOLE llm-context.json, so
     // pretty-printing here would have re-inflated it by ~40% on the first

@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { CallEdge, FunctionNode, ClassNode, InheritanceEdge } from '../analyzer/call-graph.js';
+import type { CallEdge, FunctionNode, ClassNode, InheritanceEdge, SerializedCallGraph } from '../analyzer/call-graph.js';
 import type { FunctionCfg } from '../analyzer/cfg.js';
 import type { DecisionNode, DecisionAffectsEdge } from '../decisions/project.js';
 import type { FileProvenance } from '../provenance/git-provenance.js';
@@ -52,7 +52,7 @@ function runTransaction(db: DatabaseSync, fn: () => void): void {
 }
 
 /** Bump when schema changes. Old DBs are dropped and rebuilt on next analyze --force. */
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 export class EdgeStore {
   /**
@@ -87,6 +87,7 @@ export class EdgeStore {
         DROP TABLE IF EXISTS provenance;
         DROP TABLE IF EXISTS change_coupling;
         DROP TABLE IF EXISTS cfg_overlay;
+        DROP TABLE IF EXISTS graph_meta;
         DROP TABLE IF EXISTS schema_version;
         CREATE TABLE schema_version (version INTEGER NOT NULL);
       `);
@@ -104,7 +105,16 @@ export class EdgeStore {
         confidence     TEXT,
         kind           TEXT,
         call_type      TEXT,
-        synthesized_by TEXT
+        synthesized_by TEXT,
+        -- The store is now the ONLY home of the call graph (it used to be a
+        -- production-only projection alongside a full copy in llm-context.json).
+        -- Test-side edges (tested_by, or either end in a test file) live here
+        -- too, flagged, so the test-impact tools keep working — every production
+        -- query filters is_test = 0 and is therefore unchanged by their presence.
+        is_test        INTEGER NOT NULL DEFAULT 0,
+        -- Insertion order of the serialized graph, so materializing it back
+        -- reproduces the previous array order byte-for-byte.
+        ord            INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_caller_id   ON edges(caller_id);
       CREATE INDEX IF NOT EXISTS idx_callee_id   ON edges(callee_id);
@@ -112,9 +122,13 @@ export class EdgeStore {
       CREATE INDEX IF NOT EXISTS idx_callee_file ON edges(callee_file);
 
       CREATE TABLE IF NOT EXISTS inheritance_edges (
+        -- id was dropped on the way in while llm-context.json still held a full
+        -- copy of the graph; with the store now authoritative it has to survive.
+        id        TEXT,
         parent_id TEXT NOT NULL,
         child_id  TEXT NOT NULL,
-        kind      TEXT
+        kind      TEXT,
+        ord       INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_inh_parent ON inheritance_edges(parent_id);
       CREATE INDEX IF NOT EXISTS idx_inh_child  ON inheritance_edges(child_id);
@@ -138,11 +152,28 @@ export class EdgeStore {
         is_entry_point INTEGER NOT NULL DEFAULT 0,
         -- Content-addressed location-independent identity (add-content-addressed-stable-symbol-ids).
         -- Nullable: anonymous/synthetic symbols and pre-bump stores carry none. Additive: id stays PK.
-        stable_id     TEXT
+        stable_id     TEXT,
+        -- Fields below used to survive only in llm-context.json's copy of the graph.
+        -- The store is now its only home, so they are persisted here or the tools
+        -- that read them (surprising-connections' communities, health-map's
+        -- complexity, every line-numbered view) would silently lose them.
+        is_test       INTEGER NOT NULL DEFAULT 0,
+        start_line    INTEGER,
+        end_line      INTEGER,
+        community_id  TEXT,
+        community_label TEXT,
+        cyclomatic_complexity INTEGER,
+        -- Position in the serialized graph's nodes array, and in hubFunctions /
+        -- entryPoints (NULL when not a member). Those two arrays were full node
+        -- copies with a meaningful ranking order; the flags alone cannot restore it.
+        ord           INTEGER NOT NULL DEFAULT 0,
+        hub_ord       INTEGER,
+        entry_ord     INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_node_file ON nodes(file_path);
       CREATE INDEX IF NOT EXISTS idx_node_name ON nodes(name);
       CREATE INDEX IF NOT EXISTS idx_node_stable ON nodes(stable_id);
+      CREATE INDEX IF NOT EXISTS idx_node_test ON nodes(is_test);
 
       CREATE TABLE IF NOT EXISTS classes (
         id             TEXT PRIMARY KEY,
@@ -155,7 +186,8 @@ export class EdgeStore {
         fan_in         INTEGER NOT NULL DEFAULT 0,
         fan_out        INTEGER NOT NULL DEFAULT 0,
         is_module      INTEGER NOT NULL DEFAULT 0,
-        stable_id      TEXT
+        stable_id      TEXT,
+        ord            INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_class_file ON classes(file_path);
       CREATE INDEX IF NOT EXISTS idx_class_name ON classes(name);
@@ -226,6 +258,15 @@ export class EdgeStore {
         cfg         TEXT NOT NULL  -- JSON FunctionCfg
       );
       CREATE INDEX IF NOT EXISTS idx_cfg_file ON cfg_overlay(file_path);
+
+      -- The non-array remainder of the serialized call graph: stats and
+      -- layerViolations. Small, but it belongs with the graph rather than in
+      -- llm-context.json — otherwise the artifact would still carry a piece of
+      -- the graph, and a second reader would have to know where each half lives.
+      CREATE TABLE IF NOT EXISTS graph_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL  -- JSON
+      );
     `);
   }
 
@@ -234,7 +275,7 @@ export class EdgeStore {
   /** All distinct files that call into calleeFile (reverse lookup before delete). */
   getCallerFiles(calleeFile: string): string[] {
     const rows = this.db
-      .prepare('SELECT DISTINCT caller_file FROM edges WHERE callee_file = ?')
+      .prepare('SELECT DISTINCT caller_file FROM edges WHERE callee_file = ? AND is_test = 0')
       .all(calleeFile) as unknown as Array<{ caller_file: string }>;
     return rows.map(r => r.caller_file);
   }
@@ -242,10 +283,10 @@ export class EdgeStore {
   /** All outgoing + incoming edges touching a file. */
   getEdgesForFile(file: string): { outgoing: CallEdge[]; incoming: CallEdge[] } {
     const outgoing = (
-      this.db.prepare('SELECT * FROM edges WHERE caller_file = ?').all(file) as unknown as RawEdge[]
+      this.db.prepare('SELECT * FROM edges WHERE caller_file = ? AND is_test = 0').all(file) as unknown as RawEdge[]
     ).map(rawToCallEdge);
     const incoming = (
-      this.db.prepare('SELECT * FROM edges WHERE callee_file = ?').all(file) as unknown as RawEdge[]
+      this.db.prepare('SELECT * FROM edges WHERE callee_file = ? AND is_test = 0').all(file) as unknown as RawEdge[]
     ).map(rawToCallEdge);
     return { outgoing, incoming };
   }
@@ -253,14 +294,14 @@ export class EdgeStore {
   /** Outgoing edges from a node ID (its direct callees). */
   getCallees(nodeId: string): CallEdge[] {
     return (
-      this.db.prepare('SELECT * FROM edges WHERE caller_id = ?').all(nodeId) as unknown as RawEdge[]
+      this.db.prepare('SELECT * FROM edges WHERE caller_id = ? AND is_test = 0').all(nodeId) as unknown as RawEdge[]
     ).map(rawToCallEdge);
   }
 
   /** Incoming edges to a node ID (its direct callers). */
   getCallers(nodeId: string): CallEdge[] {
     return (
-      this.db.prepare('SELECT * FROM edges WHERE callee_id = ?').all(nodeId) as unknown as RawEdge[]
+      this.db.prepare('SELECT * FROM edges WHERE callee_id = ? AND is_test = 0').all(nodeId) as unknown as RawEdge[]
     ).map(rawToCallEdge);
   }
 
@@ -275,7 +316,7 @@ export class EdgeStore {
   getExternalConsumers(symbolName: string): CallEdge[] {
     return (
       this.db
-        .prepare("SELECT * FROM edges WHERE callee_name = ? AND confidence = 'external'")
+        .prepare("SELECT * FROM edges WHERE callee_name = ? AND confidence = 'external' AND is_test = 0")
         .all(symbolName) as unknown as RawEdge[]
     ).map(rawToCallEdge);
   }
@@ -290,7 +331,7 @@ export class EdgeStore {
   getExternalReferenceNames(): string[] {
     return (
       this.db
-        .prepare("SELECT DISTINCT callee_name FROM edges WHERE confidence = 'external' AND callee_name IS NOT NULL")
+        .prepare("SELECT DISTINCT callee_name FROM edges WHERE confidence = 'external' AND callee_name IS NOT NULL AND is_test = 0")
         .all() as unknown as Array<{ callee_name: string }>
     ).map((r) => r.callee_name);
   }
@@ -300,7 +341,7 @@ export class EdgeStore {
     if (callerIds.length === 0) return [];
     const placeholders = callerIds.map(() => '?').join(',');
     return (
-      this.db.prepare(`SELECT * FROM edges WHERE caller_id IN (${placeholders})`).all(...callerIds) as unknown as RawEdge[]
+      this.db.prepare(`SELECT * FROM edges WHERE caller_id IN (${placeholders}) AND is_test = 0`).all(...callerIds) as unknown as RawEdge[]
     ).map(rawToCallEdge);
   }
 
@@ -309,7 +350,7 @@ export class EdgeStore {
     if (calleeIds.length === 0) return [];
     const placeholders = calleeIds.map(() => '?').join(',');
     return (
-      this.db.prepare(`SELECT * FROM edges WHERE callee_id IN (${placeholders})`).all(...calleeIds) as unknown as RawEdge[]
+      this.db.prepare(`SELECT * FROM edges WHERE callee_id IN (${placeholders}) AND is_test = 0`).all(...calleeIds) as unknown as RawEdge[]
     ).map(rawToCallEdge);
   }
 
@@ -325,12 +366,20 @@ export class EdgeStore {
     this.db.prepare('DELETE FROM edges WHERE caller_file = ?').run(file);
   }
 
-  /** Bulk-insert edges in a single transaction. */
-  insertEdges(edges: CallEdge[]): void {
+  /**
+   * Bulk-insert edges in a single transaction.
+   *
+   * `isTest` marks an edge as belonging to the test side of the graph
+   * (`tested_by`, or either endpoint in a test file). Those edges are stored but
+   * excluded from every production query, exactly as they were when the store
+   * held only the production projection.
+   */
+  insertEdges(edges: CallEdge[], isTest?: (e: CallEdge) => boolean): void {
     const stmt: StatementSync = this.db.prepare(`
-      INSERT INTO edges (caller_id, caller_file, callee_id, callee_file, callee_name, line, confidence, kind, call_type, synthesized_by)
-      VALUES (@callerId, @callerFile, @calleeId, @calleeFile, @calleeName, @line, @confidence, @kind, @callType, @synthesizedBy)
+      INSERT INTO edges (caller_id, caller_file, callee_id, callee_file, callee_name, line, confidence, kind, call_type, synthesized_by, is_test, ord)
+      VALUES (@callerId, @callerFile, @calleeId, @calleeFile, @calleeName, @line, @confidence, @kind, @callType, @synthesizedBy, @isTest, @ord)
     `);
+    let ord = this.maxOrd('edges');
     runTransaction(this.db, () => {
       for (const e of edges) {
         const callerFile = e.callerId.includes('::') ? e.callerId.split('::')[0] : e.callerId;
@@ -346,6 +395,8 @@ export class EdgeStore {
           '@kind':       e.kind ?? null,
           '@callType':   e.callType ?? null,
           '@synthesizedBy': e.synthesizedBy ?? null,
+          '@isTest':     isTest && isTest(e) ? 1 : 0,
+          '@ord':        ++ord,
         });
       }
     });
@@ -354,11 +405,12 @@ export class EdgeStore {
   /** Bulk-insert inheritance edges in a single transaction. */
   insertInheritanceEdges(edges: InheritanceEdge[]): void {
     const stmt: StatementSync = this.db.prepare(
-      'INSERT INTO inheritance_edges (parent_id, child_id, kind) VALUES (@parentId, @childId, @kind)'
+      'INSERT INTO inheritance_edges (id, parent_id, child_id, kind, ord) VALUES (@id, @parentId, @childId, @kind, @ord)'
     );
+    let ord = this.maxOrd('inheritance_edges');
     runTransaction(this.db, () => {
       for (const e of edges) {
-        stmt.run({ '@parentId': e.parentId, '@childId': e.childId, '@kind': e.kind ?? null });
+        stmt.run({ '@id': e.id ?? null, '@parentId': e.parentId, '@childId': e.childId, '@kind': e.kind ?? null, '@ord': ++ord });
       }
     });
   }
@@ -366,13 +418,13 @@ export class EdgeStore {
   // ── Node queries ──────────────────────────────────────────────────────────────
 
   getNode(id: string): FunctionNode | null {
-    const row = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(id) as RawNode | undefined;
+    const row = this.db.prepare('SELECT * FROM nodes WHERE id = ? AND is_test = 0').get(id) as RawNode | undefined;
     return row ? rawToFunctionNode(row) : null;
   }
 
   getNodesForFile(file: string): FunctionNode[] {
     return (
-      this.db.prepare('SELECT * FROM nodes WHERE file_path = ?').all(file) as unknown as RawNode[]
+      this.db.prepare('SELECT * FROM nodes WHERE file_path = ? AND is_test = 0').all(file) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
 
@@ -385,7 +437,7 @@ export class EdgeStore {
    */
   getNodeByStableId(stableId: string): FunctionNode | null {
     const rows = this.db
-      .prepare('SELECT * FROM nodes WHERE stable_id = ? AND is_external = 0')
+      .prepare('SELECT * FROM nodes WHERE stable_id = ? AND is_external = 0 AND is_test = 0')
       .all(stableId) as unknown as RawNode[];
     return rows.length === 1 ? rawToFunctionNode(rows[0]) : null;
   }
@@ -397,7 +449,7 @@ export class EdgeStore {
    */
   getAllInternalNodes(): FunctionNode[] {
     return (
-      this.db.prepare('SELECT * FROM nodes WHERE is_external = 0').all() as unknown as RawNode[]
+      this.db.prepare('SELECT * FROM nodes WHERE is_external = 0 AND is_test = 0').all() as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
 
@@ -413,7 +465,7 @@ export class EdgeStore {
           .prepare(`
             SELECT n.* FROM nodes_fts f
             JOIN nodes n ON n.id = f.node_id
-            WHERE nodes_fts MATCH ? AND n.is_external = 0
+            WHERE nodes_fts MATCH ? AND n.is_external = 0 AND n.is_test = 0
             LIMIT ?
           `)
           .all(phrase, limit) as unknown as RawNode[]
@@ -421,7 +473,7 @@ export class EdgeStore {
     }
     return (
       this.db
-        .prepare('SELECT * FROM nodes WHERE name LIKE ? AND is_external = 0 LIMIT ?')
+        .prepare('SELECT * FROM nodes WHERE name LIKE ? AND is_external = 0 AND is_test = 0 LIMIT ?')
         .all(`%${pattern}%`, limit) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
@@ -429,7 +481,7 @@ export class EdgeStore {
   getHubs(limit = 25): FunctionNode[] {
     return (
       this.db
-        .prepare('SELECT * FROM nodes WHERE is_hub = 1 AND is_external = 0 ORDER BY fan_in DESC LIMIT ?')
+        .prepare('SELECT * FROM nodes WHERE is_hub = 1 AND is_external = 0 AND is_test = 0 ORDER BY fan_in DESC LIMIT ?')
         .all(limit) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
@@ -437,13 +489,13 @@ export class EdgeStore {
   getEntryPoints(limit = 50): FunctionNode[] {
     return (
       this.db
-        .prepare('SELECT * FROM nodes WHERE is_entry_point = 1 AND is_external = 0 ORDER BY fan_out DESC LIMIT ?')
+        .prepare('SELECT * FROM nodes WHERE is_entry_point = 1 AND is_external = 0 AND is_test = 0 ORDER BY fan_out DESC LIMIT ?')
         .all(limit) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
 
   countNodes(): number {
-    const row = this.db.prepare('SELECT COUNT(*) as n FROM nodes WHERE is_external = 0').get() as { n: number };
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM nodes WHERE is_external = 0 AND is_test = 0').get() as { n: number };
     return row.n;
   }
 
@@ -463,17 +515,31 @@ export class EdgeStore {
   /**
    * Bulk-insert nodes. hubIds/entryIds are optional sets used to mark flags;
    * omit them during incremental watcher updates (flags preserved from last analyze).
+   *
+   * `order` carries the positions the serialized graph had — the index in its
+   * `nodes` array and in the ranked `hubFunctions` / `entryPoints` arrays — so
+   * {@link materializeCallGraph} reproduces those arrays exactly rather than
+   * re-deriving an order whose tie-breaks we would only be guessing at. Omitted
+   * by the watcher's incremental path, which appends after the current maximum.
    */
-  insertNodes(nodes: FunctionNode[], hubIds?: Set<string>, entryIds?: Set<string>): void {
+  insertNodes(
+    nodes: FunctionNode[],
+    hubIds?: Set<string>,
+    entryIds?: Set<string>,
+    order?: { nodeOrd?: (id: string) => number; hubOrd?: (id: string) => number | null; entryOrd?: (id: string) => number | null },
+  ): void {
     const stmt: StatementSync = this.db.prepare(`
       INSERT OR REPLACE INTO nodes
         (id, name, file_path, class_name, is_async, language, start_index, end_index,
-         fan_in, fan_out, docstring, signature, is_external, external_kind, is_hub, is_entry_point, stable_id)
+         fan_in, fan_out, docstring, signature, is_external, external_kind, is_hub, is_entry_point, stable_id,
+         is_test, start_line, end_line, community_id, community_label, cyclomatic_complexity, ord, hub_ord, entry_ord)
       VALUES
         (@id, @name, @filePath, @className, @isAsync, @language, @startIndex, @endIndex,
-         @fanIn, @fanOut, @docstring, @signature, @isExternal, @externalKind, @isHub, @isEntryPoint, @stableId)
+         @fanIn, @fanOut, @docstring, @signature, @isExternal, @externalKind, @isHub, @isEntryPoint, @stableId,
+         @isTest, @startLine, @endLine, @communityId, @communityLabel, @cyclomaticComplexity, @ord, @hubOrd, @entryOrd)
     `);
     const ftsStmt: StatementSync = this.db.prepare('INSERT OR REPLACE INTO nodes_fts (node_id, name) VALUES (?, ?)');
+    let nextOrd = order?.nodeOrd ? 0 : this.maxOrd('nodes');
     runTransaction(this.db, () => {
       for (const n of nodes) {
         stmt.run({
@@ -494,10 +560,28 @@ export class EdgeStore {
           '@isHub':        hubIds ? (hubIds.has(n.id) ? 1 : 0) : 0,
           '@isEntryPoint': entryIds ? (entryIds.has(n.id) ? 1 : 0) : 0,
           '@stableId':     n.stableId ?? null,
+          '@isTest':       n.isTest ? 1 : 0,
+          '@startLine':    n.startLine ?? null,
+          '@endLine':      n.endLine ?? null,
+          '@communityId':  n.communityId ?? null,
+          '@communityLabel': n.communityLabel ?? null,
+          '@cyclomaticComplexity': n.cyclomaticComplexity ?? null,
+          '@ord':          order?.nodeOrd ? order.nodeOrd(n.id) : ++nextOrd,
+          '@hubOrd':       order?.hubOrd ? order.hubOrd(n.id) : null,
+          '@entryOrd':     order?.entryOrd ? order.entryOrd(n.id) : null,
         });
-        if (!n.isExternal) ftsStmt.run(n.id, n.name);
+        // Test nodes stay out of the search index: search_code and every
+        // production query it feeds were production-only before the graph moved
+        // into this store, and must remain so.
+        if (!n.isExternal && !n.isTest) ftsStmt.run(n.id, n.name);
       }
     });
+  }
+
+  /** Current maximum `ord` in a table — the append point for incremental inserts. */
+  private maxOrd(table: 'nodes' | 'edges' | 'classes' | 'inheritance_edges'): number {
+    const row = this.db.prepare(`SELECT MAX(ord) as m FROM ${table}`).get() as { m: number | null };
+    return row.m ?? 0;
   }
 
   // ── CFG / data-flow overlay (spec: add-intraprocedural-cfg-dataflow-overlay) ──
@@ -559,10 +643,11 @@ export class EdgeStore {
   insertClasses(classes: ClassNode[]): void {
     const stmt: StatementSync = this.db.prepare(`
       INSERT OR REPLACE INTO classes
-        (id, name, file_path, language, parent_classes, interfaces, method_ids, fan_in, fan_out, is_module, stable_id)
+        (id, name, file_path, language, parent_classes, interfaces, method_ids, fan_in, fan_out, is_module, stable_id, ord)
       VALUES
-        (@id, @name, @filePath, @language, @parentClasses, @interfaces, @methodIds, @fanIn, @fanOut, @isModule, @stableId)
+        (@id, @name, @filePath, @language, @parentClasses, @interfaces, @methodIds, @fanIn, @fanOut, @isModule, @stableId, @ord)
     `);
+    let ord = this.maxOrd('classes');
     runTransaction(this.db, () => {
       for (const c of classes) {
         stmt.run({
@@ -577,6 +662,7 @@ export class EdgeStore {
           '@fanOut':        c.fanOut,
           '@isModule':      c.isModule ? 1 : 0,
           '@stableId':      c.stableId ?? null,
+          '@ord':           ++ord,
         });
       }
     });
@@ -757,9 +843,89 @@ export class EdgeStore {
       .run(filePath, hash, Date.now());
   }
 
+  // ── Whole-graph access (the store replaced llm-context.json's copy) ───────────
+
+  /**
+   * Every node, test nodes included, in the serialized graph's original order.
+   * Unlike the per-query getters this does NOT filter the test side: it exists to
+   * rebuild the full `SerializedCallGraph` that used to live in llm-context.json.
+   */
+  getAllNodes(): FunctionNode[] {
+    return (
+      this.db.prepare('SELECT * FROM nodes ORDER BY ord').all() as unknown as RawNode[]
+    ).map(rawToFunctionNode);
+  }
+
+  /** Every edge, test edges included, in the serialized graph's original order. */
+  getAllEdges(): CallEdge[] {
+    return (
+      this.db.prepare('SELECT * FROM edges ORDER BY ord').all() as unknown as RawEdge[]
+    ).map(rawToCallEdge);
+  }
+
+  getAllClasses(): ClassNode[] {
+    return (
+      this.db.prepare('SELECT * FROM classes ORDER BY ord').all() as unknown as RawClass[]
+    ).map(rawToClassNode);
+  }
+
+  getAllInheritanceEdges(): InheritanceEdge[] {
+    const rows = this.db
+      .prepare('SELECT id, parent_id, child_id, kind FROM inheritance_edges ORDER BY ord')
+      .all() as unknown as Array<{ id: string | null; parent_id: string; child_id: string; kind: string | null }>;
+    return rows.map(r => ({
+      id:       r.id ?? `${r.parent_id}->${r.child_id}`,
+      parentId: r.parent_id,
+      childId:  r.child_id,
+      kind:     (r.kind ?? 'extends') as InheritanceEdge['kind'],
+    }));
+  }
+
+  /** Read one graph_meta value (`stats`, `layerViolations`), or null when absent. */
+  getGraphMeta<T>(key: string): T | null {
+    const row = this.db.prepare('SELECT value FROM graph_meta WHERE key = ?').get(key) as { value: string } | undefined;
+    if (!row) return null;
+    try { return JSON.parse(row.value) as T; } catch { return null; }
+  }
+
+  setGraphMeta(key: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO graph_meta (key, value) VALUES (?, ?)')
+      .run(key, JSON.stringify(value));
+  }
+
+  /**
+   * Rebuild the whole `SerializedCallGraph` from the store — the object that used
+   * to be persisted inside llm-context.json (86–91% of that artifact).
+   *
+   * Returns null for an EMPTY store, so callers can tell "no graph built yet"
+   * from "graph present" and say so out loud instead of serving an empty graph
+   * that reads identically to "no analysis".
+   */
+  materializeCallGraph(): SerializedCallGraph | null {
+    const nodes = this.getAllNodes();
+    if (nodes.length === 0) return null;
+    const hubRows = this.db.prepare('SELECT id FROM nodes WHERE hub_ord IS NOT NULL ORDER BY hub_ord').all() as unknown as Array<{ id: string }>;
+    const entryRows = this.db.prepare('SELECT id FROM nodes WHERE entry_ord IS NOT NULL ORDER BY entry_ord').all() as unknown as Array<{ id: string }>;
+    const byId = new Map(nodes.map(n => [n.id, n]));
+    const pick = (rows: Array<{ id: string }>): FunctionNode[] =>
+      rows.map(r => byId.get(r.id)).filter((n): n is FunctionNode => n !== undefined);
+    return {
+      nodes,
+      edges: this.getAllEdges(),
+      classes: this.getAllClasses(),
+      inheritanceEdges: this.getAllInheritanceEdges(),
+      hubFunctions: pick(hubRows),
+      entryPoints: pick(entryRows),
+      layerViolations: this.getGraphMeta<SerializedCallGraph['layerViolations']>('layerViolations') ?? [],
+      stats: this.getGraphMeta<SerializedCallGraph['stats']>('stats')
+        ?? { totalNodes: 0, totalEdges: 0, avgFanIn: 0, avgFanOut: 0 },
+    };
+  }
+
   /** Drop all graph data — used by full analyze rebuild. */
   clearAll(): void {
-    this.db.exec('DELETE FROM edges; DELETE FROM inheritance_edges; DELETE FROM nodes; DELETE FROM classes; DELETE FROM nodes_fts; DELETE FROM file_hashes; DELETE FROM decisions; DELETE FROM decision_edges; DELETE FROM provenance; DELETE FROM change_coupling; DELETE FROM cfg_overlay;');
+    this.db.exec('DELETE FROM edges; DELETE FROM inheritance_edges; DELETE FROM nodes; DELETE FROM classes; DELETE FROM nodes_fts; DELETE FROM file_hashes; DELETE FROM decisions; DELETE FROM decision_edges; DELETE FROM provenance; DELETE FROM change_coupling; DELETE FROM cfg_overlay; DELETE FROM graph_meta;');
   }
 
   /** Run fn inside a single SQLite transaction. */
@@ -819,6 +985,15 @@ interface RawNode {
   is_hub:         number;
   is_entry_point: number;
   stable_id:      string | null;
+  is_test:        number;
+  start_line:     number | null;
+  end_line:       number | null;
+  community_id:   string | null;
+  community_label: string | null;
+  cyclomatic_complexity: number | null;
+  ord:            number;
+  hub_ord:        number | null;
+  entry_ord:      number | null;
 }
 
 interface RawClass {
@@ -938,6 +1113,12 @@ function rawToFunctionNode(r: RawNode): FunctionNode {
     ...(r.signature    && { signature:    r.signature }),
     ...(r.is_external  && { isExternal:   true }),
     ...(r.external_kind && { externalKind: r.external_kind as FunctionNode['externalKind'] }),
+    ...(r.is_test      && { isTest:       true }),
+    ...(r.start_line !== null && { startLine: r.start_line }),
+    ...(r.end_line   !== null && { endLine:   r.end_line }),
+    ...(r.community_id    && { communityId:    r.community_id }),
+    ...(r.community_label && { communityLabel: r.community_label }),
+    ...(r.cyclomatic_complexity !== null && { cyclomaticComplexity: r.cyclomatic_complexity }),
     ...(r.stable_id    && { stableId:     r.stable_id }),
   };
 }

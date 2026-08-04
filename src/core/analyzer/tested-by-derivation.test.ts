@@ -50,10 +50,12 @@ describe('tested_by derivation — full analyze pipeline (bugs A + B)', () => {
       const outputPath = join(dir, '.openlore', 'analysis');
       await runAnalysis(dir, outputPath, { maxFiles: 50, include: [], exclude: [] });
 
-      const ctx = JSON.parse(await readFile(join(outputPath, 'llm-context.json'), 'utf-8')) as {
-        callGraph?: { nodes: Array<{ name: string; isTest?: boolean; filePath: string }>; edges: Array<{ kind?: string; callerId: string }> };
-      };
-      const cg = ctx.callGraph!;
+      // The graph lives in call-graph.db, not in llm-context.json (PDLC-156) — and
+      // that includes the test side, which is what tested_by is made of.
+      const ctx = JSON.parse(await readFile(join(outputPath, 'llm-context.json'), 'utf-8')) as { callGraph?: unknown };
+      expect(ctx.callGraph, 'the artifact must not carry the graph any more').toBeUndefined();
+      const { loadCallGraph } = await import('../services/call-graph-loader.js');
+      const cg = loadCallGraph(outputPath)!;
       expect(cg).toBeTruthy();
       // Bug A: the test file must be analyzed (its presence yields tested_by).
       // Bug A+B: the production fn must be tested_by the test file.

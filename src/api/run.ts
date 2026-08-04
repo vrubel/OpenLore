@@ -36,6 +36,7 @@ import { OpenSpecFormatGenerator } from '../core/generator/openspec-format-gener
 import { OpenSpecWriter } from '../core/generator/openspec-writer.js';
 import { ADRGenerator } from '../core/generator/adr-generator.js';
 import type { RunApiOptions, RunResult, InitResult, AnalyzeResult, ProgressCallback } from './types.js';
+import { attachCallGraphFromStore } from '../core/services/call-graph-loader.js';
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'run', step, status, detail });
@@ -48,10 +49,10 @@ async function loadCachedArtifacts(
   analysisPath: string,
   repoStructure: RepoStructure,
 ): Promise<AnalysisArtifacts> {
-  const llmContext = await readJsonFile<LLMContext>(
+  const llmContext = attachCallGraphFromStore(await readJsonFile<LLMContext>(
     join(analysisPath, ARTIFACT_LLM_CONTEXT),
     ARTIFACT_LLM_CONTEXT,
-  ) ?? { phase1_survey: { purpose: '', files: [] }, phase2_deep: { purpose: '', files: [] }, phase3_validation: { purpose: '', files: [] } };
+  ), analysisPath) ?? { phase1_survey: { purpose: '', files: [] }, phase2_deep: { purpose: '', files: [] }, phase3_validation: { purpose: '', files: [] } };
 
   let summaryMarkdown = '';
   let dependencyDiagram = '';
@@ -282,10 +283,10 @@ export async function openloreRun(options: RunApiOptions = {}): Promise<RunResul
   }
 
   // Load analysis data for pipeline
-  const llmContext = await readJsonFile<LLMContext>(
+  const llmContext = attachCallGraphFromStore(await readJsonFile<LLMContext>(
     join(analysisPath, ARTIFACT_LLM_CONTEXT),
     ARTIFACT_LLM_CONTEXT,
-  ) ?? {
+  ), analysisPath) ?? {
     phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
     phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
     phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },

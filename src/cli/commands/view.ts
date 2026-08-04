@@ -29,6 +29,7 @@ import { VectorIndex } from '../../core/analyzer/vector-index.js';
 import { EmbeddingService } from '../../core/analyzer/embedding-service.js';
 import { getSkeletonContent, detectLanguage } from '../../core/analyzer/code-shaper.js';
 import { runChatAgent, resolveProviderConfig } from '../../core/services/chat-agent.js';
+import { attachCallGraphFromStore, type ContextWithCallGraph } from '../../core/services/call-graph-loader.js';
 
 /** Strip internal filesystem paths and API keys from error messages before sending to clients. */
 export function sanitizeErrorMessage(msg: string): string {
@@ -158,10 +159,16 @@ export const viewCommand = new Command('view')
                     res.end(JSON.stringify({ error: 'llm-context.json not found' }));
                     return;
                   }
-                  const json = await readFile(llmContextPath, 'utf-8');
+                  // The call graph is no longer inside the artifact (PDLC-156) —
+                  // it lives in call-graph.db. The viewer expects one object with
+                  // the graph inline, so attach it before serving.
+                  const ctx = attachCallGraphFromStore(
+                    JSON.parse(await readFile(llmContextPath, 'utf-8')) as ContextWithCallGraph,
+                    analysisDir,
+                  );
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
-                  res.end(json);
+                  res.end(JSON.stringify(ctx));
                 } catch (err) {
                   res.statusCode = 500;
                   res.end(JSON.stringify({ error: sanitizeErrorMessage((err as Error).message) }));
@@ -175,17 +182,18 @@ export const viewCommand = new Command('view')
                     res.end(JSON.stringify({ error: 'llm-context.json not found' }));
                     return;
                   }
-                  const raw = JSON.parse(await readFile(llmContextPath, 'utf-8')) as {
-                    callGraph?: { classes?: unknown[]; inheritanceEdges?: unknown[]; edges?: unknown[]; nodes?: unknown[] };
-                  };
-                  const cg = raw.callGraph ?? {};
+                  const raw = attachCallGraphFromStore(
+                    JSON.parse(await readFile(llmContextPath, 'utf-8')) as ContextWithCallGraph,
+                    analysisDir,
+                  );
+                  const cg = raw?.callGraph;
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(JSON.stringify({
-                    classes:         cg.classes         ?? [],
-                    inheritanceEdges: cg.inheritanceEdges ?? [],
-                    edges:           cg.edges            ?? [],
-                    nodes:           cg.nodes            ?? [],
+                    classes:          cg?.classes          ?? [],
+                    inheritanceEdges: cg?.inheritanceEdges ?? [],
+                    edges:            cg?.edges            ?? [],
+                    nodes:            cg?.nodes            ?? [],
                   }));
                 } catch (err) {
                   res.statusCode = 500;

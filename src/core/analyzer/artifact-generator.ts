@@ -394,6 +394,25 @@ export class AnalysisArtifactGenerator {
     // Ensure output directory exists
     await mkdir(this.options.outputDir, { recursive: true });
 
+    // Write the SQLite graph store FIRST and let it fail loudly. It is no longer
+    // an additive duplicate of what llm-context.json carries — it is the ONLY
+    // home of the call graph, so a swallowed failure here would leave an analysis
+    // whose graph tools all answer "no call graph" with nothing said about why.
+    if (artifacts.llmContext.callGraph) {
+      const dbPath = join(this.options.outputDir, ARTIFACT_CALL_GRAPH_DB);
+      try {
+        await writeEdgesToSQLite(artifacts.llmContext.callGraph, dbPath, this.options.rootDir, artifacts.llmContext.cfgs);
+      } catch (err) {
+        throw new Error(
+          `Failed to write the call graph to ${ARTIFACT_CALL_GRAPH_DB} (${dbPath}). The call graph ` +
+          `lives ONLY in this database — without it every graph tool (analyze_impact, ` +
+          `trace_execution_path, get_subgraph, blast radius, test impact) is unavailable. ` +
+          `Cause: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
+    }
+
     // Save each artifact
     const saves: Promise<void>[] = [
       writeFile(
@@ -410,14 +429,15 @@ export class AnalysisArtifactGenerator {
       ),
       writeFile(
         join(this.options.outputDir, ARTIFACT_LLM_CONTEXT),
-        // Strip the CFG/def-use overlay before persisting: it is DB-only and must
-        // never enter the resident llm-context.json or the hot cache (spec:
-        // add-intraprocedural-cfg-dataflow-overlay).
-        // Written compact: this is the largest artifact by far (the call graph
-        // dominates it) and is machine input only, so pretty-printing bought
+        // Strip the CFG/def-use overlay AND the call graph before persisting: both
+        // are DB-only and must never enter the resident llm-context.json or the hot
+        // cache (specs: add-intraprocedural-cfg-dataflow-overlay; PDLC-156). The
+        // call graph was 86–91% of this artifact and the whole of its growth curve
+        // — it now lives solely in call-graph.db, which readers attach lazily.
+        // Written compact: it is machine input only, so pretty-printing bought
         // nothing but ~40% more characters against the V8 string ceiling.
         stringifyArtifact(
-          { ...artifacts.llmContext, cfgs: undefined },
+          { ...artifacts.llmContext, cfgs: undefined, callGraph: undefined },
           ARTIFACT_LLM_CONTEXT,
           {
             scale: describeContextScale(artifacts.llmContext),
@@ -465,16 +485,6 @@ export class AnalysisArtifactGenerator {
     }
 
     await Promise.all(saves);
-
-    // Write SQLite edge store alongside JSON artifacts (additive, non-fatal)
-    if (artifacts.llmContext.callGraph) {
-      try {
-        const dbPath = join(this.options.outputDir, ARTIFACT_CALL_GRAPH_DB);
-        await writeEdgesToSQLite(artifacts.llmContext.callGraph, dbPath, this.options.rootDir, artifacts.llmContext.cfgs);
-      } catch {
-        // Non-fatal — JSON artifacts are the source of truth
-      }
-    }
 
     return artifacts;
   }
@@ -1427,19 +1437,33 @@ export async function writeEdgesToSQLite(
     const hubIds   = new Set(callGraph.hubFunctions.map(n => norm(n.id)));
     const entryIds = new Set(callGraph.entryPoints.map(n => norm(n.id)));
 
-    // The edge store is the PRODUCTION call graph: test nodes + their edges (and the
-    // derived `tested_by` edges) live only in llm-context.json for the test-impact
-    // tools. Filtering them here keeps analyze_impact / search / blast-radius — which
-    // read the edge store — production-only and unchanged by test inclusion.
+    // The store used to hold the PRODUCTION projection only: test nodes, their
+    // edges and the derived `tested_by` edges lived in llm-context.json, which the
+    // test-impact tools read. The graph no longer ships in that artifact, so the
+    // test side is written HERE — flagged `is_test`, filtered out of every
+    // production query, so analyze_impact / search / blast-radius see exactly the
+    // graph they saw before.
     const testNodeIds = new Set(nodes.filter(n => n.isTest).map(n => n.id));
-    const prodNodes = nodes.filter(n => !n.isTest);
-    const prodEdges = edges.filter(e =>
-      e.kind !== 'tested_by' && !testNodeIds.has(e.callerId) && !testNodeIds.has(e.calleeId));
+    const isTestEdge = (e: typeof edges[number]): boolean =>
+      e.kind === 'tested_by' || testNodeIds.has(e.callerId) || testNodeIds.has(e.calleeId);
 
-    store.insertNodes(prodNodes, hubIds, entryIds);
-    store.insertEdges(prodEdges);
+    // Positions in the serialized arrays — see EdgeStore.insertNodes(order).
+    const nodeOrd  = new Map(nodes.map((n, i) => [n.id, i]));
+    const hubOrd   = new Map(callGraph.hubFunctions.map((n, i) => [norm(n.id), i]));
+    const entryOrd = new Map(callGraph.entryPoints.map((n, i) => [norm(n.id), i]));
+
+    store.insertNodes(nodes, hubIds, entryIds, {
+      nodeOrd:  id => nodeOrd.get(id) ?? 0,
+      hubOrd:   id => hubOrd.get(id) ?? null,
+      entryOrd: id => entryOrd.get(id) ?? null,
+    });
+    store.insertEdges(edges, isTestEdge);
     store.insertInheritanceEdges(inheritanceEdges);
     store.insertClasses(classes);
+    // The non-array remainder of the graph, so the store carries ALL of it and
+    // llm-context.json carries none.
+    store.setGraphMeta('stats', callGraph.stats);
+    store.setGraphMeta('layerViolations', callGraph.layerViolations);
 
     // CFG/def-use overlay (spec: add-intraprocedural-cfg-dataflow-overlay).
     // Production functions only — keyed by the same normalized ids as nodes.

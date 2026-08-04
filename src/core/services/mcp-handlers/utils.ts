@@ -13,6 +13,42 @@ import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT
 
 /** LLMContext with optional SQLite edge store attached (present when call-graph.db exists). */
 export type CachedContext = LLMContext & { edgeStore?: EdgeStore };
+
+/**
+ * Attach the call graph to a context read from disk (PDLC-156).
+ *
+ * `llm-context.json` no longer carries `callGraph` — it lives in call-graph.db,
+ * which is where it was already being written. The property is re-attached here
+ * as a LAZY getter over the store: a tool that never touches the graph never pays
+ * to materialize it, and one that does sees exactly the object the artifact used
+ * to hold (same arrays, same order — the store keeps the serialized positions).
+ *
+ * Two things this deliberately does NOT do:
+ *   • it does not fabricate an empty graph. An empty/absent store yields
+ *     `undefined`, which every graph tool already reports as "re-run analyze";
+ *   • it does not override a graph that IS present in the JSON. An analysis taken
+ *     by an older version still carries one inline, and keeps working unchanged.
+ */
+export function attachCallGraph(ctx: CachedContext, store: EdgeStore | undefined): void {
+  if (ctx.callGraph !== undefined || !store) return;
+  let materialized: LLMContext['callGraph'] | undefined;
+  let done = false;
+  Object.defineProperty(ctx, 'callGraph', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (!done) {
+        done = true;
+        materialized = store.materializeCallGraph() ?? undefined;
+      }
+      return materialized;
+    },
+    set(v: LLMContext['callGraph']) {
+      done = true;
+      materialized = v;
+    },
+  });
+}
 import { logger } from '../../../utils/logger.js';
 import { emit } from '../telemetry.js';
 import { redactSecretString } from '../secret-redaction.js';
@@ -303,21 +339,55 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
           ctx.callGraph = undefined;
         }
       }
+      // The call graph now lives ONLY in call-graph.db, so an analysis whose
+      // artifact carries no graph is normal — and an analysis whose STORE carries
+      // no graph is a real fault that must be audible. `hasAnalysis` is the test
+      // for "there is an analysis here at all": if the artifact has content but
+      // the graph is missing on both sides, the two are out of sync (interrupted
+      // analyze, deleted db, schema bump) and every graph tool is about to answer
+      // "no call graph" with no explanation of why.
+      const jsonProdNodes = Array.isArray(ctx.callGraph?.nodes)
+        ? ctx.callGraph.nodes.filter(n => !n.isExternal && !n.isTest).length
+        : 0;
+      // "There is an analysis here at all" — used to tell a fresh, empty project
+      // apart from an analysis whose graph went missing.
+      const hasAnalysis = (ctx.signatures?.length ?? 0) > 0 || (ctx.phase1_survey?.files?.length ?? 0) > 0;
       if (EdgeStore.exists(analysisDir)) {
         const es = EdgeStore.open(EdgeStore.dbPath(analysisDir));
-        // Schema-bump guard: opening a DB whose SCHEMA_VERSION is stale wipes it
-        // (rebuild-on-bump). If the DB is now empty but the JSON analysis still has
-        // production nodes, the two are out of sync after an upgrade — do NOT serve
-        // the empty store. Edge-store tools then return "Re-run analyze_codebase"
-        // instead of silent empty results; the next analyze repopulates and re-attaches.
-        const jsonProdNodes = Array.isArray(ctx.callGraph?.nodes)
-          ? ctx.callGraph.nodes.filter(n => !n.isExternal && !n.isTest).length
-          : 0;
+        // Schema-bump guard, for an analysis taken BEFORE the graph moved into the
+        // store: opening a DB whose SCHEMA_VERSION is stale wipes it, and serving
+        // the empty store next to a JSON that still has production nodes would give
+        // silent empty results. Withhold it, as before, so edge-store tools say
+        // "re-run analyze_codebase" while the inline graph still answers the rest.
         if ((es.wasReset || jsonProdNodes > 0) && es.countNodes() === 0 && jsonProdNodes > 0) {
           es.close();
         } else {
+          // Attach the store — it also carries decisions, provenance and change
+          // coupling, which are useful even when the graph is empty — and hang the
+          // lazy call graph off it.
           ctx.edgeStore = es;
+          attachCallGraph(ctx, es);
+          // The graph now lives ONLY here. An empty store next to a real analysis
+          // means the two are out of sync (interrupted analyze, deleted db, schema
+          // bump): every graph tool is about to answer "no call graph", and without
+          // this line that answer is indistinguishable from "no analysis yet".
+          if (hasAnalysis && jsonProdNodes === 0 && es.countNodes() === 0) {
+            logger.warning(
+              es.wasReset
+                ? `The call graph index (${EdgeStore.dbPath(analysisDir)}) was reset by a version upgrade and is ` +
+                  `empty. Graph tools stay unavailable until "openlore analyze --force" rebuilds it.`
+                : `The analysis in ${analysisDir} has no call graph: ${EdgeStore.dbPath(analysisDir)} is empty, ` +
+                  `and llm-context.json does not carry one (the graph lives in that database). ` +
+                  `Re-run "openlore analyze --force" to rebuild it.`
+            );
+          }
         }
+      } else if (hasAnalysis && jsonProdNodes === 0) {
+        logger.warning(
+          `The analysis in ${analysisDir} has no call graph: ${EdgeStore.dbPath(analysisDir)} is missing, ` +
+          `and llm-context.json does not carry one (the graph lives in that database). ` +
+          `Re-run "openlore analyze --force" to rebuild it.`
+        );
       }
       // Evict + close the previous entry's EdgeStore — otherwise each cache miss
       // (every `analyze` rewrites llm-context.json's mtime) leaks an open SQLite

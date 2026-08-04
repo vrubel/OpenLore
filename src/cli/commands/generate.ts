@@ -60,6 +60,7 @@ import { MappingGenerator } from '../../core/generator/mapping-generator.js';
 import type { MappingArtifact } from '../../core/generator/mapping-generator.js';
 import { RagManifestGenerator } from '../../core/generator/rag-manifest-generator.js';
 import { createProgress } from '../../utils/progress.js';
+import { attachCallGraphFromStore } from '../../core/services/call-graph-loader.js';
 
 // ============================================================================
 // TYPES
@@ -98,10 +99,10 @@ async function loadAnalysis(analysisPath: string): Promise<AnalysisData | null> 
     );
     if (!repoStructure) return null;
 
-    const llmContext = await readJsonFile<LLMContext>(
+    const llmContext = attachCallGraphFromStore(await readJsonFile<LLMContext>(
       join(analysisPath, ARTIFACT_LLM_CONTEXT),
       ARTIFACT_LLM_CONTEXT,
-    ) ?? {
+    ), analysisPath) ?? {
       phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
       phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
       phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
