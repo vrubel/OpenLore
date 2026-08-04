@@ -37,6 +37,23 @@ import { t } from '../../utils/i18n.js';
 // same shared definition so the two can no longer drift.
 export { isTestFile } from './test-file.js';
 import { isTestFile } from './test-file.js';
+import { stringifyArtifact } from './artifact-json.js';
+
+/**
+ * Element counts that drive the size of llm-context.json, for the error raised
+ * when it no longer fits into a single JSON string. The call graph dominates the
+ * artifact (measured on a 593-file repository: 5.81 MB of 6.73 MB), so naming
+ * its node/edge counts points straight at what has to be narrowed.
+ */
+function describeContextScale(ctx: LLMContext): string {
+  const parts = [`${ctx.signatures?.length ?? 0} file signature(s)`];
+  if (ctx.callGraph) {
+    parts.push(
+      `call graph ${ctx.callGraph.nodes?.length ?? 0} node(s) / ${ctx.callGraph.edges?.length ?? 0} edge(s)`
+    );
+  }
+  return parts.join(', ');
+}
 
 // ============================================================================
 // PROJECT TYPE (public artifact labels)
@@ -369,7 +386,7 @@ export class AnalysisArtifactGenerator {
     const saves: Promise<void>[] = [
       writeFile(
         join(this.options.outputDir, ARTIFACT_REPO_STRUCTURE),
-        JSON.stringify(artifacts.repoStructure, null, 2)
+        stringifyArtifact(artifacts.repoStructure, ARTIFACT_REPO_STRUCTURE, { indent: 2 })
       ),
       writeFile(
         join(this.options.outputDir, 'SUMMARY.md'),
@@ -384,28 +401,35 @@ export class AnalysisArtifactGenerator {
         // Strip the CFG/def-use overlay before persisting: it is DB-only and must
         // never enter the resident llm-context.json or the hot cache (spec:
         // add-intraprocedural-cfg-dataflow-overlay).
-        JSON.stringify({ ...artifacts.llmContext, cfgs: undefined }, null, 2)
+        // Written compact: this is the largest artifact by far (the call graph
+        // dominates it) and is machine input only, so pretty-printing bought
+        // nothing but ~40% more characters against the V8 string ceiling.
+        stringifyArtifact(
+          { ...artifacts.llmContext, cfgs: undefined },
+          ARTIFACT_LLM_CONTEXT,
+          { scale: describeContextScale(artifacts.llmContext) }
+        )
       ),
     ];
 
     if (enrichment?.schemas) {
       saves.push(writeFile(
         join(this.options.outputDir, ARTIFACT_SCHEMA_INVENTORY),
-        JSON.stringify(enrichment.schemas, null, 2)
+        stringifyArtifact(enrichment.schemas, ARTIFACT_SCHEMA_INVENTORY, { indent: 2 })
       ));
     }
 
     if (enrichment?.uiComponents) {
       saves.push(writeFile(
         join(this.options.outputDir, ARTIFACT_UI_INVENTORY),
-        JSON.stringify(enrichment.uiComponents, null, 2)
+        stringifyArtifact(enrichment.uiComponents, ARTIFACT_UI_INVENTORY, { indent: 2 })
       ));
     }
 
     if (enrichment?.routeInventory) {
       saves.push(writeFile(
         join(this.options.outputDir, ARTIFACT_ROUTE_INVENTORY),
-        JSON.stringify(enrichment.routeInventory, null, 2)
+        stringifyArtifact(enrichment.routeInventory, ARTIFACT_ROUTE_INVENTORY, { indent: 2 })
       ));
     }
 
@@ -413,7 +437,7 @@ export class AnalysisArtifactGenerator {
       const { ARTIFACT_MIDDLEWARE_INVENTORY } = await import('../../constants.js');
       saves.push(writeFile(
         join(this.options.outputDir, ARTIFACT_MIDDLEWARE_INVENTORY),
-        JSON.stringify(enrichment.middleware, null, 2)
+        stringifyArtifact(enrichment.middleware, ARTIFACT_MIDDLEWARE_INVENTORY, { indent: 2 })
       ));
     }
 
@@ -421,7 +445,7 @@ export class AnalysisArtifactGenerator {
       const { ARTIFACT_ENV_INVENTORY } = await import('../../constants.js');
       saves.push(writeFile(
         join(this.options.outputDir, ARTIFACT_ENV_INVENTORY),
-        JSON.stringify(enrichment.envVars, null, 2)
+        stringifyArtifact(enrichment.envVars, ARTIFACT_ENV_INVENTORY, { indent: 2 })
       ));
     }
 
@@ -1310,7 +1334,7 @@ export class AnalysisArtifactGenerator {
     try {
       await writeFile(
         join(this.options.outputDir, 'duplicates.json'),
-        JSON.stringify(duplicates, null, 2)
+        stringifyArtifact(duplicates, 'duplicates.json', { indent: 2 })
       );
     } catch {
       // non-fatal if output dir doesn't exist yet
@@ -1331,7 +1355,7 @@ export class AnalysisArtifactGenerator {
     try {
       await writeFile(
         join(this.options.outputDir, ARTIFACT_REFACTOR_PRIORITIES),
-        JSON.stringify(refactorReport, null, 2)
+        stringifyArtifact(refactorReport, ARTIFACT_REFACTOR_PRIORITIES, { indent: 2 })
       );
     } catch {
       // non-fatal

@@ -50,6 +50,7 @@ import { buildRouteInventory } from '../../core/analyzer/http-route-parser.js';
 import { extractMiddleware } from '../../core/analyzer/middleware-extractor.js';
 import { extractEnvVars } from '../../core/analyzer/env-extractor.js';
 import { generateAiConfigs, AI_TOOL_TARGETS, type AiTool, type AiConfigResult } from '../../core/analyzer/ai-config-generator.js';
+import { stringifyArtifact } from '../../core/analyzer/artifact-json.js';
 
 // ============================================================================
 // TYPES
@@ -191,10 +192,14 @@ export async function runAnalysis(
     envVars,
   });
 
-  // Also save the raw dependency graph
+  // Also save the raw dependency graph. Compact, like llm-context.json: it is
+  // machine input that grows with the repository, so pretty-printing it only
+  // spends characters against the V8 string ceiling.
   await writeFile(
     join(outputPath, ARTIFACT_DEPENDENCY_GRAPH),
-    JSON.stringify(depGraph, null, 2)
+    stringifyArtifact(depGraph, ARTIFACT_DEPENDENCY_GRAPH, {
+      scale: `${depGraph.statistics.nodeCount} node(s) / ${depGraph.statistics.edgeCount} edge(s)`,
+    })
   );
 
   // Write the metadata fingerprint (path + mtime + size per source file — not file

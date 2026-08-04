@@ -7,6 +7,7 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
+import { MAX_STRING_LENGTH } from '../../analyzer/artifact-json.js';
 import { EdgeStore } from '../edge-store.js';
 import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR, OPENSPEC_DIR } from '../../../constants.js';
 
@@ -189,8 +190,14 @@ const STALE_STORE_CLOSE_DELAY_MS = 30_000;
 
 /** Hard ceiling on the analysis artifact (.openlore/analysis/llm-context.json)
  * before we deserialize it. Real contexts are single-digit MB; this generous cap
- * exists only to fail closed on a poisoned/oversized artifact rather than OOM. */
-const ARTIFACT_MAX_BYTES = 512 * 1024 * 1024;
+ * exists only to fail closed on a poisoned/oversized artifact rather than OOM.
+ *
+ * Pinned to the V8 string ceiling rather than a round 512 MiB: the previous cap
+ * sat 24 bytes ABOVE the longest string the runtime can hold, so a file in that
+ * window passed the size check and then died inside readFile with
+ * ERR_STRING_TOO_LONG instead of the clean "artifact_too_large" miss. Byte length
+ * is never below character count, so a file over this cap provably cannot be read. */
+const ARTIFACT_MAX_BYTES = MAX_STRING_LENGTH;
 
 /** Test-only: clear in-memory context cache to force cold path. */
 export function _resetContextCacheForTesting(): void {
