@@ -7,7 +7,8 @@
 
 import { join } from 'node:path';
 import { readFile, stat, mkdir, writeFile } from 'node:fs/promises';
-import { ANALYSIS_STALE_THRESHOLD_MS, DEFAULT_MAX_FILES, OPENLORE_ANALYSIS_REL_PATH, ARTIFACT_REPO_STRUCTURE, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_LLM_CONTEXT, OPENSPEC_DIR } from '../constants.js';
+import { ANALYSIS_STALE_THRESHOLD_MS, DEFAULT_MAX_FILES, OPENLORE_ANALYSIS_REL_PATH, ARTIFACT_REPO_STRUCTURE, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_LLM_CONTEXT, OPENLORE_CONFIG_REL_PATH, OPENSPEC_DIR } from '../constants.js';
+import { stringifyArtifact } from '../core/analyzer/artifact-json.js';
 import { fileExists, readJsonFile } from '../utils/command-helpers.js';
 import { readOpenLoreConfig } from '../core/services/config-manager.js';
 import { RepositoryMapper } from '../core/analyzer/repository-mapper.js';
@@ -176,8 +177,16 @@ export async function openloreAnalyze(options: AnalyzeApiOptions = {}): Promise<
   });
   const artifacts = await artifactGenerator.generateAndSave(repoMap, depGraph);
 
-  // Save dependency graph
-  await writeFile(join(outputPath, ARTIFACT_DEPENDENCY_GRAPH), JSON.stringify(depGraph, null, 2));
+  // Save dependency graph — same writer as the CLI path (compact, loud about the
+  // string ceiling). This API backs `openlore serve` rebuilds and the
+  // analyze_codebase MCP tool, so it must not drift back to pretty-printing.
+  await writeFile(
+    join(outputPath, ARTIFACT_DEPENDENCY_GRAPH),
+    stringifyArtifact(depGraph, ARTIFACT_DEPENDENCY_GRAPH, {
+      scale: `${depGraph.statistics.nodeCount} node(s) / ${depGraph.statistics.edgeCount} edge(s)`,
+      configPath: join(rootPath, OPENLORE_CONFIG_REL_PATH),
+    })
+  );
   progress(onProgress, 'Generating analysis artifacts', 'complete');
 
   // Generate spec snapshot (non-fatal — snapshot is a derived artifact)

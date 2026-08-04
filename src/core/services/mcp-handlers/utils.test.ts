@@ -8,14 +8,17 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { openSync, ftruncateSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { vi } from 'vitest';
+import { MAX_STRING_LENGTH } from '../../analyzer/artifact-json.js';
 import {
   validateDirectory,
   sanitizeMcpError,
   safeJoin,
   readCachedContext,
+  _resetContextCacheForTesting,
   isCacheFresh,
   computeProjectFingerprint,
   loadMappingIndex,
@@ -227,6 +230,24 @@ describe('readCachedContext', () => {
     await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), 'not-json', 'utf-8');
     const result = await readCachedContext(tmpDir);
     expect(result).toBeNull();
+  });
+
+  it('rejects an artifact longer than the runtime string ceiling, without reading it', async () => {
+    // The old 512 MiB cap sat 24 bytes ABOVE the longest string V8 can hold, so a
+    // file in that window passed the size check and then blew up inside readFile
+    // after ~1.3 s and ~590 MB RSS. A sparse file reproduces the window at zero
+    // disk cost: apparent size only, no blocks allocated.
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(dir, { recursive: true });
+    const fd = openSync(join(dir, ARTIFACT_LLM_CONTEXT), 'w');
+    ftruncateSync(fd, MAX_STRING_LENGTH + 12);  // inside the old cap, over the ceiling
+    closeSync(fd);
+
+    _resetContextCacheForTesting();
+    const started = Date.now();
+    expect(await readCachedContext(tmpDir)).toBeNull();
+    // Decided from stat alone — no half-gigabyte read attempt behind it.
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 
   it('returns parsed LLMContext when file is valid', async () => {

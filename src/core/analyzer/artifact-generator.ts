@@ -20,6 +20,7 @@ import {
   ARTIFACT_ROUTE_INVENTORY,
   ARTIFACT_UI_INVENTORY,
   ARTIFACT_CALL_GRAPH_DB,
+  OPENLORE_CONFIG_REL_PATH,
 } from '../../constants.js';
 import type { ScoredFile, ProjectType } from '../../types/index.js';
 import type { RepositoryMap } from './repository-mapper.js';
@@ -42,15 +43,26 @@ import { stringifyArtifact } from './artifact-json.js';
 /**
  * Element counts that drive the size of llm-context.json, for the error raised
  * when it no longer fits into a single JSON string. The call graph dominates the
- * artifact (measured on a 593-file repository: 5.81 MB of 6.73 MB), so naming
- * its node/edge counts points straight at what has to be narrowed.
+ * artifact (measured on a 593-file repository: 6 088 439 of 7 052 971 chars,
+ * 86%), so naming its counts points straight at what has to be narrowed.
+ *
+ * Every array of the serialised graph is counted, not just nodes/edges:
+ * `hubFunctions` and `entryPoints` hold full FunctionNode copies rather than
+ * ids, so they carry real weight and would otherwise be invisible in the report.
  */
 function describeContextScale(ctx: LLMContext): string {
   const parts = [`${ctx.signatures?.length ?? 0} file signature(s)`];
-  if (ctx.callGraph) {
-    parts.push(
-      `call graph ${ctx.callGraph.nodes?.length ?? 0} node(s) / ${ctx.callGraph.edges?.length ?? 0} edge(s)`
-    );
+  const cg = ctx.callGraph;
+  if (cg) {
+    const counts: Array<[string, unknown]> = [
+      ['node', cg.nodes], ['edge', cg.edges], ['class', cg.classes],
+      ['inheritance edge', cg.inheritanceEdges], ['hub', cg.hubFunctions],
+      ['entry point', cg.entryPoints], ['layer violation', cg.layerViolations],
+    ];
+    const shown = counts
+      .filter(([, arr]) => Array.isArray(arr) && arr.length > 0)
+      .map(([label, arr]) => `${(arr as unknown[]).length} ${label}(s)`);
+    if (shown.length > 0) parts.push(`call graph ${shown.join(' / ')}`);
   }
   return parts.join(', ');
 }
@@ -407,7 +419,10 @@ export class AnalysisArtifactGenerator {
         stringifyArtifact(
           { ...artifacts.llmContext, cfgs: undefined },
           ARTIFACT_LLM_CONTEXT,
-          { scale: describeContextScale(artifacts.llmContext) }
+          {
+            scale: describeContextScale(artifacts.llmContext),
+            configPath: join(this.options.rootDir, OPENLORE_CONFIG_REL_PATH),
+          }
         )
       ),
     ];
@@ -1330,12 +1345,12 @@ export class AnalysisArtifactGenerator {
     // Duplicate detection — static analysis, no LLM (Types 1-2-3)
     const duplicates = detectDuplicates(callGraphFiles, callGraphResult);
 
-    // Save duplicates
+    // Save duplicates. Serialise OUTSIDE the catch: a missing output dir is
+    // non-fatal, but a string-ceiling overflow is a real defect and its
+    // actionable message must not be swallowed by the write guard.
+    const duplicatesJson = stringifyArtifact(duplicates, 'duplicates.json', { indent: 2 });
     try {
-      await writeFile(
-        join(this.options.outputDir, 'duplicates.json'),
-        stringifyArtifact(duplicates, 'duplicates.json', { indent: 2 })
-      );
+      await writeFile(join(this.options.outputDir, 'duplicates.json'), duplicatesJson);
     } catch {
       // non-fatal if output dir doesn't exist yet
     }
@@ -1351,12 +1366,11 @@ export class AnalysisArtifactGenerator {
     }
     const refactorReport = analyzeForRefactoring(callGraph, mappings, duplicates);
 
-    // Save refactor priorities
+    // Save refactor priorities — same split as duplicates.json above: overflow
+    // is fatal and loud, a failed write stays non-fatal.
+    const refactorJson = stringifyArtifact(refactorReport, ARTIFACT_REFACTOR_PRIORITIES, { indent: 2 });
     try {
-      await writeFile(
-        join(this.options.outputDir, ARTIFACT_REFACTOR_PRIORITIES),
-        stringifyArtifact(refactorReport, ARTIFACT_REFACTOR_PRIORITIES, { indent: 2 })
-      );
+      await writeFile(join(this.options.outputDir, ARTIFACT_REFACTOR_PRIORITIES), refactorJson);
     } catch {
       // non-fatal
     }

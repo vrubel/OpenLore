@@ -419,11 +419,41 @@ describe('Untrusted Artifact Deserialization Safety (mcp-security)', () => {
   });
 
   it('readCachedContext bounds artifact size (regression: ARTIFACT_MAX_BYTES guard present)', () => {
-    // The oversized path is asserted structurally (writing a 512MB file in CI is
-    // wasteful); confirm the size gate exists in source so it can't be removed.
+    // Behaviour is covered in utils.test.ts with a sparse file (zero disk cost);
+    // this pins the source so the gate cannot be quietly dropped. The previous
+    // pattern `[\d *]+` included a literal SPACE, so it matched the bare
+    // "ARTIFACT_MAX_BYTES = " and asserted nothing about the value.
     const src = readFileSync(join(SRC, 'core', 'services', 'mcp-handlers', 'utils.ts'), 'utf-8');
-    expect(src).toMatch(/ARTIFACT_MAX_BYTES\s*=\s*[\d *]+/);
+    expect(src).toMatch(/ARTIFACT_MAX_BYTES\s*=\s*MAX_STRING_LENGTH\b/);
     expect(src).toMatch(/st\.size\s*>\s*ARTIFACT_MAX_BYTES/);
+  });
+
+  it('no artifact writer bypasses stringifyArtifact (regression: watcher re-inflated llm-context.json)', () => {
+    // The ceiling guard is only worth as much as its coverage: the watcher wrote
+    // the SAME llm-context.json with a raw pretty-printing JSON.stringify, which
+    // undid the compaction on the first incremental update and raised a bare
+    // RangeError of its own. Pin every writer of a growing artifact.
+    const writers = [
+      join(SRC, 'core', 'analyzer', 'artifact-generator.ts'),
+      join(SRC, 'core', 'services', 'mcp-watcher.ts'),
+      join(SRC, 'cli', 'commands', 'analyze.ts'),
+      join(SRC, 'api', 'analyze.ts'),
+      join(SRC, 'api', 'run.ts'),
+    ];
+    // Fixed-size sidecars may serialise directly — they hold a handful of scalars
+    // and cannot approach the ceiling however large the repository gets.
+    const FIXED_SIZE_SIDECARS = [/ARTIFACT_FINGERPRINT/, /runsDir/];
+
+    const offenders: string[] = [];
+    for (const file of writers) {
+      const src = readFileSync(file, 'utf-8');
+      // A raw JSON.stringify handed straight to writeFile — the shape that drifts.
+      for (const call of src.match(/writeFile\([^;]*?JSON\.stringify\([^;]*?\);/gs) ?? []) {
+        if (FIXED_SIZE_SIDECARS.some(re => re.test(call))) continue;
+        offenders.push(`${file}: ${call.slice(0, 60).replace(/\s+/g, ' ')}…`);
+      }
+    }
+    expect(offenders, `raw JSON.stringify passed to writeFile in: ${offenders.join(' | ')}`).toEqual([]);
   });
 });
 

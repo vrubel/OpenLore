@@ -195,10 +195,19 @@ export async function runAnalysis(
   // Also save the raw dependency graph. Compact, like llm-context.json: it is
   // machine input that grows with the repository, so pretty-printing it only
   // spends characters against the V8 string ceiling.
+  //
+  // Serialising the large artifacts is silent and, on the repositories that
+  // approach the ceiling, slow — and a host that watches for output (PDLC kills a
+  // tool after 15 minutes without a line) would otherwise reap the process right
+  // before it could report why. Say what is happening first.
+  logger.analysis(
+    `Writing analysis artifacts (dependency graph: ${depGraph.statistics.nodeCount} nodes, ${depGraph.statistics.edgeCount} edges)...`
+  );
   await writeFile(
     join(outputPath, ARTIFACT_DEPENDENCY_GRAPH),
     stringifyArtifact(depGraph, ARTIFACT_DEPENDENCY_GRAPH, {
       scale: `${depGraph.statistics.nodeCount} node(s) / ${depGraph.statistics.edgeCount} edge(s)`,
+      configPath: join(rootPath, OPENLORE_CONFIG_REL_PATH),
     })
   );
 

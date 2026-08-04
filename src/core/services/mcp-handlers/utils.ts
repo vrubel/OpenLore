@@ -192,11 +192,18 @@ const STALE_STORE_CLOSE_DELAY_MS = 30_000;
  * before we deserialize it. Real contexts are single-digit MB; this generous cap
  * exists only to fail closed on a poisoned/oversized artifact rather than OOM.
  *
- * Pinned to the V8 string ceiling rather than a round 512 MiB: the previous cap
- * sat 24 bytes ABOVE the longest string the runtime can hold, so a file in that
- * window passed the size check and then died inside readFile with
- * ERR_STRING_TOO_LONG instead of the clean "artifact_too_large" miss. Byte length
- * is never below character count, so a file over this cap provably cannot be read. */
+ * Pinned to the V8 string ceiling rather than a round 512 MiB, which sat 24 bytes
+ * ABOVE the longest string this runtime can hold. A file in that window passed
+ * the size check and then blew up inside readFile — a RangeError that the outer
+ * catch swallowed into an anonymous miss, after spending ~1.3 s and ~590 MB RSS
+ * reading a file it could never turn into a string. Pinning the cap makes that
+ * case a named miss, decided from `stat` alone.
+ *
+ * Direction of the guarantee: byte length is never BELOW character count, so a
+ * file within the cap provably fits in a string — which is what closes the hole.
+ * The converse does not hold: a file over the cap may still be short enough in
+ * characters (multi-byte UTF-8), so this rejects fail-closed. Hitting that window
+ * requires landing in those same 24 bytes. */
 const ARTIFACT_MAX_BYTES = MAX_STRING_LENGTH;
 
 /** Test-only: clear in-memory context cache to force cold path. */
@@ -256,6 +263,16 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
       // contexts are single-digit MB, far below this ceiling.
       if (st.size > ARTIFACT_MAX_BYTES) {
         emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'artifact_too_large', size: st.size });
+        // `emit` is a no-op without OPENLORE_TELEMETRY=1, and callers only see a
+        // null context — indistinguishable from "no analysis yet", which is what
+        // every graph tool then tells the operator to fix by re-running analyze.
+        // Say the real reason out loud, or this branch is invisible.
+        logger.warning(
+          `${ARTIFACT_LLM_CONTEXT} is ${st.size.toLocaleString('en-US')} bytes — over the ` +
+          `${ARTIFACT_MAX_BYTES.toLocaleString('en-US')} byte ceiling (the longest string this ` +
+          `runtime can hold), so it cannot be loaded. Re-run analyze with a narrower surface ` +
+          `(analysis.excludePatterns / --exclude); graph tools stay unavailable until then.`
+        );
         return null;
       }
       // Cache miss — read 3.7MB JSON and open EdgeStore connection
