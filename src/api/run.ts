@@ -9,6 +9,7 @@
 import { join } from 'node:path';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { DEFAULT_MAX_FILES, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_COMPAT_MODEL, DEFAULT_COPILOT_MODEL, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_LOGS_SUBDIR, OPENLORE_CONFIG_REL_PATH, OPENLORE_GENERATION_SUBDIR, OPENLORE_RUNS_SUBDIR, DEFAULT_OPENSPEC_PATH, ARTIFACT_REPO_STRUCTURE, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_LLM_CONTEXT } from '../constants.js';
+import { stringifyArtifact } from '../core/analyzer/artifact-json.js';
 import { fileExists, readJsonFile } from '../utils/command-helpers.js';
 import { isCacheFresh } from '../core/services/mcp-handlers/utils.js';
 import {
@@ -184,9 +185,14 @@ export async function openloreRun(options: RunApiOptions = {}): Promise<RunResul
     });
     const artifacts = await artifactGenerator.generateAndSave(repoMap, depGraph);
 
+    // Compact + loud about the string ceiling, like every other writer of this
+    // artifact (CLI analyze, api/analyze, the watcher).
     await writeFile(
       join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
-      JSON.stringify(depGraph, null, 2)
+      stringifyArtifact(depGraph, ARTIFACT_DEPENDENCY_GRAPH, {
+        scale: `${depGraph.statistics.nodeCount} node(s) / ${depGraph.statistics.edgeCount} edge(s)`,
+        configPath: join(rootPath, OPENLORE_CONFIG_REL_PATH),
+      })
     );
 
     analyzeResult = {

@@ -44,7 +44,9 @@ import {
   WATCH_BULK_THRESHOLD,
   WATCH_EMBED_FILE_CEILING,
   WATCH_VCS_SETTLE_MS,
+  OPENLORE_CONFIG_REL_PATH,
 } from '../../constants.js';
+import { stringifyArtifact } from '../analyzer/artifact-json.js';
 
 // Languages the watcher incrementally re-graphs on edit. MUST include every
 // graphable language whose extension is in SOURCE_EXTENSIONS, otherwise editing
@@ -633,7 +635,19 @@ export class McpWatcher {
     // Strip the runtime-only EdgeStore handle before serializing.
     const { edgeStore: _edgeStore, ...serializable } = context as CachedContext & { edgeStore?: unknown };
     void _edgeStore;
-    await writeFile(this.contextPath, JSON.stringify(serializable, null, 2), 'utf-8');
+    // Same writer as `analyze` (artifact-generator): compact, and loud about the
+    // V8 string ceiling. This path rewrites the WHOLE llm-context.json, so
+    // pretty-printing here would have re-inflated it by ~40% on the first
+    // incremental update and silently undone what analyze just saved — and an
+    // overflow would have surfaced as a bare "reindex failed: Invalid string
+    // length" with no artifact name and no lever.
+    await writeFile(
+      this.contextPath,
+      stringifyArtifact(serializable, ARTIFACT_LLM_CONTEXT, {
+        configPath: join(this.rootPath, OPENLORE_CONFIG_REL_PATH),
+      }),
+      'utf-8'
+    );
     // Hand the patched object back to the read cache, aligned to the new on-disk
     // mtime, so the next tool call is a cache hit (no cold re-parse). This is the
     // fix for root-cause item 2 (mtime bump forcing a full re-read). Only valid
@@ -835,7 +849,9 @@ export class McpWatcher {
       // Atomic write (tmp + rename) so a concurrent MCP read never sees a torn
       // JSON — matching the watcher's "readers never see a torn graph" invariant.
       const tmp = `${graphPath}.${process.pid}.tmp`;
-      await writeFile(tmp, JSON.stringify(graph));
+      await writeFile(tmp, stringifyArtifact(graph, ARTIFACT_DEPENDENCY_GRAPH, {
+        configPath: join(this.rootPath, OPENLORE_CONFIG_REL_PATH),
+      }));
       await rename(tmp, graphPath);
       if (this.debug) {
         process.stderr.write(
@@ -959,7 +975,9 @@ export class McpWatcher {
       }
 
       const tmp = `${graphPath}.${process.pid}.tmp`;
-      await writeFile(tmp, JSON.stringify(graph));
+      await writeFile(tmp, stringifyArtifact(graph, ARTIFACT_DEPENDENCY_GRAPH, {
+        configPath: join(this.rootPath, OPENLORE_CONFIG_REL_PATH),
+      }));
       await rename(tmp, graphPath);
     } catch (err) {
       process.stderr.write(`[mcp-watcher] delete (dep-graph) error: ${(err as Error).message}\n`);

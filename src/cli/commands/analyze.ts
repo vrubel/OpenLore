@@ -50,6 +50,7 @@ import { buildRouteInventory } from '../../core/analyzer/http-route-parser.js';
 import { extractMiddleware } from '../../core/analyzer/middleware-extractor.js';
 import { extractEnvVars } from '../../core/analyzer/env-extractor.js';
 import { generateAiConfigs, AI_TOOL_TARGETS, type AiTool, type AiConfigResult } from '../../core/analyzer/ai-config-generator.js';
+import { stringifyArtifact } from '../../core/analyzer/artifact-json.js';
 
 // ============================================================================
 // TYPES
@@ -141,6 +142,16 @@ export async function runAnalysis(
   logger.info('Files found', repoMap.summary.totalFiles);
   logger.info('Files analyzed', repoMap.summary.analyzedFiles);
   logger.info('Files skipped', repoMap.summary.skippedFiles);
+  // The walker simply stops once the cap is reached — in traversal order, with no
+  // signal of its own. Silence here reads as "the whole repository was analysed",
+  // when in fact everything past the cutoff is missing from every artifact.
+  if (repoMap.summary.analyzedFiles >= options.maxFiles) {
+    logger.warning(
+      `Stopped at the ${options.maxFiles}-file cap: this analysis is a PARTIAL slice, cut off in ` +
+      `traversal order, not a view of the whole repository. Raise --max-files (or analysis.maxFiles ` +
+      `in the config), or narrow the tree with excludePatterns so the cap is not reached.`
+    );
+  }
   logger.blank();
 
   // Phase 2: Dependency Graph
@@ -191,10 +202,23 @@ export async function runAnalysis(
     envVars,
   });
 
-  // Also save the raw dependency graph
+  // Also save the raw dependency graph. Compact, like llm-context.json: it is
+  // machine input that grows with the repository, so pretty-printing it only
+  // spends characters against the V8 string ceiling.
+  //
+  // Serialising the large artifacts is silent and, on the repositories that
+  // approach the ceiling, slow — and a host that watches for output (PDLC kills a
+  // tool after 15 minutes without a line) would otherwise reap the process right
+  // before it could report why. Say what is happening first.
+  logger.analysis(
+    `Writing analysis artifacts (dependency graph: ${depGraph.statistics.nodeCount} nodes, ${depGraph.statistics.edgeCount} edges)...`
+  );
   await writeFile(
     join(outputPath, ARTIFACT_DEPENDENCY_GRAPH),
-    JSON.stringify(depGraph, null, 2)
+    stringifyArtifact(depGraph, ARTIFACT_DEPENDENCY_GRAPH, {
+      scale: `${depGraph.statistics.nodeCount} node(s) / ${depGraph.statistics.edgeCount} edge(s)`,
+      configPath: join(rootPath, OPENLORE_CONFIG_REL_PATH),
+    })
   );
 
   // Write the metadata fingerprint (path + mtime + size per source file — not file
@@ -227,8 +251,9 @@ export const analyzeCommand = new Command('analyze')
   )
   .option(
     '--max-files <n>',
-    'Maximum number of files to analyze (default: 100000)',
-    '100000'
+    `Maximum number of files to analyze (default: analysis.maxFiles from ${OPENLORE_CONFIG_REL_PATH}, else ${DEFAULT_MAX_FILES})`
+    // NO commander default: the default has to stay distinguishable from an
+    // explicit flag, otherwise analysis.maxFiles in the config can never win.
   )
   .option(
     '--include <glob>',
@@ -298,11 +323,17 @@ After analysis, run 'openlore generate' to create OpenSpec files.
     const startTime = Date.now();
     const rootPath = process.cwd();
 
+    // analysis.maxFiles lived in the config but was never read: runAnalysis merges
+    // only include/excludePatterns, and commander's own default always won. An
+    // operator who set it got a silent no-op. Precedence is now explicit —
+    // CLI flag > config > built-in default.
+    const configuredMaxFiles = (await readOpenLoreConfig(rootPath))?.analysis?.maxFiles;
+
     const opts: ExtendedAnalyzeOptions = {
       output: options.output ?? `${OPENLORE_ANALYSIS_REL_PATH}/`,
       maxFiles: typeof options.maxFiles === 'string'
         ? parseInt(options.maxFiles, 10)
-        : options.maxFiles ?? DEFAULT_MAX_FILES,
+        : options.maxFiles ?? configuredMaxFiles ?? DEFAULT_MAX_FILES,
       include: options.include ?? [],
       exclude: options.exclude ?? [],
       force: options.force ?? false,

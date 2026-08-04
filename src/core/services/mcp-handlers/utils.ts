@@ -7,6 +7,7 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
+import { MAX_STRING_LENGTH } from '../../analyzer/artifact-json.js';
 import { EdgeStore } from '../edge-store.js';
 import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR, OPENSPEC_DIR } from '../../../constants.js';
 
@@ -189,8 +190,21 @@ const STALE_STORE_CLOSE_DELAY_MS = 30_000;
 
 /** Hard ceiling on the analysis artifact (.openlore/analysis/llm-context.json)
  * before we deserialize it. Real contexts are single-digit MB; this generous cap
- * exists only to fail closed on a poisoned/oversized artifact rather than OOM. */
-const ARTIFACT_MAX_BYTES = 512 * 1024 * 1024;
+ * exists only to fail closed on a poisoned/oversized artifact rather than OOM.
+ *
+ * Pinned to the V8 string ceiling rather than a round 512 MiB, which sat 24 bytes
+ * ABOVE the longest string this runtime can hold. A file in that window passed
+ * the size check and then blew up inside readFile — a RangeError that the outer
+ * catch swallowed into an anonymous miss, after spending ~1.3 s and ~590 MB RSS
+ * reading a file it could never turn into a string. Pinning the cap makes that
+ * case a named miss, decided from `stat` alone.
+ *
+ * Direction of the guarantee: byte length is never BELOW character count, so a
+ * file within the cap provably fits in a string — which is what closes the hole.
+ * The converse does not hold: a file over the cap may still be short enough in
+ * characters (multi-byte UTF-8), so this rejects fail-closed. Hitting that window
+ * requires landing in those same 24 bytes. */
+const ARTIFACT_MAX_BYTES = MAX_STRING_LENGTH;
 
 /** Test-only: clear in-memory context cache to force cold path. */
 export function _resetContextCacheForTesting(): void {
@@ -249,6 +263,16 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
       // contexts are single-digit MB, far below this ceiling.
       if (st.size > ARTIFACT_MAX_BYTES) {
         emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'artifact_too_large', size: st.size });
+        // `emit` is a no-op without OPENLORE_TELEMETRY=1, and callers only see a
+        // null context — indistinguishable from "no analysis yet", which is what
+        // every graph tool then tells the operator to fix by re-running analyze.
+        // Say the real reason out loud, or this branch is invisible.
+        logger.warning(
+          `${ARTIFACT_LLM_CONTEXT} is ${st.size.toLocaleString('en-US')} bytes — over the ` +
+          `${ARTIFACT_MAX_BYTES.toLocaleString('en-US')} byte ceiling (the longest string this ` +
+          `runtime can hold), so it cannot be loaded. Re-run analyze with a narrower surface ` +
+          `(analysis.excludePatterns / --exclude); graph tools stay unavailable until then.`
+        );
         return null;
       }
       // Cache miss — read 3.7MB JSON and open EdgeStore connection
@@ -480,7 +504,20 @@ export async function loadMappingIndex(absDir: string, retryCount: number = 1): 
   
   const loadAttempt = async (attempt: number): Promise<MappingIndex | null> => {
     try {
-      const raw = await readFile(join(absDir, '.openlore', 'analysis', 'mapping.json'), 'utf-8');
+      const mappingPath = join(absDir, '.openlore', 'analysis', 'mapping.json');
+      // mcp-security: "Parsing SHALL bound input size" covers mapping.json too, not
+      // just llm-context.json. Without this, an oversized artifact spends the read
+      // before failing — and past the string ceiling it cannot be read at all.
+      const st = await stat(mappingPath);
+      if (st.size > ARTIFACT_MAX_BYTES) {
+        logger.warning(
+          `mapping.json is ${st.size.toLocaleString('en-US')} bytes — over the ` +
+          `${ARTIFACT_MAX_BYTES.toLocaleString('en-US')} byte ceiling, so it cannot be loaded. ` +
+          `Re-run analyze with a narrower surface (analysis.excludePatterns / --exclude).`
+        );
+        return null;
+      }
+      const raw = await readFile(mappingPath, 'utf-8');
       const parsed: unknown = JSON.parse(raw);
       // Untrusted artifact: validate top-level shape before use. A malformed
       // mapping.json (non-object, or no `mappings` array) fails closed — retrying

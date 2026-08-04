@@ -790,6 +790,37 @@ describe('AnalysisArtifactGenerator', () => {
       expect(llmContext.phase1_survey).toBeDefined();
     });
 
+    it('writes llm-context.json compact and repo-structure.json indented', async () => {
+      // Formatting is load-bearing, not cosmetic: indentation cost ~40% of
+      // llm-context.json's characters against the V8 string ceiling. Both files
+      // parse back either way, so only the raw text catches a regression here.
+      const srcDir = join(tempDir, 'src');
+      await mkdir(srcDir, { recursive: true });
+      await writeFile(join(srcDir, 'index.ts'), 'export const main = () => {};');
+
+      const repoMap = createMockRepoMap({
+        highValueFiles: [
+          createScoredFile({
+            name: 'index.ts',
+            path: 'src/index.ts',
+            absolutePath: join(srcDir, 'index.ts'),
+          }),
+        ],
+      });
+
+      await generateAndSaveArtifacts(repoMap, createMockDepGraph(), {
+        rootDir: tempDir,
+        outputDir,
+      });
+
+      const llmContextRaw = await readFile(join(outputDir, 'llm-context.json'), 'utf-8');
+      expect(llmContextRaw).not.toContain('\n');
+      expect(llmContextRaw.startsWith('{"')).toBe(true);
+
+      const repoStructureRaw = await readFile(join(outputDir, 'repo-structure.json'), 'utf-8');
+      expect(repoStructureRaw).toMatch(/^\{\n  "/);
+    });
+
     it('writes callGraph with correct edge shape to llm-context.json', async () => {
       const srcDir = join(tempDir, 'src');
       await mkdir(srcDir, { recursive: true });

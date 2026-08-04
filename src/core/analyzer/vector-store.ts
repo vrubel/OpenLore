@@ -20,7 +20,9 @@
  * <dbPath>/.qdrant — existsSync(dbPath) истинно для обоих бэкендов; данные при этом в Qdrant.
  * fail-loud: Qdrant не-2xx → throw (НЕ молчаливый пустой результат).
  */
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, createReadStream, createWriteStream, renameSync, openSync, readSync, closeSync } from 'node:fs';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -152,14 +154,52 @@ export class FileBackend implements VectorBackend {
     this.file = join(dbPath, `${tableName}.records.json`);
   }
 
+  /**
+   * NDJSON: одна запись — одна строка, дописываемая потоком.
+   *
+   * Раньше корпус сериализовался единым `JSON.stringify(records)`, и это упиралось
+   * в предел строки V8 РАНЬШЕ всех остальных артефактов: на строчном текстовом
+   * индексе — примерно с 12 600 файлов (замер: 42 529 символов на файл), на
+   * векторном с эмбеддингами — уже с 2–3 тысяч (один 768-мерный вектор весит
+   * 16 185 символов JSON). Хуже того, переполнение ГЛОТАЛОСЬ вызывающим:
+   * `analyze` завершался успешно, индекса не было, а `orient`/`search_code`
+   * молча отдавали пустоту. Построчная запись убирает потолок совсем — ни на
+   * одном шаге не собирается строка длиннее одной записи.
+   */
   async build(records: VectorRecord[]): Promise<void> {
     mkdirSync(this.dbPath, { recursive: true });   // папка vector-index/ → VectorIndex.exists() (проверка папки) истинно
-    writeFileSync(this.file, JSON.stringify(records));   // overwrite: id+payload+vector (vector — plain number[])
+    // tmp + rename: читатель никогда не видит наполовину переписанный корпус.
+    const tmp = `${this.file}.${process.pid}.tmp`;
+    const out = createWriteStream(tmp, { encoding: 'utf8' });
+    for (const r of records) {
+      if (!out.write(`${JSON.stringify(r)}\n`)) await once(out, 'drain');
+    }
+    out.end();
+    await once(out, 'finish');
+    renameSync(tmp, this.file);
   }
 
   async loadAll(): Promise<Record<string, unknown>[]> {
     if (!existsSync(this.file)) return [];
-    const rows = JSON.parse(readFileSync(this.file, 'utf8')) as Record<string, unknown>[];
+    const rows: Record<string, unknown>[] = [];
+    // Формат распознаём по первому байту. '[' — корпус, записанный ДО перехода на
+    // NDJSON; такой файл по построению помещался в одну строку (иначе его не
+    // удалось бы записать), поэтому читать его целиком безопасно. Иначе — NDJSON
+    // построчно: целиком его читать нельзя, readFile('utf8') на корпусе больше
+    // предела строки бросил бы ERR_STRING_TOO_LONG и обнулил бы смысл правки.
+    const fd = openSync(this.file, 'r');
+    const head = Buffer.alloc(1);
+    const got = readSync(fd, head, 0, 1, 0);
+    closeSync(fd);
+
+    if (got === 1 && head.toString('utf8') === '[') {
+      rows.push(...(JSON.parse(readFileSync(this.file, 'utf8')) as Record<string, unknown>[]));
+    } else if (got === 1) {
+      const rl = createInterface({ input: createReadStream(this.file, 'utf8'), crlfDelay: Infinity });
+      for await (const line of rl) {
+        if (line.length > 0) rows.push(JSON.parse(line) as Record<string, unknown>);
+      }
+    }
     for (const r of rows) if (r.vector) r.vector = Array.from(r.vector as ArrayLike<number>);
     return rows;
   }
