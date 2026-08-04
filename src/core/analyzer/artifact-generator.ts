@@ -1415,7 +1415,6 @@ export async function writeEdgesToSQLite(
   const { EdgeStore } = await import('../services/edge-store.js');
   const store = EdgeStore.open(dbPath);
   try {
-    store.clearAll();
 
     // Normalize absolute paths to relative — vector index uses relative IDs; DB must match.
     const prefix = rootPath ? (rootPath.endsWith('/') ? rootPath : rootPath + '/') : '';
@@ -1452,27 +1451,41 @@ export async function writeEdgesToSQLite(
     const hubOrd   = new Map(callGraph.hubFunctions.map((n, i) => [norm(n.id), i]));
     const entryOrd = new Map(callGraph.entryPoints.map((n, i) => [norm(n.id), i]));
 
-    store.insertNodes(nodes, hubIds, entryIds, {
-      nodeOrd:  id => nodeOrd.get(id) ?? 0,
-      hubOrd:   id => hubOrd.get(id) ?? null,
-      entryOrd: id => entryOrd.get(id) ?? null,
-    });
-    store.insertEdges(edges, isTestEdge);
-    store.insertInheritanceEdges(inheritanceEdges);
-    store.insertClasses(classes);
-    // The non-array remainder of the graph, so the store carries ALL of it and
-    // llm-context.json carries none.
-    store.setGraphMeta('stats', callGraph.stats);
-    store.setGraphMeta('layerViolations', callGraph.layerViolations);
+    // ONE transaction for the whole graph. The pieces used to be independent
+    // writes, which was survivable while llm-context.json still carried a
+    // complete copy: a reader that caught the store mid-rebuild could fall back
+    // to the artifact. It no longer can — and because readers materialize the
+    // graph lazily and MEMOIZE it, a reader landing between two commits would
+    // cache `{nodes: [...], edges: []}` as a whole graph for the life of its
+    // context. Committing once means concurrent readers see the previous graph
+    // or the new one, never a torn mixture.
+    store.transaction(() => {
+      // clearAll stays inside the transaction, with the same reach it had before
+      // (it also drops file_hashes, so the watcher does not treat a freshly
+      // analyzed file as an unchanged no-op).
+      store.clearAll();
+      store.insertNodes(nodes, hubIds, entryIds, {
+        nodeOrd:  id => nodeOrd.get(id) ?? 0,
+        hubOrd:   id => hubOrd.get(id) ?? null,
+        entryOrd: id => entryOrd.get(id) ?? null,
+      });
+      store.insertEdges(edges, isTestEdge);
+      store.insertInheritanceEdges(inheritanceEdges);
+      store.insertClasses(classes);
+      // The non-array remainder of the graph, so the store carries ALL of it and
+      // llm-context.json carries none.
+      store.setGraphMeta('stats', callGraph.stats);
+      store.setGraphMeta('layerViolations', callGraph.layerViolations);
 
-    // CFG/def-use overlay (spec: add-intraprocedural-cfg-dataflow-overlay).
-    // Production functions only — keyed by the same normalized ids as nodes.
-    if (cfgs && cfgs.length > 0) {
-      const normCfgs = cfgs
-        .map(c => ({ functionId: norm(c.functionId), filePath: norm(c.filePath), cfg: c.cfg }))
-        .filter(c => !testNodeIds.has(c.functionId));
-      store.insertCfgs(normCfgs);
-    }
+      // CFG/def-use overlay (spec: add-intraprocedural-cfg-dataflow-overlay).
+      // Production functions only — keyed by the same normalized ids as nodes.
+      if (cfgs && cfgs.length > 0) {
+        const normCfgs = cfgs
+          .map(c => ({ functionId: norm(c.functionId), filePath: norm(c.filePath), cfg: c.cfg }))
+          .filter(c => !testNodeIds.has(c.functionId));
+        store.insertCfgs(normCfgs);
+      }
+    });
 
     // Project the decision store onto first-class graph nodes + `affects` edges
     // (spec-16). Derived, like IaC: the JSON store stays authoritative. Active

@@ -78,7 +78,17 @@ export function loadCallGraph(analysisDir: string): SerializedCallGraph | null {
     logger.debug(`No call graph store at ${dbPath} — graph-dependent output will be omitted.`);
     return null;
   }
-  const store = EdgeStore.open(dbPath);
+  let store: EdgeStore;
+  try {
+    store = EdgeStore.open(dbPath);
+  } catch (err) {
+    // A corrupt/locked database must not take down a read-only command; the
+    // caller degrades to "no call graph", which every consumer already handles.
+    logger.warning(
+      `Could not open the call graph store ${dbPath}: ${err instanceof Error ? err.message : String(err)}.`
+    );
+    return null;
+  }
   try {
     const graph = store.materializeCallGraph();
     if (!graph) {

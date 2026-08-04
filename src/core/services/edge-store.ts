@@ -356,14 +356,25 @@ export class EdgeStore {
 
   // ── Edge mutations ────────────────────────────────────────────────────────────
 
-  /** Remove all edges where this file is caller or callee. */
+  /**
+   * Remove PRODUCTION edges where this file is caller or callee.
+   *
+   * The test side (`tested_by`, and calls from test files) is deliberately left
+   * alone. The incremental re-index that calls this can only rebuild what it
+   * re-parses, and it never re-parses test files: the watcher skips them, and
+   * `getCallerFiles` — a production query — does not report them as callers. So
+   * deleting test edges here would destroy them for good, until the next full
+   * analyze. Before the graph moved into this store they lived in
+   * llm-context.json, which the incremental path never rewrote; leaving them
+   * untouched preserves exactly that behaviour, stale-but-present.
+   */
   deleteEdgesForFile(file: string): void {
-    this.db.prepare('DELETE FROM edges WHERE caller_file = ? OR callee_file = ?').run(file, file);
+    this.db.prepare('DELETE FROM edges WHERE (caller_file = ? OR callee_file = ?) AND is_test = 0').run(file, file);
   }
 
-  /** Remove only outgoing edges from this file (incoming edges remain). */
+  /** Remove only outgoing PRODUCTION edges from this file (incoming edges, and the test side, remain). */
   deleteOutgoingEdgesForFile(file: string): void {
-    this.db.prepare('DELETE FROM edges WHERE caller_file = ?').run(file);
+    this.db.prepare('DELETE FROM edges WHERE caller_file = ? AND is_test = 0').run(file);
   }
 
   /**
@@ -510,6 +521,45 @@ export class EdgeStore {
       const placeholders = ids.map(() => '?').join(',');
       this.db.prepare(`DELETE FROM nodes_fts WHERE node_id IN (${placeholders})`).run(...ids);
     }
+  }
+
+  /**
+   * Swap one file's nodes for a freshly re-parsed set, KEEPING the rankings a
+   * full analyze assigned: hub / entry-point membership (and the positions that
+   * order those two arrays), plus each node's position in the graph.
+   *
+   * Those rankings are global properties — whether a function is a hub depends on
+   * the whole repository — so an incremental re-parse of ONE file cannot recompute
+   * them. A plain delete+insert therefore silently drops every edited file's
+   * functions out of `hubFunctions` / `entryPoints` until the next full analyze.
+   * That did not happen before the graph moved into this store, because those
+   * arrays lived in llm-context.json and the incremental path never rewrote them.
+   *
+   * Nodes that are new in this parse are appended after the current maximum.
+   */
+  replaceFileNodes(file: string, nodes: FunctionNode[]): void {
+    runTransaction(this.db, () => {
+      const previous = new Map(
+        (this.db
+          .prepare('SELECT id, ord, hub_ord, entry_ord FROM nodes WHERE file_path = ?')
+          .all(file) as unknown as Array<{ id: string; ord: number; hub_ord: number | null; entry_ord: number | null }>)
+          .map(r => [r.id, r]),
+      );
+      this.deleteNodesForFile(file);
+      let nextOrd = this.maxOrd('nodes');
+      const hubIds = new Set<string>();
+      const entryIds = new Set<string>();
+      for (const n of nodes) {
+        const prev = previous.get(n.id);
+        if (prev?.hub_ord !== null && prev?.hub_ord !== undefined) hubIds.add(n.id);
+        if (prev?.entry_ord !== null && prev?.entry_ord !== undefined) entryIds.add(n.id);
+      }
+      this.insertNodes(nodes, hubIds, entryIds, {
+        nodeOrd:  id => previous.get(id)?.ord ?? ++nextOrd,
+        hubOrd:   id => previous.get(id)?.hub_ord ?? null,
+        entryOrd: id => previous.get(id)?.entry_ord ?? null,
+      });
+    });
   }
 
   /**

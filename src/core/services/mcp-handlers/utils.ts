@@ -39,7 +39,20 @@ export function attachCallGraph(ctx: CachedContext, store: EdgeStore | undefined
     get() {
       if (!done) {
         done = true;
-        materialized = store.materializeCallGraph() ?? undefined;
+        try {
+          materialized = store.materializeCallGraph() ?? undefined;
+        } catch (err) {
+          // The read used to be a plain property on a parsed object and could not
+          // fail. Now it touches SQLite — and it is reached from handler code that
+          // sits OUTSIDE readCachedContext's catch, so an evicted/closed handle
+          // ("database is not open") would surface as a tool crash. Degrade to the
+          // same "no call graph" every handler already reports, and say why.
+          logger.warning(
+            `Could not read the call graph from the store: ${err instanceof Error ? err.message : String(err)}. ` +
+            `Re-run "openlore analyze --force" if this persists.`
+          );
+          materialized = undefined;
+        }
       }
       return materialized;
     },
@@ -444,7 +457,13 @@ export async function waitForGraphRebuild(
 
   while (Date.now() < deadline) {
     const ctx = await readCachedContext(directory);
-    if (ctx?.edgeStore) {
+    // POPULATED, not merely attached. The old test — "is there an edgeStore?" —
+    // relied on readCachedContext withholding an empty store, which it could only
+    // decide by comparing against the graph inside llm-context.json. That copy is
+    // gone (PDLC-156), so an empty post-reset store now attaches like any other
+    // and a bare presence check would report "rebuild finished" the instant the
+    // reset wiped it — exactly the silent empty graph this helper exists to avoid.
+    if (ctx?.edgeStore && ctx.edgeStore.countNodes() > 0) {
       logger.debug(`[waitForGraphRebuild] Graph rebuild completed after ${Date.now() - (deadline - timeoutMs)}ms`);
       return true;
     }

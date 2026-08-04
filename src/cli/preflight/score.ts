@@ -62,7 +62,10 @@ function loadFileStats(db: DatabaseSync, files: string[]): Map<string, FileScore
   const placeholders = files.map(() => '?').join(',');
   const rows = db
     .prepare(
-      `SELECT file_path, is_hub, fan_in FROM nodes WHERE is_external = 0 AND file_path IN (${placeholders})`
+      // is_test = 0: the store also holds test nodes since PDLC-156, and this
+      // score is about production surface — without the filter a change touching
+      // only tests would start scoring as if it touched the graph.
+      `SELECT file_path, is_hub, fan_in FROM nodes WHERE is_external = 0 AND is_test = 0 AND file_path IN (${placeholders})`
     )
     .all(...files) as unknown as NodeRow[];
   const byFile = new Map<string, FileScore>();

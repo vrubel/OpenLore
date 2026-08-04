@@ -386,7 +386,10 @@ export function getSourceRoots(directory: string): string[] {
   try {
     const dbPath = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_CALL_GRAPH_DB);
     const db = new DatabaseSync(dbPath);
-    const rows = db.prepare('SELECT DISTINCT file_path FROM nodes WHERE is_external = 0').all() as Array<{ file_path: string }>;
+    // is_test = 0: since PDLC-156 the store also holds the test side of the graph,
+    // which this query predates — without the filter a repo's `tests/` directory
+    // would start counting as a source root.
+    const rows = db.prepare('SELECT DISTINCT file_path FROM nodes WHERE is_external = 0 AND is_test = 0').all() as Array<{ file_path: string }>;
     db.close();
     const roots = new Set<string>();
     for (const { file_path } of rows) {

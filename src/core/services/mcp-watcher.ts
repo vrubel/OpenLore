@@ -63,6 +63,19 @@ const CALL_GRAPH_LANGS = new Set([
 const CALLER_REPARSE_LIMIT = 10;
 
 /**
+ * The call graph an OLDER analysis carries inline in llm-context.json, or
+ * undefined for the current format (where it lives in call-graph.db).
+ *
+ * Reads the property descriptor rather than the property: for the current format
+ * `callGraph` is a lazy getter, and touching it would materialize the entire
+ * graph — which is precisely what the caller is trying to avoid.
+ */
+function inlineCallGraph(context: CachedContext): CachedContext['callGraph'] | undefined {
+  const desc = Object.getOwnPropertyDescriptor(context, 'callGraph');
+  return desc && 'value' in desc ? (desc.value as CachedContext['callGraph']) : undefined;
+}
+
+/**
  * Session-global latch: a SCHEMA_VERSION bump wipes the graph store, and an
  * incremental update can't repair it — only a full `analyze` can. We schedule
  * exactly one background rebuild per process (Spec 26 B10). Latched (never
@@ -489,11 +502,13 @@ export class McpWatcher {
             for (const cf of callerFiles.slice(0, CALLER_REPARSE_LIMIT)) {
               store.deleteOutgoingEdgesForFile(cf);
             }
-            store.deleteNodesForFile(f.rel);
             // Recompute only THIS file's overlay records — intra-procedural, so
             // caller files' overlays stay valid (spec: add-intraprocedural-cfg-dataflow-overlay).
             store.deleteCfgForFile(f.rel);
-            store.insertNodes(newNodes);
+            // Swap the file's nodes KEEPING hub / entry-point membership and graph
+            // position: those are whole-repository properties that re-parsing one
+            // file cannot recompute, and the store is now their only home (PDLC-156).
+            store.replaceFileNodes(f.rel, newNodes);
             store.insertEdges(newEdges);
             store.insertCfgs(newCfgs);
             store.setFileHash(f.rel, newHash);
@@ -549,7 +564,7 @@ export class McpWatcher {
 
     // 4. Vector update — decoupled from signature freshness (Step 4).
     const isBulk = consumedVcsBulk || changedFiles.length >= this.bulkThreshold;
-    if (this.embed && !this.embedDegraded && context.callGraph) {
+    if (this.embed && !this.embedDegraded && this.hasGraph(context)) {
       if (opts.syncFlush) {
         // Direct handleChange path: inline so callers/tests observe it.
         await this.updateVectors(context, changedFiles, changedNodes);
@@ -611,6 +626,22 @@ export class McpWatcher {
    * in-memory read cache (primeContextCache) the right channel to prime; a custom
    * `outputPath` (tests / non-standard installs) writes only to disk.
    */
+  /**
+   * Is there a call graph at all — WITHOUT materializing it. The store answers
+   * with a COUNT; an analysis from an older version answers with its inline copy.
+   */
+  private hasGraph(context: CachedContext): boolean {
+    if (EdgeStore.exists(this.outputPath)) {
+      const es = EdgeStore.open(EdgeStore.dbPath(this.outputPath));
+      try {
+        if (es.countNodes() > 0) return true;
+      } finally {
+        es.close();
+      }
+    }
+    return !!inlineCallGraph(context);
+  }
+
   private get usesStandardLayout(): boolean {
     return this.outputPath === join(this.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
   }
@@ -731,17 +762,42 @@ export class McpWatcher {
       // embedSvc may be null: updateFiles then refreshes the BM25-only corpus
       // rather than re-embedding, keeping the keyword index live in watch mode.
 
-      const cg = context.callGraph;
-      if (!cg) return;
-      const hubIds = new Set((cg.hubFunctions ?? []).map((f) => f.id));
-      const entryIds = new Set((cg.entryPoints ?? []).map((f) => f.id));
       const changedFilePaths = new Set(changedFiles.map((f) => f.rel));
       const fileContents = new Map(changedFiles.map((f) => [f.rel, f.content]));
-      // Prefer the freshly-parsed nodes; fall back to the (possibly stale)
-      // call-graph nodes for the changed files when no edge store seeded them.
-      const nodes = changedNodes.length > 0
-        ? changedNodes
-        : (cg.nodes ?? []).filter((n) => changedFilePaths.has(n.filePath));
+      // Hub / entry-point membership: read the two sets from the store rather than
+      // materializing the whole graph to pick two flags off it (PDLC-156 — the
+      // graph is a lazy getter now). An analysis taken by an older version has no
+      // store to read, so fall back to its inline graph.
+      let hubIds = new Set<string>();
+      let entryIds = new Set<string>();
+      let storeNodesForChanged: FunctionNode[] = [];
+      const storeHasGraph = EdgeStore.exists(this.outputPath) && (() => {
+        const es = EdgeStore.open(EdgeStore.dbPath(this.outputPath));
+        try {
+          if (es.countNodes() === 0) return false;
+          hubIds = new Set(es.getHubs(Number.MAX_SAFE_INTEGER).map((n) => n.id));
+          entryIds = new Set(es.getEntryPoints(Number.MAX_SAFE_INTEGER).map((n) => n.id));
+          if (changedNodes.length === 0) {
+            for (const rel of changedFilePaths) storeNodesForChanged.push(...es.getNodesForFile(rel));
+          }
+          return true;
+        } finally {
+          es.close();
+        }
+      })();
+      const inline = storeHasGraph ? undefined : inlineCallGraph(context);
+      if (inline) {
+        hubIds = new Set((inline.hubFunctions ?? []).map((f) => f.id));
+        entryIds = new Set((inline.entryPoints ?? []).map((f) => f.id));
+        if (changedNodes.length === 0) {
+          storeNodesForChanged = (inline.nodes ?? []).filter((n) => changedFilePaths.has(n.filePath));
+        }
+      } else if (!storeHasGraph) {
+        return;
+      }
+      // Prefer the freshly-parsed nodes; fall back to the stored nodes of the
+      // changed files when no edge store seeded them.
+      const nodes = changedNodes.length > 0 ? changedNodes : storeNodesForChanged;
 
       const { embedded, reused, total, hasEmbeddings } = await VectorIndex.updateFiles(
         this.outputPath,

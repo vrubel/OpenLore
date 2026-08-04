@@ -60,13 +60,22 @@ async function makeGraphDb(dbPath: string, nodes: FixtureNode[]): Promise<void> 
         is_external INTEGER NOT NULL DEFAULT 0,
         is_hub INTEGER NOT NULL DEFAULT 0,
         fan_in INTEGER NOT NULL DEFAULT 0,
-        fan_out INTEGER NOT NULL DEFAULT 0
+        fan_out INTEGER NOT NULL DEFAULT 0,
+        -- The store holds the test side of the graph too since PDLC-156, and the
+        -- preflight query filters it out; this fixture mirrors the real schema so
+        -- the filter is exercised rather than crashing on a missing column.
+        is_test INTEGER NOT NULL DEFAULT 0
       );
     `);
     const stmt = db.prepare(
       'INSERT INTO nodes (id, name, file_path, is_external, is_hub, fan_in) VALUES (?,?,?,?,?,?)'
     );
     for (const n of nodes) stmt.run(n.id, n.name, n.file_path, 0, n.is_hub, n.fan_in);
+    // One test-side node in every fixture: preflight scores PRODUCTION surface, so
+    // this must never show up in the graph stats it reports.
+    db.prepare(
+      'INSERT INTO nodes (id, name, file_path, is_external, is_hub, fan_in, is_test) VALUES (?,?,?,?,?,?,1)'
+    ).run('tests/fixture.test.ts::spec', 'spec', 'tests/fixture.test.ts', 0, 0, 0);
   } finally {
     db.close();
   }
