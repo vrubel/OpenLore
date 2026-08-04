@@ -48,13 +48,17 @@ describe('stringifyArtifact', () => {
     // The original RangeError (and its stack) is preserved for debugging.
     expect(err.cause).toBeInstanceOf(RangeError);
     expect((err.cause as Error).message).toBe('Invalid string length');
-  });
+    // Serialising ~600 MB twice (once to overflow, once to size the sections)
+    // takes seconds — and more under a loaded full run than in isolation.
+  }, 60_000);
 
   it('falls back to the relative config path when none is supplied', () => {
     const chunk = 'a'.repeat(1_000_000);
+    // An array, not an object: describeSections has nothing to report, so the
+    // message must still stand on its own.
     expect(() => stringifyArtifact(new Array(600).fill(chunk), 'llm-context.json'))
       .toThrowError(/\.openlore\/config\.json/);
-  });
+  }, 60_000);
 
   it('does NOT misreport a stack overflow as a string-ceiling overflow', () => {
     // JSON.stringify raises RangeError for deep nesting too. Matching on the

@@ -142,6 +142,16 @@ export async function runAnalysis(
   logger.info('Files found', repoMap.summary.totalFiles);
   logger.info('Files analyzed', repoMap.summary.analyzedFiles);
   logger.info('Files skipped', repoMap.summary.skippedFiles);
+  // The walker simply stops once the cap is reached — in traversal order, with no
+  // signal of its own. Silence here reads as "the whole repository was analysed",
+  // when in fact everything past the cutoff is missing from every artifact.
+  if (repoMap.summary.analyzedFiles >= options.maxFiles) {
+    logger.warning(
+      `Stopped at the ${options.maxFiles}-file cap: this analysis is a PARTIAL slice, cut off in ` +
+      `traversal order, not a view of the whole repository. Raise --max-files (or analysis.maxFiles ` +
+      `in the config), or narrow the tree with excludePatterns so the cap is not reached.`
+    );
+  }
   logger.blank();
 
   // Phase 2: Dependency Graph
@@ -241,8 +251,9 @@ export const analyzeCommand = new Command('analyze')
   )
   .option(
     '--max-files <n>',
-    'Maximum number of files to analyze (default: 100000)',
-    '100000'
+    `Maximum number of files to analyze (default: analysis.maxFiles from ${OPENLORE_CONFIG_REL_PATH}, else ${DEFAULT_MAX_FILES})`
+    // NO commander default: the default has to stay distinguishable from an
+    // explicit flag, otherwise analysis.maxFiles in the config can never win.
   )
   .option(
     '--include <glob>',
@@ -312,11 +323,17 @@ After analysis, run 'openlore generate' to create OpenSpec files.
     const startTime = Date.now();
     const rootPath = process.cwd();
 
+    // analysis.maxFiles lived in the config but was never read: runAnalysis merges
+    // only include/excludePatterns, and commander's own default always won. An
+    // operator who set it got a silent no-op. Precedence is now explicit —
+    // CLI flag > config > built-in default.
+    const configuredMaxFiles = (await readOpenLoreConfig(rootPath))?.analysis?.maxFiles;
+
     const opts: ExtendedAnalyzeOptions = {
       output: options.output ?? `${OPENLORE_ANALYSIS_REL_PATH}/`,
       maxFiles: typeof options.maxFiles === 'string'
         ? parseInt(options.maxFiles, 10)
-        : options.maxFiles ?? DEFAULT_MAX_FILES,
+        : options.maxFiles ?? configuredMaxFiles ?? DEFAULT_MAX_FILES,
       include: options.include ?? [],
       exclude: options.exclude ?? [],
       force: options.force ?? false,

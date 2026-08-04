@@ -504,7 +504,20 @@ export async function loadMappingIndex(absDir: string, retryCount: number = 1): 
   
   const loadAttempt = async (attempt: number): Promise<MappingIndex | null> => {
     try {
-      const raw = await readFile(join(absDir, '.openlore', 'analysis', 'mapping.json'), 'utf-8');
+      const mappingPath = join(absDir, '.openlore', 'analysis', 'mapping.json');
+      // mcp-security: "Parsing SHALL bound input size" covers mapping.json too, not
+      // just llm-context.json. Without this, an oversized artifact spends the read
+      // before failing — and past the string ceiling it cannot be read at all.
+      const st = await stat(mappingPath);
+      if (st.size > ARTIFACT_MAX_BYTES) {
+        logger.warning(
+          `mapping.json is ${st.size.toLocaleString('en-US')} bytes — over the ` +
+          `${ARTIFACT_MAX_BYTES.toLocaleString('en-US')} byte ceiling, so it cannot be loaded. ` +
+          `Re-run analyze with a narrower surface (analysis.excludePatterns / --exclude).`
+        );
+        return null;
+      }
+      const raw = await readFile(mappingPath, 'utf-8');
       const parsed: unknown = JSON.parse(raw);
       // Untrusted artifact: validate top-level shape before use. A malformed
       // mapping.json (non-object, or no `mappings` array) fails closed — retrying

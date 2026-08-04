@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { analyzeCommand, runAnalysis } from './analyze.js';
+import { DEFAULT_MAX_FILES } from '../../constants.js';
 import { ARTIFACT_FINGERPRINT } from '../../constants.js';
 
 // ============================================================================
@@ -127,10 +128,17 @@ describe('analyze command', () => {
       expect(outputOption?.defaultValue).toBe('.openlore/analysis/');
     });
 
-    it('should have --max-files option with default', () => {
+    it('should have --max-files option WITHOUT a commander default', () => {
+      // The default must stay unset here, or an explicit flag becomes
+      // indistinguishable from the fallback and analysis.maxFiles in the config
+      // can never win — which is exactly why that config field used to be a
+      // silent no-op. Precedence (CLI > config > built-in) is resolved in the
+      // action instead; the description still tells the user the effective value.
       const maxFilesOption = analyzeCommand.options.find(o => o.long === '--max-files');
       expect(maxFilesOption).toBeDefined();
-      expect(maxFilesOption?.defaultValue).toBe('100000');
+      expect(maxFilesOption?.defaultValue).toBeUndefined();
+      expect(maxFilesOption?.description).toContain('analysis.maxFiles');
+      expect(maxFilesOption?.description).toContain(String(DEFAULT_MAX_FILES));
     });
 
     it('should have --include option (repeatable)', () => {
