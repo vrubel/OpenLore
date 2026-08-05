@@ -23,10 +23,11 @@
       "spawns": [
         { "bin": "git", "how": "execFile/execFileSync/spawnSync with an argv array (no shell); refs validated against argument injection (leading-dash + shell-meta)", "why": "history, diffs, change coupling, drift detection" },
         { "bin": "openlore (self)", "how": "spawn(process.execPath | resolved bin, ['decisions','--consolidate'|'analyze']) with fixed argv", "why": "background decision consolidation / re-analyze" },
-        { "bin": "claude | gemini | vibe (LLM CLIs)", "how": "execFileSync(bin, argv) with fixed argv; bin overridable by env (CLAUDE/GEMINI_CLI/MISTRAL_VIBE_CLI)", "why": "optional CLI-based LLM provider transport (alternative to HTTP)" }
+        { "bin": "claude | gemini | vibe (LLM CLIs)", "how": "execFileSync(bin, argv) with fixed argv; bin overridable by env (CLAUDE/GEMINI_CLI/MISTRAL_VIBE_CLI)", "why": "optional CLI-based LLM provider transport (alternative to HTTP)" },
+        { "bin": "qwen | gigacode (LLM CLIs)", "how": "execFileSync(bin, fixed argv) with the prompt on stdin; bin overridable by env (QWEN_CLI/GIGACODE_CLI); on Windows only, the spawn is given a shell so the CMD resolver can find the .cmd shim — see acceptedRisks", "why": "CLI-based LLM provider transport used by PDLC" }
       ],
-      "method": "argv arrays only; no shell:true and no shell-binary (-c) invocation anywhere on the core+cli server surface.",
-      "exception": "src/pi (the VS Code extension launcher) uses a Windows-only shell:true with FIXED arguments — see acceptedRisks."
+      "method": "argv arrays only; no shell-binary (-c) invocation anywhere, and no shell on the core+cli server surface except the registered Windows-gated case below.",
+      "exception": "Two surfaces pass a shell, both Windows-only and both with FIXED arguments: src/pi (the VS Code extension launcher, outside the scanned surface) and the qwen/gigacode CLI providers in src/core/services/llm-service.ts — see acceptedRisks."
     },
     "network": {
       "egress": [
@@ -75,6 +76,11 @@
       "id": "windows-extension-launcher-shell",
       "pattern": "fixed constant argv -> spawn(..., { shell: true }) in src/pi/extension.ts",
       "why": "The VS Code extension launches the openlore CLI on Windows with shell:true and a FIXED argv ('openlore', ['serve', ...]) — no untrusted value is interpolated into the command. It is the editor-integration launcher, outside the analyzed MCP server surface (src/core, src/cli) that the no-shell gate scans."
+    },
+    {
+      "id": "windows-cli-provider-shim-shell",
+      "pattern": "fixed constant argv -> execFileSync(qwen|gigacode, { shell: process.platform === 'win32' }) in src/core/services/llm-service.ts",
+      "why": "On Windows the qwen and gigacode CLIs are installed as .cmd shims, which execFileSync cannot launch directly (spawnSync ENOENT) — the CMD resolver has to resolve them. The shell is gated on win32 and nothing repo-derived reaches a command line: argv is a constant ([] and ['--output-format','text']) and the whole prompt travels over stdin. The binary name comes from the operator's own QWEN_CLI/GIGACODE_CLI or the bare command name, i.e. the same trust level as PATH itself. On POSIX the plain argv spawn is kept. Gated form and register entry are pinned by security-capabilities.test.ts and mcp-handlers/security.test.ts."
     },
     {
       "id": "serve-output-redirect-fds",

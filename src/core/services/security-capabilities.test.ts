@@ -32,6 +32,14 @@ function surfaceText(): string {
   return SURFACE.map(f => readFileSync(f, 'utf-8')).join('\n');
 }
 
+// Scan CODE, not prose: a grep over raw text indicts files whose COMMENTS merely
+// discuss shells, and trips on sentences like "WITHOUT a shell: git is invoked".
+function codeOnly(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')     // block comments
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');   // line comments, leaving `://` in URLs alone
+}
+
 describe('Capability declaration — shape (mcp-security)', () => {
   it('declares the required security-relevant capability categories', () => {
     expect(decl.tool).toBe('openlore');
@@ -74,15 +82,41 @@ describe('Capability declaration — matches observed behavior (mcp-security)', 
     expect(declared).toContain('127.0.0.1');
   });
 
-  it('the no-shell claim holds: no shell:true / shell-binary on the core+cli surface', () => {
-    // The declaration asserts argv-only subprocess on the server surface; verify it.
+  it('the no-shell claim holds: no unregistered shell on the core+cli surface', () => {
+    // The declaration asserts argv-only subprocess on the server surface, with the
+    // single registered Windows exception; verify exactly that. `shell:` set to
+    // anything but the literal `false` counts — a conditional is still a shell where
+    // the condition holds.
     const offenders: string[] = [];
     const SHELL_INVOKE = /(?:exec|execFile|execFileSync|spawn|spawnSync)\(\s*['"`](?:\/bin\/)?(?:sh|bash|zsh|dash)['"`]\s*,\s*\[\s*['"`]-c['"`]/;
+    const SHELL_OPTION = /shell\s*:\s*(?!false\b)[A-Za-z_$(]/;
+    const registered = new Set(['src/core/services/llm-service.ts']);
     for (const f of SURFACE) {
-      const src = readFileSync(f, 'utf-8');
-      if (/shell\s*:\s*true/.test(src) || SHELL_INVOKE.test(src)) offenders.push(f.replace(SRC, 'src'));
+      const rel = f.replace(SRC, 'src');
+      if (registered.has(rel)) continue;
+      const src = codeOnly(readFileSync(f, 'utf-8'));
+      if (SHELL_OPTION.test(src) || SHELL_INVOKE.test(src)) offenders.push(rel);
     }
-    expect(offenders, `declaration claims no shell on surface, but found: ${offenders.join(', ')}`).toEqual([]);
+    expect(offenders, `declaration claims no unregistered shell on surface, but found: ${offenders.join(', ')}`).toEqual([]);
+  });
+
+  it('the Windows CLI-provider accepted-risk entry is justified by real code', () => {
+    // Mirrors the src/pi check below: the register must not carry a justification for
+    // code that no longer exists, and the code must not drift past what was justified
+    // (constant argv, prompt over stdin, shell only on win32).
+    const entry = decl.acceptedRisks.find((r: { id: string }) => r.id === 'windows-cli-provider-shim-shell');
+    expect(entry, 'expected the windows-cli-provider-shim-shell entry').toBeTruthy();
+    const llm = codeOnly(readFileSync(join(SRC, 'core', 'services', 'llm-service.ts'), 'utf-8'));
+    const uses = [...llm.matchAll(/shell\s*:\s*([^,\n]+)/g)].map(m => m[1].trim());
+    expect(uses.length, 'llm-service.ts should still use a Windows-gated shell').toBeGreaterThan(0);
+    for (const use of uses) {
+      expect(use, `shell must stay win32-gated, got \`shell: ${use}\``).toMatch(/^process\.platform\s*===\s*'win32'$/);
+    }
+    // The two shimmed CLIs are declared as spawned binaries.
+    const bins: string = decl.capabilities.subprocess.spawns.map((s: { bin: string }) => s.bin).join(' ');
+    for (const cli of ['qwen', 'gigacode']) {
+      expect(bins, `declaration must list the ${cli} CLI provider`).toContain(cli);
+    }
   });
 
   it('the Windows-launcher accepted-risk entry is justified by real code in src/pi', () => {

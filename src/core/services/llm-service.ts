@@ -171,8 +171,12 @@ export class GigaCodeProvider implements LLMProvider {
         encoding: 'utf8',
         maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
         timeout: LLM_CLI_TIMEOUT_MS,
-        // Windows: the binary is a `.cmd` shim; execFileSync without a shell cannot
-        // resolve it (spawnSync ENOENT). shell:true lets the CMD resolver find it.
+        // Windows only: the binary is a `.cmd` shim, which execFileSync cannot run
+        // directly (spawnSync ENOENT) — the CMD resolver has to find it. Registered
+        // as `windows-cli-provider-shim-shell` in schemas/security-capabilities.json
+        // and asserted by security-capabilities.test.ts: the argv here is the empty
+        // constant list and the prompt travels over stdin, so nothing repo-derived
+        // reaches a command line. POSIX keeps the plain argv spawn.
         shell: process.platform === 'win32',
       });
     } catch (err: unknown) {
@@ -244,7 +248,9 @@ export class QwenProvider implements LLMProvider {
         encoding: 'utf8',
         maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
         timeout: LLM_CLI_TIMEOUT_MS,
-        // Windows: `qwen` is a `.cmd` shim; execFileSync without a shell hits ENOENT.
+        // Windows only: `qwen` is a `.cmd` shim, unrunnable by execFileSync directly
+        // (ENOENT). Same registered exception as the gigacode call above — constant
+        // argv, prompt over stdin. POSIX keeps the plain argv spawn.
         shell: process.platform === 'win32',
       });
     } catch (err: unknown) {
