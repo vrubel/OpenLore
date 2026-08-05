@@ -101,6 +101,40 @@ describe('generateAiConfigs', () => {
     expect(content).not.toContain('<!--');
   });
 
+  it('a host-OS (Windows) analysisDir does not mint a two-dialect reference', async () => {
+    // The caller hands over whatever `path` gave it, and on Windows that is
+    // `.openlore\analysis`. The reference appends a literal `/CODEBASE.md`, so the file
+    // used to end up with `@.openlore\analysis/CODEBASE.md` — one path in two dialects,
+    // written once by writeIfAbsent and then committed for good.
+    await generateAiConfigs({
+      rootDir: tmpDir,
+      analysisDir: '.openlore\\analysis',
+      projectName: 'my-project',
+      tools: ['claude', 'cursor'],
+    });
+
+    const claude = await readFile(join(tmpDir, 'CLAUDE.md'), 'utf-8');
+    expect(claude).toContain('@.openlore/analysis/CODEBASE.md');
+    expect(claude).not.toContain('\\');
+
+    const cursor = await readFile(join(tmpDir, '.cursorrules'), 'utf-8');
+    expect(cursor).toContain('.openlore/analysis/CODEBASE.md');
+    expect(cursor).not.toContain('\\');
+  });
+
+  it('a trailing separator in analysisDir does not double up in the reference', async () => {
+    await generateAiConfigs({
+      rootDir: tmpDir,
+      analysisDir: 'out/analysis/',
+      projectName: 'my-project',
+      tools: ['claude'],
+    });
+
+    const content = await readFile(join(tmpDir, 'CLAUDE.md'), 'utf-8');
+    expect(content).toContain('@out/analysis/CODEBASE.md');
+    expect(content).not.toContain('//CODEBASE.md');
+  });
+
   it('non-Claude format uses HTML comment reference', async () => {
     await generateAiConfigs({
       rootDir: tmpDir,
