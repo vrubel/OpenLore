@@ -1,10 +1,15 @@
 name: CI
 
+# `main` here is upstream's line, which this fork does not develop on: our work
+# lands on `feat/doc-context-directive` (the fork line) and is shipped to PDLC as
+# a `vX.Y.Z-ruN` tag built from source. Listening on `main` alone left the line
+# with no CI at all — every check below was dead weight on the branch that
+# actually receives commits.
 on:
   push:
-    branches: [main]
+    branches: [main, feat/doc-context-directive]
   pull_request:
-    branches: [main]
+    branches: [main, feat/doc-context-directive]
 
 permissions:
   contents: read
