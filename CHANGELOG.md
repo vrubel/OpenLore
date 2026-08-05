@@ -5,10 +5,31 @@ All notable changes to OpenLore are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Removed
+
+- **The unused `memfs` devDependency is gone, and with it the entire
+  `@jsonjoy.com/*` subtree** (ru line). This supersedes the 4.64.0 pin below and
+  closes the failure class for good rather than until the next version surfaces
+  in a mirror: a dependency that is not installed cannot demand a version nobody
+  has. `memfs` was never imported — verified across the whole repository, not
+  just `src/`: sources, tests, fixtures, mocks, the `vitest` configs (their only
+  alias is `@` → `./src`; `fs` is never substituted), build scripts and both CI
+  workflows. No memfs companion (`fs-monkey`, `unionfs`, `vol.fromJSON`,
+  `createFsFromVolume`) appears either, and the lockfile named the root as its
+  sole consumer. Dropping it removes 26 lock entries — the eight
+  `@jsonjoy.com/fs-*` packages, their `@jsonjoy.com` support packages, and
+  `memfs`'s own companions (`thingies`, `tree-dump`, `hyperdyperid`,
+  `glob-to-regex.js`) — so the `overrides` added for `@jsonjoy.com/fs-*` are
+  dropped as well: with no consumer left they pinned nothing. A clean install in
+  an empty directory, via `npm ci` and via the `--no-package-lock` path the
+  installer actually uses, now unpacks **zero** `@jsonjoy.com` directories. Unit
+  tests are unchanged from the baseline: 8 failing / 4451 passing.
+
 ### Fixed
 
 - **Install no longer fails on registries that lag npmjs: `@jsonjoy.com/fs-*`
-  pinned to 4.64.0** (ru line). The dev-only `memfs` dependency was a floating
+  pinned to 4.64.0** (ru line, superseded by the removal above — kept for the
+  record, since v2.1.3-ru12 shipped with it). The dev-only `memfs` dependency was a floating
   `^4.15.0`, and every `memfs` release hard-pins its eight `@jsonjoy.com/fs-*`
   companions to its own exact version. Since the fork is installed with
   `npm install --no-package-lock` (the lockfile is deliberately bypassed — the
