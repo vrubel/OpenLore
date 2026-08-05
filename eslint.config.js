@@ -57,6 +57,15 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ['dist/**', 'node_modules/**', 'examples/**', '*.config.js', '*.config.ts', 'src/core/scip/fixtures/**', 'src/core/analyzer/iac/fixtures/**'],
+    // src/pi/** is out of scope on this fork line, and eslint must agree with
+    // tsconfig, which already excludes it. The typed rules above ask the parser for
+    // a `project`, so any file OUTSIDE tsconfig's program is a hard parse error
+    // ("file was not found in any of the provided project(s)") rather than a lint
+    // finding — `npm run lint` = `eslint src` walked into src/pi and died there.
+    // The VS Code extension is not built, not published and not tested here: the
+    // slim series dropped @earendil-works/pi-ai from install. The sources stay in
+    // tree (they still justify the windows-extension-launcher-shell accepted risk,
+    // which is read straight off disk), they are simply not linted.
+    ignores: ['dist/**', 'node_modules/**', 'examples/**', '*.config.js', '*.config.ts', 'src/core/scip/fixtures/**', 'src/core/analyzer/iac/fixtures/**', 'src/pi/**'],
   }
 );

@@ -818,7 +818,7 @@ describe('AnalysisArtifactGenerator', () => {
       expect(llmContextRaw.startsWith('{"')).toBe(true);
 
       const repoStructureRaw = await readFile(join(outputDir, 'repo-structure.json'), 'utf-8');
-      expect(repoStructureRaw).toMatch(/^\{\n  "/);
+      expect(repoStructureRaw).toMatch(/^\{\n {2}"/);
     });
 
     it('keeps the call graph OUT of llm-context.json and writes it to call-graph.db with the correct edge shape', async () => {
