@@ -43,13 +43,51 @@ const ALL_SOURCES = SURFACE_DIRS.flatMap(sourceFiles);
 
 // ── Subprocess Argument Safety ────────────────────────────────────────────────
 
+// Files on the surface allowed to hand a spawn a shell, each covered by an entry in
+// schemas/security-capabilities.json → acceptedRisks. Adding a file here is a
+// deliberate act: the register entry must justify it, and security-capabilities.test.ts
+// fails if the entry stops matching real code.
+const SHELL_EXCEPTIONS = new Set(['src/core/services/llm-service.ts']);
+
+// `shell:` set to anything that is not the literal `false` — `true`, a variable, or a
+// platform check. The old guard matched only `shell: true`, which a conditional such as
+// `shell: process.platform === 'win32'` walked straight past while still being a shell
+// wherever the condition holds.
+const SHELL_OPTION = /shell\s*:\s*(?!false\b)[A-Za-z_$(]/;
+
+// Scan CODE, not prose. A grep over raw text reads both ways wrong: a comment saying
+// "shell:true" indicts a file that does no such thing, and a sentence like "WITHOUT a
+// shell: git is invoked with argv" trips the tightened form. Both happened here.
+function codeOnly(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')     // block comments
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');   // line comments, leaving `://` in URLs alone
+}
+
 describe('Subprocess Argument Safety (mcp-security)', () => {
-  it('no source in the server surface uses a shell (`shell: true`)', () => {
+  it('no unregistered source in the server surface hands a spawn a shell', () => {
     const offenders: string[] = [];
     for (const file of ALL_SOURCES) {
-      if (/shell\s*:\s*true/.test(readFileSync(file, 'utf-8'))) offenders.push(file.replace(SRC, 'src'));
+      const rel = file.replace(SRC, 'src');
+      if (SHELL_EXCEPTIONS.has(rel)) continue;
+      if (SHELL_OPTION.test(codeOnly(readFileSync(file, 'utf-8')))) offenders.push(rel);
     }
-    expect(offenders, `shell:true found in: ${offenders.join(', ')}`).toEqual([]);
+    expect(offenders, `shell option found in: ${offenders.join(', ')}`).toEqual([]);
+  });
+
+  it('the registered shell exceptions are Windows-gated, never unconditional', () => {
+    // The exception buys `.cmd` shim resolution on Windows and nothing else. An
+    // unconditional shell in the same file would inherit the register entry's cover
+    // without inheriting its reasoning, so pin the gating form itself.
+    for (const rel of SHELL_EXCEPTIONS) {
+      const src = codeOnly(readFileSync(join(SRC, rel.replace(/^src\//, '')), 'utf-8'));
+      const uses = [...src.matchAll(/shell\s*:\s*([^,\n]+)/g)].map(m => m[1].trim());
+      expect(uses.length, `${rel} is registered as a shell exception but uses no shell`).toBeGreaterThan(0);
+      for (const use of uses) {
+        expect(use, `${rel}: shell must be gated on win32, got \`shell: ${use}\``)
+          .toMatch(/^process\.platform\s*===\s*'win32'$/);
+      }
+    }
   });
 
   it('no source spawns a shell binary (/bin/sh, sh -c, bash -c)', () => {

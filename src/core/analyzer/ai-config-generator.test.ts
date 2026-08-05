@@ -30,7 +30,7 @@ describe('generateAiConfigs', () => {
   beforeEach(async () => { tmpDir = await createTempDir(); });
   afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
 
-  it('creates all 7 files when none exist and returns their relative paths', async () => {
+  it('creates all 9 files when none exist and returns their relative paths', async () => {
     const results = await generateAiConfigs({
       rootDir: tmpDir,
       analysisDir: '.openlore/analysis',
@@ -38,7 +38,11 @@ describe('generateAiConfigs', () => {
     });
 
     const rels = results.map(r => r.rel);
-    expect(results).toHaveLength(7);
+    // 7 upstream targets + QWEN.md and GIGACODE.md, added by this fork when it
+    // taught openlore the qwen and gigacode CLIs. The count is spelled out rather
+    // than derived from the generator's own table on purpose: a silently dropped
+    // target would then still pass.
+    expect(results).toHaveLength(9);
     expect(results.every(r => r.created)).toBe(true);
     expect(rels).toContain('CLAUDE.md');
     expect(rels).toContain('AGENTS.md');
@@ -47,6 +51,8 @@ describe('generateAiConfigs', () => {
     expect(rels).toContain('.github/copilot-instructions.md');
     expect(rels).toContain('.windsurf/rules.md');
     expect(rels).toContain('.vibe/skills/openlore.md');
+    expect(rels).toContain('QWEN.md');
+    expect(rels).toContain('GIGACODE.md');
   });
 
   it('skips files that already exist — all have created=false on second call', async () => {
@@ -64,7 +70,7 @@ describe('generateAiConfigs', () => {
       projectName: 'my-project',
     });
 
-    expect(results).toHaveLength(7);
+    expect(results).toHaveLength(9);
     expect(results.every(r => !r.created)).toBe(true);
   });
 
@@ -183,11 +189,11 @@ describe('generateAiConfigs', () => {
       projectName: 'my-project',
     });
 
-    // All 7 returned, CLAUDE.md has created=false, the rest created=true
-    expect(results).toHaveLength(7);
+    // All 9 returned, CLAUDE.md has created=false, the rest created=true
+    expect(results).toHaveLength(9);
     const claudeResult = results.find(r => r.rel === 'CLAUDE.md');
     expect(claudeResult?.created).toBe(false);
-    expect(results.filter(r => r.created)).toHaveLength(6);
+    expect(results.filter(r => r.created)).toHaveLength(8);
 
     // Existing file content should be unchanged
     const content = await readFile(join(tmpDir, 'CLAUDE.md'), 'utf-8');

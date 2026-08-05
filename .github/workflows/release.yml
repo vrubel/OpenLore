@@ -1,26 +1,28 @@
 name: Release
 
-# Publishes `openlore` to npm with provenance using npm Trusted Publishing
-# (OIDC) — no long-lived NPM_TOKEN required. See docs/publishing.md for the
-# one-time setup steps on the npmjs.com side.
+# UPSTREAM'S RELEASE PATH — DISARMED ON THE FORK LINE. Kept for reference and for
+# a clean merge with upstream; it must not fire here.
 #
-# Triggers (any of these runs validate → [create GitHub Release] → publish):
-#   - push of a `v*` tag  — the normal path. Pushing the tag auto-creates the
-#     GitHub Release (with generated notes) and publishes to npm in one run.
-#   - a GitHub Release published manually in the UI — the create-release job is
-#     skipped (the Release already exists) and publish runs.
-#   - workflow_dispatch — manual re-publish of an existing tag if a prior run
-#     failed mid-way.
+# It publishes `openlore` to npm with provenance via npm Trusted Publishing (OIDC)
+# and creates a GitHub Release through api.github.com. This fork has neither: PDLC
+# installs openlore by BUILDING IT FROM SOURCE at a pinned tag
+# (core/scripts/forks.lst), and our golden source is a self-hosted Gitea.
 #
-# Note on the no-double-run: a Release created by this workflow with the default
-# GITHUB_TOKEN does NOT emit a `release: published` event, so the tag-push path
-# does not re-trigger itself via the release trigger.
+# Worse than useless, the automatic tag trigger was actively harmful: the
+# `Verify tag matches package.json version` step below compares the tag name with
+# package.json's version, and our tag convention `vX.Y.Z-ruN` over upstream's
+# version `X.Y.Z` CANNOT match by construction. Every one of the 17 tags pushed on
+# this line since 2026-07-15 went red there — and because the step sits fourth,
+# lint/typecheck/tests/build were reported as `skipped` on all of them. A red badge
+# that never once ran a test reads like "the fork's code is checked and failing"
+# when in fact nothing was checked at all. Real checks now live in ci.yml, which
+# runs on this line's pushes and PRs.
+#
+# Left as `workflow_dispatch` only: it cannot start by itself, and a deliberate
+# manual run is still the way to reach upstream's publishing path if this fork ever
+# needs it (the version guard would have to be reconciled with `-ruN` first).
 
 on:
-  push:
-    tags: ['v*']
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:

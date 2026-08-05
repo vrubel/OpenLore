@@ -1,10 +1,15 @@
 name: CI
 
+# `main` here is upstream's line, which this fork does not develop on: our work
+# lands on `feat/doc-context-directive` (the fork line) and is shipped to PDLC as
+# a `vX.Y.Z-ruN` tag built from source. Listening on `main` alone left the line
+# with no CI at all — every check below was dead weight on the branch that
+# actually receives commits.
 on:
   push:
-    branches: [main]
+    branches: [main, feat/doc-context-directive]
   pull_request:
-    branches: [main]
+    branches: [main, feat/doc-context-directive]
 
 permissions:
   contents: read
@@ -68,12 +73,12 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/
-          retention-days: 7
+      # No artifact upload: actions/upload-artifact@v4+ refuses to run outside
+      # github.com (`GHESNotSupportedError`), and our Actions live on the self-hosted
+      # Gitea — the first real run of this job failed on exactly that, with the build
+      # itself green. Nothing in our contour consumed the artifact anyway: PDLC
+      # installs openlore by BUILDING IT FROM SOURCE at a pinned tag. Keeping a step
+      # that can only fail would leave the job permanently red for no signal.
 
   ci-success:
     name: CI Success
