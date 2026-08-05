@@ -5,6 +5,24 @@ All notable changes to OpenLore are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Install no longer fails on registries that lag npmjs: `@jsonjoy.com/fs-*`
+  pinned to 4.64.0** (ru line). The dev-only `memfs` dependency was a floating
+  `^4.15.0`, and every `memfs` release hard-pins its eight `@jsonjoy.com/fs-*`
+  companions to its own exact version. Since the fork is installed with
+  `npm install --no-package-lock` (the lockfile is deliberately bypassed — the
+  build strips lint devDeps from `package.json` first, which would make `npm ci`
+  fail on a lock mismatch), `memfs` re-resolved to whatever was newest on every
+  install: it reached 4.66.1 and demanded `@jsonjoy.com/fs-node@4.66.1`, which a
+  mirrored/air-gapped registry did not carry (its newest was 4.64.0) → `ETARGET`,
+  and the whole install died. `memfs` is now an exact `4.64.0`, and all eight
+  `@jsonjoy.com/fs-*` packages are additionally nailed to `4.64.0` via
+  `overrides`, so neither a direct nor a transitive path can drift upward again.
+  Same class of failure as the lint-stack strip on the PDLC side. `memfs` itself
+  is not imported anywhere in the source tree — the dependency is inert, only its
+  resolution mattered.
+
 ### Added
 
 - **`openlore reindex` — one-shot incremental delta catch-up** (ru line). Brings
