@@ -54,9 +54,23 @@ describe('grammar optional dependencies', () => {
 
   it('extractSoftLoadedPackages detects at least the known soft-loaded grammars', () => {
     const softLoaded = extractSoftLoadedPackages();
-    const known = ['tree-sitter-kotlin', 'tree-sitter-bash', 'tree-sitter-c', 'tree-sitter-c-sharp'];
+    // Kotlin is deliberately absent from this list on the fork line: the slim
+    // series moved it to the WASM loader (native tree-sitter-kotlin ships no
+    // prebuilt binary, so it never loaded under --ignore-scripts anyway). It is
+    // still soft-loaded — just through the other mechanism, asserted below.
+    const known = ['tree-sitter-bash', 'tree-sitter-c', 'tree-sitter-c-sharp'];
     for (const k of known) {
       expect(softLoaded, `Expected ${k} to be detected as soft-loaded`).toContain(k);
     }
+  });
+
+  it('the WASM path is soft too — the mechanism differs, the guarantee does not', () => {
+    // Same install-time promise as loadGrammarSoft: a grammar that cannot be
+    // resolved must degrade, never break `npm install` or the analyze run. Pinned
+    // for Kotlin because it MOVED here from the native path — without this, the
+    // list above shrinking would read as tightened scope rather than lost cover.
+    const src = readFileSync(join(ROOT, 'src', 'core', 'analyzer', 'call-graph.ts'), 'utf-8');
+    const wasmLoaded = [...src.matchAll(/loadWasmGrammarSoft\('([^']+)'/g)].map(m => m[1]);
+    expect(wasmLoaded, 'Kotlin should be soft-loaded via the WASM loader').toContain('Kotlin');
   });
 });

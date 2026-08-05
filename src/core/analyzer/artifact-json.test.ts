@@ -64,7 +64,7 @@ describe('stringifyArtifact', () => {
     // JSON.stringify raises RangeError for deep nesting too. Matching on the
     // class alone would tell the operator to exclude directories over a problem
     // that has nothing to do with size.
-    let root: Record<string, unknown> = {};
+    const root: Record<string, unknown> = {};
     let cur = root;
     for (let i = 0; i < 20_000; i++) {
       const next: Record<string, unknown> = {};
