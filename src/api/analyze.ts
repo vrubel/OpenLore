@@ -19,6 +19,7 @@ import {
 import { AnalysisArtifactGenerator, repoStructureToRepoMap, type RepoStructure, type LLMContext } from '../core/analyzer/artifact-generator.js';
 import type { AnalyzeApiOptions, AnalyzeResult, ProgressCallback } from './types.js';
 import { SpecSnapshotGenerator } from '../core/analyzer/spec-snapshot-generator.js';
+import { attachCallGraphFromStore } from '../core/services/call-graph-loader.js';
 
 function progress(
   onProgress: ProgressCallback | undefined,
@@ -38,10 +39,10 @@ async function loadCachedArtifacts(
   outputPath: string,
   repoStructure: RepoStructure,
 ): Promise<AnalyzeResult['artifacts']> {
-  const llmContext = await readJsonFile<LLMContext>(
+  const llmContext = attachCallGraphFromStore(await readJsonFile<LLMContext>(
     join(outputPath, ARTIFACT_LLM_CONTEXT),
     ARTIFACT_LLM_CONTEXT,
-  ) ?? { phase1_survey: { purpose: '', files: [] }, phase2_deep: { purpose: '', files: [] }, phase3_validation: { purpose: '', files: [] } };
+  ), outputPath) ?? { phase1_survey: { purpose: '', files: [] }, phase2_deep: { purpose: '', files: [] }, phase3_validation: { purpose: '', files: [] } };
 
   let summaryMarkdown = '';
   let dependencyDiagram = '';

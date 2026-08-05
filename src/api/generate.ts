@@ -43,6 +43,7 @@ import {
   ARTIFACT_REFACTOR_PRIORITIES,
   ARTIFACT_RAG_MANIFEST,
 } from '../constants.js';
+import { attachCallGraphFromStore } from '../core/services/call-graph-loader.js';
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'generate', step, status, detail });
@@ -63,10 +64,10 @@ async function loadAnalysisData(analysisPath: string): Promise<AnalysisData | nu
   );
   if (!repoStructure) return null;
 
-  const llmContext = await readJsonFile<LLMContext>(
+  const llmContext = attachCallGraphFromStore(await readJsonFile<LLMContext>(
     join(analysisPath, ARTIFACT_LLM_CONTEXT),
     ARTIFACT_LLM_CONTEXT,
-  ) ?? {
+  ), analysisPath) ?? {
     phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
     phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
     phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },

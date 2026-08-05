@@ -27,6 +27,7 @@ import type { AuditApiOptions } from './types.js';
 import type { LLMContext } from '../core/analyzer/artifact-generator.js';
 import type { MappingArtifact } from '../core/generator/mapping-generator.js';
 import type { SerializedCallGraph, FunctionNode } from '../core/analyzer/call-graph.js';
+import { attachCallGraphFromStore } from '../core/services/call-graph-loader.js';
 
 const DEFAULT_MAX_UNCOVERED = 50;
 const DEFAULT_HUB_THRESHOLD = 5;
@@ -86,7 +87,11 @@ export async function openloreAudit(options: AuditApiOptions = {}): Promise<Audi
     readFile(join(analysisDir, ARTIFACT_MAPPING), 'utf-8').catch(() => null),
   ]);
 
-  const llmContext = llmContextRaw ? JSON.parse(llmContextRaw) as LLMContext : null;
+  // The graph lives in call-graph.db, not in the artifact (PDLC-156) — attach it.
+  const llmContext = attachCallGraphFromStore(
+    llmContextRaw ? JSON.parse(llmContextRaw) as LLMContext : null,
+    analysisDir,
+  );
   const mapping = mappingRaw ? JSON.parse(mappingRaw) as MappingArtifact : null;
 
   const callGraph = llmContext?.callGraph as SerializedCallGraph | undefined;

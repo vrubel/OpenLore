@@ -60,6 +60,7 @@ import {
 import { ADRGenerator } from '../../core/generator/adr-generator.js';
 import type { RepoStructure, LLMContext } from '../../core/analyzer/artifact-generator.js';
 import type { DependencyGraphResult } from '../../core/analyzer/dependency-graph.js';
+import { attachCallGraphFromStore } from '../../core/services/call-graph-loader.js';
 
 const _require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = _require('../../../package.json') as { version: string };
@@ -116,7 +117,7 @@ async function loadAnalysis(analysisPath: string): Promise<{
     const repoStructure = await readJsonFile<RepoStructure>(repoStructurePath, ARTIFACT_REPO_STRUCTURE);
     if (!repoStructure) return null;
 
-    const llmContext = await readJsonFile<LLMContext>(llmContextPath, ARTIFACT_LLM_CONTEXT) ?? {
+    const llmContext = attachCallGraphFromStore(await readJsonFile<LLMContext>(llmContextPath, ARTIFACT_LLM_CONTEXT), analysisPath) ?? {
       phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
       phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
       phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
