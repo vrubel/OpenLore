@@ -6,7 +6,7 @@
  */
 
 import { access, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve, relative, sep } from 'node:path';
 import {
   LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS,
   GENERATION_OUTPUT_RATIO,
@@ -26,6 +26,31 @@ export async function fileExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Resolve a user-supplied directory argument against the repository root.
+ *
+ * Absolute wins, relative counts from the root. `join(root, value)` cannot do this:
+ * it GLUES the two ('/repo' + '/tmp/x' = '/repo/tmp/x'), so `--output /tmp/x` used to
+ * write a stray directory inside the analyzed tree while the CLI reported success
+ * over the empty one the operator had named.
+ */
+export function resolvePathArg(rootPath: string, value: string): string {
+  return resolve(rootPath, value);
+}
+
+/**
+ * How to SHOW a resolved directory to the operator: relative to the root while it
+ * stays inside the repository (the familiar `.openlore/analysis/`), absolute once it
+ * does not — printing `.openlore/analysis/` for a run that wrote to /tmp is exactly
+ * the misreport this pair of helpers exists to end. Always ends with a separator, so
+ * `${display}llm-context.json` reads as a path and not as `/tmp/xllm-context.json`.
+ */
+export function displayPathArg(rootPath: string, resolvedPath: string): string {
+  const rel = relative(rootPath, resolvedPath);
+  const shown = rel && !rel.startsWith('..') ? rel : resolvedPath;
+  return shown.endsWith(sep) || shown.endsWith('/') ? shown : `${shown}${sep}`;
 }
 
 /**

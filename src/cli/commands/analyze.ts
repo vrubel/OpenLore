@@ -9,7 +9,7 @@ import { Command } from 'commander';
 import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
-import { fileExists, formatDuration, formatAge, getAnalysisAge } from '../../utils/command-helpers.js';
+import { fileExists, formatDuration, formatAge, getAnalysisAge, resolvePathArg, displayPathArg } from '../../utils/command-helpers.js';
 import {
   ARTIFACT_DEPENDENCY_GRAPH,
   ARTIFACT_FINGERPRINT,
@@ -104,6 +104,27 @@ async function captureBuildCommit(rootPath: string): Promise<string | null> {
     return commit.length > 0 ? commit : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Create the output directory, failing LOUDLY and by name if it cannot be created.
+ *
+ * With `--output` finally honouring absolute paths, the target can now sit outside
+ * the repository — on a read-only mount, under a directory the user cannot write, or
+ * behind a file of the same name. That must stop the run with the path and the reason
+ * on screen. The old glue-the-paths behaviour could not fail here at all: it always
+ * created a writable directory inside the repository and reported success over the
+ * empty one the operator was looking at.
+ */
+async function ensureOutputDir(outputPath: string): Promise<void> {
+  try {
+    await mkdir(outputPath, { recursive: true });
+  } catch (err) {
+    throw new Error(
+      `cannot write analysis to ${outputPath}: ${(err as Error).message}. ` +
+      `--output takes an absolute path or one relative to the repository root, and the directory must be writable.`
+    );
   }
 }
 
@@ -353,6 +374,18 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       return;
     }
 
+    // ONE resolved output directory for the whole command: an absolute --output lands
+    // where the operator named it, a relative one counts from the repository root.
+    // This used to be `join(rootPath, opts.output)` at two separate call sites, and
+    // join GLUES an absolute path onto the root — `--output /tmp/x` wrote into
+    // <repo>/tmp/x while every message on screen said /tmp/x and the run reported
+    // success. Two truths, one of them printed; now there is one.
+    const outputPath = resolvePathArg(rootPath, opts.output);
+    // What the operator sees. Relative while the target is inside the repository, so
+    // the familiar `.openlore/analysis/…` lines are unchanged; absolute once it is not.
+    const outputDisplay = displayPathArg(rootPath, outputPath);
+    const analysisDirRef = outputDisplay.replace(/[\\/]$/, '');
+
     try {
       // ========================================================================
       // PHASE 1: VALIDATION
@@ -372,7 +405,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       const keywordOnly = options.embed === false;
 
       logger.info('Project', openloreConfig.projectType);
-      logger.info('Output', opts.output);
+      logger.info('Output', outputDisplay);
       logger.info('Max files', opts.maxFiles);
       if (opts.include.length > 0) {
         logger.info('Include patterns', opts.include.join(', '));
@@ -386,8 +419,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       // PHASE 1b: --reindex-specs fast path (no full analysis)
       // ========================================================================
       if (opts.reindexSpecs) {
-        const outputPath = join(rootPath, opts.output);
-        await mkdir(outputPath, { recursive: true });
+        await ensureOutputDir(outputPath);
         await runSpecIndexing(rootPath, outputPath, openloreConfig);
         return;
       }
@@ -395,7 +427,6 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       // ========================================================================
       // PHASE 2: CHECK EXISTING ANALYSIS
       // ========================================================================
-      const outputPath = join(rootPath, opts.output);
       const analysisAge = await getAnalysisAge(outputPath);
 
       // Skip re-analysis only when the SOURCE is unchanged since the last run — a
@@ -446,7 +477,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
               if (selectedTools === undefined || selectedTools.length > 0) {
                 const aiResults = await generateAiConfigs({
                   rootDir: rootPath,
-                  analysisDir: opts.output.replace(/\/$/, ''),
+                  analysisDir: analysisDirRef,
                   projectName: repoStructure.projectName ?? 'project',
                   tools: selectedTools,
                 });
@@ -475,7 +506,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       // PHASE 3: RUN ANALYSIS
       // ========================================================================
       // Ensure output directory exists
-      await mkdir(outputPath, { recursive: true });
+      await ensureOutputDir(outputPath);
 
       const result = await runAnalysis(rootPath, outputPath, {
         maxFiles: opts.maxFiles,
@@ -530,7 +561,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       // Refactor priorities (read from disk if available)
       try {
         const { readFile: rf } = await import('node:fs/promises');
-        const rp = JSON.parse(await rf(join(opts.output, ARTIFACT_REFACTOR_PRIORITIES), 'utf-8'));
+        const rp = JSON.parse(await rf(join(outputPath, ARTIFACT_REFACTOR_PRIORITIES), 'utf-8'));
         if (rp?.stats?.withIssues > 0) {
           const s = rp.stats;
           const badges = [
@@ -586,7 +617,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
           }
 
           console.log('');
-          console.log(`    → ${opts.output}refactor-priorities.json`);
+          console.log(`    → ${outputDisplay}refactor-priorities.json`);
           console.log('');
         }
       } catch (rpErr) {
@@ -596,7 +627,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       // Duplicate code detection
       try {
         const { readFile: rf } = await import('node:fs/promises');
-        const dup = JSON.parse(await rf(join(opts.output, 'duplicates.json'), 'utf-8'));
+        const dup = JSON.parse(await rf(join(outputPath, 'duplicates.json'), 'utf-8'));
         if (dup?.stats?.cloneGroupCount > 0) {
           const s = dup.stats;
           const severity = s.duplicationRatio >= 0.2 ? '⚠'
@@ -637,7 +668,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
           }
 
           console.log('');
-          console.log(`    → ${opts.output}duplicates.json`);
+          console.log(`    → ${outputDisplay}duplicates.json`);
           console.log('');
         }
       } catch (dupErr) {
@@ -699,7 +730,7 @@ After analysis, run 'openlore generate' to create OpenSpec files.
         if (selectedTools === undefined || selectedTools.length > 0) {
           aiConfigsCreated = await generateAiConfigs({
             rootDir: rootPath,
-            analysisDir: opts.output.replace(/\/$/, ''),
+            analysisDir: analysisDirRef,
             projectName: result.repoMap.metadata.projectName,
             tools: selectedTools,
           });
@@ -708,35 +739,35 @@ After analysis, run 'openlore generate' to create OpenSpec files.
 
       // Files generated
       console.log('  Output Files:');
-      console.log(`    ├─ ${opts.output}repo-structure.json`);
-      console.log(`    ├─ ${opts.output}dependency-graph.json`);
-      console.log(`    ├─ ${opts.output}llm-context.json`);
-      console.log(`    ├─ ${opts.output}dependencies.mermaid`);
+      console.log(`    ├─ ${outputDisplay}repo-structure.json`);
+      console.log(`    ├─ ${outputDisplay}dependency-graph.json`);
+      console.log(`    ├─ ${outputDisplay}llm-context.json`);
+      console.log(`    ├─ ${outputDisplay}dependencies.mermaid`);
       if (artifacts.repoStructure.schemas.length > 0) {
-        console.log(`    ├─ ${opts.output}schema-inventory.json  (${artifacts.repoStructure.schemas.length} table(s))`);
+        console.log(`    ├─ ${outputDisplay}schema-inventory.json  (${artifacts.repoStructure.schemas.length} table(s))`);
       }
       if (artifacts.repoStructure.routeInventory.total > 0) {
-        console.log(`    ├─ ${opts.output}route-inventory.json  (${artifacts.repoStructure.routeInventory.total} route(s))`);
+        console.log(`    ├─ ${outputDisplay}route-inventory.json  (${artifacts.repoStructure.routeInventory.total} route(s))`);
       }
       if (artifacts.repoStructure.middleware.length > 0) {
-        console.log(`    ├─ ${opts.output}middleware-inventory.json  (${artifacts.repoStructure.middleware.length} middleware entry(ies))`);
+        console.log(`    ├─ ${outputDisplay}middleware-inventory.json  (${artifacts.repoStructure.middleware.length} middleware entry(ies))`);
       }
       if (artifacts.repoStructure.uiComponents.length > 0) {
-        console.log(`    ├─ ${opts.output}ui-inventory.json  (${artifacts.repoStructure.uiComponents.length} UI component(s))`);
+        console.log(`    ├─ ${outputDisplay}ui-inventory.json  (${artifacts.repoStructure.uiComponents.length} UI component(s))`);
       }
       if (artifacts.repoStructure.envVars.length > 0) {
-        console.log(`    ├─ ${opts.output}env-inventory.json  (${artifacts.repoStructure.envVars.length} env var(s))`);
+        console.log(`    ├─ ${outputDisplay}env-inventory.json  (${artifacts.repoStructure.envVars.length} env var(s))`);
       }
       // CODEBASE.md (digestWritten) is the last branch when present, so it owns the
       // └─ corner; otherwise the corner falls to ARCHITECTURE.md / SUMMARY.md.
       if (architectureMdWritten) {
-        console.log(`    ├─ ${opts.output}SUMMARY.md`);
-        console.log(`    ${digestWritten ? '├─' : '└─'} ${opts.output}ARCHITECTURE.md`);
+        console.log(`    ├─ ${outputDisplay}SUMMARY.md`);
+        console.log(`    ${digestWritten ? '├─' : '└─'} ${outputDisplay}ARCHITECTURE.md`);
       } else {
-        console.log(`    ${digestWritten ? '├─' : '└─'} ${opts.output}SUMMARY.md`);
+        console.log(`    ${digestWritten ? '├─' : '└─'} ${outputDisplay}SUMMARY.md`);
       }
       if (digestWritten) {
-        console.log(`    └─ ${opts.output}CODEBASE.md`);
+        console.log(`    └─ ${outputDisplay}CODEBASE.md`);
         console.log('');
         console.log('  Agent setup (one-time):');
         console.log(`    Add to your agent context file (CLAUDE.md / QWEN.md / GIGACODE.md / AGENTS.md / .clinerules):`);
@@ -883,7 +914,7 @@ async function runEmbedStep(
       } else {
         console.log(`    ✓ Built keyword (BM25) search index (${result.total} functions) — set EMBED_BASE_URL/EMBED_MODEL or add "embedding" to .openlore/config.json for semantic search.`);
       }
-      console.log(`    → ${outputPath.replace(rootPath + '/', '')}vector-index/`);
+      console.log(`    → ${displayPathArg(rootPath, outputPath)}vector-index/`);
     }
 
     // Build the literal-text line index (BM25-only, separate from the symbol
@@ -933,7 +964,7 @@ async function runTextLineIndexing(rootPath: string, outputPath: string): Promis
 
     const { lines, files: indexedFiles } = await TextLineIndex.build(outputPath, files);
     console.log(`    ✓ Text line index built (${lines} lines across ${indexedFiles} files)`);
-    console.log(`    → ${outputPath.replace(rootPath + '/', '')}text-line-index/`);
+    console.log(`    → ${displayPathArg(rootPath, outputPath)}text-line-index/`);
   } catch (err) {
     console.log(`    ⚠ Text line index skipped: ${(err as Error).message}`);
   }
@@ -985,7 +1016,7 @@ async function runSpecIndexing(
     const { recordCount, hasEmbeddings } = await SpecVectorIndex.build(outputPath, specsDir, embedSvc, mappingJsonPath, decisionsDir);
     const specNote = hasEmbeddings ? '' : ' (keyword/BM25 — set EMBED_* for semantic spec search)';
     console.log(`    ✓ Spec index built (${recordCount} sections)${specNote}`);
-    console.log(`    → ${outputPath.replace(rootPath + '/', '')}vector-index/`);
+    console.log(`    → ${displayPathArg(rootPath, outputPath)}vector-index/`);
   } catch (err) {
     console.log(`    ⚠ Spec index skipped: ${(err as Error).message}`);
   }

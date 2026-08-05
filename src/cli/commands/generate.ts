@@ -10,7 +10,7 @@ import { confirm } from '@inquirer/prompts';
 import { stat, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
-import { fileExists, formatDuration, formatAge, parseList, readJsonFile, resolveLLMProvider, estimateCost } from '../../utils/command-helpers.js';
+import { fileExists, formatDuration, formatAge, parseList, readJsonFile, resolveLLMProvider, estimateCost, resolvePathArg } from '../../utils/command-helpers.js';
 import {
   DEFAULT_ANTHROPIC_MODEL,
   DEFAULT_OPENAI_MODEL,
@@ -326,7 +326,11 @@ Each spec.md follows OpenSpec conventions:
       // ========================================================================
       logger.section('Loading Analysis');
 
-      const analysisPath = join(rootPath, opts.analysis);
+      // Same defect class as analyze's --output, same one-line fix: join GLUES an
+      // absolute path onto the root, so `--analysis /abs/dir` looked for
+      // <repo>/abs/dir and reported "no analysis found" over a directory that was
+      // right there. resolve honours absolute and still counts relative from the root.
+      const analysisPath = resolvePathArg(rootPath, opts.analysis);
 
       // --force: clear intermediate stage files so no stale LLM output survives
       if (options.force === true) {

@@ -5,13 +5,60 @@
  *   - formatAge
  *   - parseList
  *   - readJsonFile
+ *   - resolvePathArg / displayPathArg
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mkdtemp, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
-import { formatDuration, formatAge, parseList } from './command-helpers.js';
+import { formatDuration, formatAge, parseList, resolvePathArg, displayPathArg } from './command-helpers.js';
+
+// ============================================================================
+// resolvePathArg / displayPathArg — where --output actually lands, and what we say
+// ============================================================================
+
+describe('resolvePathArg', () => {
+  const root = join(sep, 'repo');
+
+  it('counts a relative path from the repository root', () => {
+    expect(resolvePathArg(root, '.openlore/analysis/')).toBe(join(root, '.openlore', 'analysis'));
+    expect(resolvePathArg(root, 'my-analysis')).toBe(join(root, 'my-analysis'));
+  });
+
+  it('uses an absolute path exactly as given — the whole point of the fix', () => {
+    // join() would have produced /repo/tmp/out here: artifacts landing in a stray
+    // directory INSIDE the analyzed tree while the CLI reported success over the
+    // empty /tmp/out the operator was watching.
+    const abs = join(sep, 'tmp', 'out');
+    expect(resolvePathArg(root, abs)).toBe(abs);
+    expect(resolvePathArg(root, abs).startsWith(root)).toBe(false);
+  });
+
+  it('resolves .. relative to the root rather than gluing it on', () => {
+    expect(resolvePathArg(join(sep, 'repo', 'sub'), '../out')).toBe(join(sep, 'repo', 'out'));
+  });
+});
+
+describe('displayPathArg', () => {
+  const root = join(sep, 'repo');
+
+  it('stays relative while the target is inside the repository', () => {
+    const inside = join(root, '.openlore', 'analysis');
+    expect(displayPathArg(root, inside)).toBe(`.openlore${sep}analysis${sep}`);
+  });
+
+  it('shows the absolute path once the target leaves the repository', () => {
+    const outside = join(sep, 'tmp', 'out');
+    expect(displayPathArg(root, outside)).toBe(`${outside}${sep}`);
+  });
+
+  it('always ends with a separator so `${display}file.json` is a path', () => {
+    // Without this, `--output /tmp/out` printed /tmp/outllm-context.json.
+    expect(displayPathArg(root, join(sep, 'tmp', 'out'))).toMatch(/[\\/]$/);
+    expect(displayPathArg(root, join(root, 'x') + sep)).toBe(`x${sep}`);
+  });
+});
 
 // ============================================================================
 // formatDuration
