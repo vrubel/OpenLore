@@ -52,16 +52,52 @@ const SHELL_EXCEPTIONS = new Set(['src/core/services/llm-service.ts']);
 // `shell:` set to anything that is not the literal `false` — `true`, a variable, or a
 // platform check. The old guard matched only `shell: true`, which a conditional such as
 // `shell: process.platform === 'win32'` walked straight past while still being a shell
-// wherever the condition holds.
-const SHELL_OPTION = /shell\s*:\s*(?!false\b)[A-Za-z_$(]/;
+// wherever the condition holds. The key may be quoted (`"shell": true`).
+const SHELL_OPTION = /['"`]?shell['"`]?\s*:\s*(?!false\b)[A-Za-z_$(]/;
 
-// Scan CODE, not prose. A grep over raw text reads both ways wrong: a comment saying
-// "shell:true" indicts a file that does no such thing, and a sentence like "WITHOUT a
-// shell: git is invoked with argv" trips the tightened form. Both happened here.
+// Scan CODE, not prose — see the twin in security-capabilities.test.ts; keep both in step.
+//
+// A grep over raw text reads both ways wrong: a comment saying "shell:true" indicts a
+// file that does no such thing, and a sentence like "WITHOUT a shell: git is invoked
+// with argv" trips the tightened form. But stripping comments with a REGEX is worse
+// than the disease: `"legacy/**"` inside the help text of analyze.ts opens a block
+// comment that never closes nearby, and `/\/\*[\s\S]*?\*\//` then swallowed 548 of its
+// 1031 lines — the guard was blind on half of a live file and said nothing.
+//
+// So: walk the source, drop comments, and step OVER string and template literals so
+// nothing inside them can open one. Literal text is kept rather than blanked — the
+// shell-binary check below matches on `execFileSync('sh', ['-c'`, which lives entirely
+// inside literals.
 function codeOnly(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')     // block comments
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');   // line comments, leaving `://` in URLs alone
+  let out = '';
+  for (let i = 0; i < src.length;) {
+    const c = src[i], next = src[i + 1];
+    if (c === '/' && next === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      out += c;
+      i++;
+      while (i < src.length) {
+        if (src[i] === '\\') { out += src[i] + (src[i + 1] ?? ''); i += 2; continue; }
+        out += src[i];
+        if (src[i] === c) { i++; break; }
+        if (src[i] === '\n' && c !== '`') { i++; break; }  // unterminated quote: bail at EOL
+        i++;
+      }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 describe('Subprocess Argument Safety (mcp-security)', () => {
@@ -73,6 +109,44 @@ describe('Subprocess Argument Safety (mcp-security)', () => {
       if (SHELL_OPTION.test(codeOnly(readFileSync(file, 'utf-8')))) offenders.push(rel);
     }
     expect(offenders, `shell option found in: ${offenders.join(', ')}`).toEqual([]);
+  });
+
+  it('the scanner keeps code that a glob in a string used to hide', () => {
+    // The guard is only as good as its view of the file. A regex-based comment stripper
+    // treated `"legacy/**"` — a glob in analyze.ts's help text — as the start of a block
+    // comment and ate everything up to the next `*/`, blinding the check on 548 of that
+    // file's 1031 lines. Pin the whole failure shape: literal survives, code after it
+    // survives, a shell hidden behind it is caught, and real comments still go.
+    const sample = [
+      'const help = `',
+      '  $ openlore analyze --exclude "legacy/**"',
+      '`;',
+      '// shell: true  <- a comment, must NOT count',
+      '/* shell: true  <- also a comment */',
+      "const opts = { shell: true };  // <- this one is real",
+    ].join('\n');
+
+    const scanned = codeOnly(sample);
+    expect(scanned, 'the literal itself must survive').toContain('legacy/**');
+    expect(scanned, 'code after the glob must survive').toContain('const opts');
+    expect(SHELL_OPTION.test(scanned), 'a shell after the glob must be caught').toBe(true);
+    expect(codeOnly('// shell: true\n'), 'a line comment must not count').not.toMatch(SHELL_OPTION);
+    expect(codeOnly('/* shell: true */\n'), 'a block comment must not count').not.toMatch(SHELL_OPTION);
+
+    // And the real file is no longer being eaten: the scanner keeps the bulk of it.
+    const analyze = readFileSync(join(SRC, 'cli', 'commands', 'analyze.ts'), 'utf-8');
+    const kept = codeOnly(analyze).split('\n').length;
+    const total = analyze.split('\n').length;
+    expect(kept / total, `codeOnly kept only ${kept} of ${total} lines of analyze.ts`).toBeGreaterThan(0.9);
+  });
+
+  it('a quoted shell key does not slip past the option guard', () => {
+    // `{ "shell": true }` is the same spawn option with a quoted key — JSON-shaped
+    // option objects and generated code write it that way.
+    for (const form of ['{ "shell": true }', "{ 'shell': true }", '{ shell: someFlag }']) {
+      expect(SHELL_OPTION.test(codeOnly(form)), `must catch ${form}`).toBe(true);
+    }
+    expect(SHELL_OPTION.test(codeOnly('{ shell: false }')), 'must allow the literal false').toBe(false);
   });
 
   it('the registered shell exceptions are Windows-gated, never unconditional', () => {

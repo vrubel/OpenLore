@@ -32,12 +32,46 @@ function surfaceText(): string {
   return SURFACE.map(f => readFileSync(f, 'utf-8')).join('\n');
 }
 
-// Scan CODE, not prose: a grep over raw text indicts files whose COMMENTS merely
-// discuss shells, and trips on sentences like "WITHOUT a shell: git is invoked".
+// Scan CODE, not prose — TWIN of the scanner in mcp-handlers/security.test.ts; the two
+// guards must see the same thing, so keep them in step.
+//
+// A grep over raw text indicts files whose COMMENTS merely discuss shells and trips on
+// sentences like "WITHOUT a shell: git is invoked". But stripping comments by REGEX is
+// worse: `"legacy/**"` in analyze.ts's help text opens a block comment that never closes
+// nearby, and the stripper ate 548 of that file's 1031 lines — the declaration was being
+// verified against half a file. Walk the source instead and step OVER string/template
+// literals. Literal text is KEPT, not blanked: the shell-binary check matches on
+// `execFileSync('sh', ['-c'`, which is all literals.
 function codeOnly(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')     // block comments
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');   // line comments, leaving `://` in URLs alone
+  let out = '';
+  for (let i = 0; i < src.length;) {
+    const c = src[i], next = src[i + 1];
+    if (c === '/' && next === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      out += c;
+      i++;
+      while (i < src.length) {
+        if (src[i] === '\\') { out += src[i] + (src[i + 1] ?? ''); i += 2; continue; }
+        out += src[i];
+        if (src[i] === c) { i++; break; }
+        if (src[i] === '\n' && c !== '`') { i++; break; }  // unterminated quote: bail at EOL
+        i++;
+      }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 describe('Capability declaration — shape (mcp-security)', () => {
@@ -89,7 +123,7 @@ describe('Capability declaration — matches observed behavior (mcp-security)', 
     // the condition holds.
     const offenders: string[] = [];
     const SHELL_INVOKE = /(?:exec|execFile|execFileSync|spawn|spawnSync)\(\s*['"`](?:\/bin\/)?(?:sh|bash|zsh|dash)['"`]\s*,\s*\[\s*['"`]-c['"`]/;
-    const SHELL_OPTION = /shell\s*:\s*(?!false\b)[A-Za-z_$(]/;
+    const SHELL_OPTION = /['"`]?shell['"`]?\s*:\s*(?!false\b)[A-Za-z_$(]/;
     const registered = new Set(['src/core/services/llm-service.ts']);
     for (const f of SURFACE) {
       const rel = f.replace(SRC, 'src');

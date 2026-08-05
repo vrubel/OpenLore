@@ -384,7 +384,14 @@ After analysis, run 'openlore generate' to create OpenSpec files.
     // What the operator sees. Relative while the target is inside the repository, so
     // the familiar `.openlore/analysis/…` lines are unchanged; absolute once it is not.
     const outputDisplay = displayPathArg(rootPath, outputPath);
-    const analysisDirRef = outputDisplay.replace(/[\\/]$/, '');
+    // Where the GENERATED agent configs point at the digest. Derived from the display
+    // path but deliberately NOT the display path: `displayPathArg` speaks the host OS
+    // (`path.sep`), and this value is written into CLAUDE.md / QWEN.md / AGENTS.md,
+    // where the generator appends a literal `/CODEBASE.md`. On Windows that produced
+    // the mixed `@.openlore\analysis/CODEBASE.md` — a reference in two dialects at
+    // once. Separators are normalised to `/`, which every consumer of these files
+    // understands and which Windows accepts as a path separator too.
+    const analysisDirRef = outputDisplay.replace(/[\\/]$/, '').replace(/\\/g, '/');
 
     try {
       // ========================================================================
