@@ -18,9 +18,19 @@ import {
   readCachedContext,
   loadMappingIndex,
   queryTooLongError,
+  validateDirectory,
   _resetContextCacheForTesting,
   clearMappingCache,
 } from './utils.js';
+import {
+  configureRootAllowlist,
+  assertRootAllowed,
+  WRITING_TOOLS,
+  _resetRootAllowlistForTesting,
+} from './root-allowlist.js';
+import { handleFederationStatus } from './federation.js';
+import { resolveFederationScope } from '../../federation/resolver.js';
+import { emit } from '../telemetry.js';
 import { redactSecrets, redactSecretString } from '../secret-redaction.js';
 import { TOOL_DEFINITIONS, toolAnnotations } from '../../../cli/commands/mcp.js';
 import { handleAnnotateStory } from './change.js';
@@ -380,7 +390,12 @@ describe('Path-Parameter Coverage Gate (mcp-security)', () => {
   // confinement category we have verified for it. A path-like field that is not
   // in this registry fails the gate below — so a newly added path argument cannot
   // silently bypass confinement. Categories:
-  //   'root'     → the project root, confined by validateDirectory()
+  //   'root'     → the project root. Confined TWICE: by the MCP root allowlist
+  //                (assertRootAllowed — the perimeter, checked BEFORE the filesystem
+  //                is touched at all) and then by validateDirectory() (must be an
+  //                existing directory). "Confined by validateDirectory()" alone was
+  //                the old, false claim: existence is not confinement, and a server
+  //                raised for one repo answered about every path on the machine.
   //   'disk'     → joined to the root and read/written; MUST route through safeJoin()
   //   'lookup'   → matched against already-analyzed in-memory data; never hits the fs
   //   'metadata' → stored/echoed as data; never used to access the fs
@@ -575,16 +590,31 @@ describe('Write Confinement for Mutating Tools (mcp-security)', () => {
   // Every tool that writes to disk or mutates persistent state must be annotated
   // non-read-only (mcp-quality Tool Behavior Annotations). Keeps the annotation
   // table honest as new mutators are added.
-  const MUTATORS = [
-    'record_decision', 'sync_decisions', 'annotate_story', 'generate_change_proposal',
-    'generate_tests', 'remember', 'approve_decision', 'reject_decision',
-  ];
+  //
+  // The list had gone stale in exactly the way it exists to prevent: it named
+  // eight tools while ten write. `analyze_codebase` rewrites the whole .openlore
+  // index, and `change_impact_certificate` persists a certificate file whenever
+  // `persist: true` — and shipped annotated read-only. Both are here now, and the
+  // gate below is BIDIRECTIONAL so neither list can drift from the other again.
+  const MUTATORS = [...WRITING_TOOLS].sort();
 
   it('all mutating tools are annotated readOnlyHint:false', () => {
     for (const name of MUTATORS) {
       const ann = toolAnnotations(name);
       expect(ann.readOnlyHint, `${name} must be readOnlyHint:false`).toBe(false);
     }
+  });
+
+  it('the perimeter\'s writer list and the annotation table agree in BOTH directions', () => {
+    // The allowlist decides read-vs-write access from WRITING_TOOLS, not from the
+    // annotations — annotations are a client-facing hint and have been wrong. This
+    // test is what keeps the hint honest: any tool annotated as a writer must be in
+    // the perimeter's list, and vice versa.
+    const annotatedWriters = TOOL_DEFINITIONS
+      .map(t => t.name)
+      .filter(n => toolAnnotations(n).readOnlyHint === false)
+      .sort();
+    expect(annotatedWriters).toEqual(MUTATORS);
   });
 
   it('read-only graph tools are annotated readOnlyHint:true (negative control)', () => {
@@ -700,6 +730,145 @@ describe('Bounded Computation — free-text query length (mcp-security)', () => 
       expect(String(res.error)).toMatch(/too long/i);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Root Allowlist: the MCP server's filesystem perimeter ─────────────────────
+
+describe('Root Allowlist (MCP filesystem perimeter)', () => {
+  let home: string;      // the repo this server was raised for
+  let neighbour: string; // another repo on the same machine — off limits
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-perim-home-')));
+    neighbour = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-perim-nb-')));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(neighbour, { recursive: true, force: true });
+  });
+
+  it('validateDirectory refuses a foreign absolute path once a perimeter is declared', async () => {
+    // Before this gate existed the very same call SUCCEEDED and returned the path:
+    // a server raised for `home` answered, in full, about `neighbour`.
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    await expect(validateDirectory(neighbour)).rejects.toThrow(/Root allowlist/);
+  });
+
+  it('the perimeter is checked BEFORE the filesystem, so refusals do not leak existence', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    // Two foreign paths, one real and one not. If `stat` ran first, the messages
+    // would differ ("Directory not found" vs. a successful read) and the agent
+    // could map the machine by reading the difference. They must be identical.
+    const real = await validateDirectory(neighbour).catch((e: Error) => e.message);
+    const ghost = await validateDirectory(join(neighbour, 'no-such-dir')).catch((e: Error) => e.message);
+    expect(real).toMatch(/Root allowlist/);
+    expect(ghost).toMatch(/Root allowlist/);
+    expect(String(ghost)).not.toMatch(/not found|Not a directory/i);
+  });
+
+  it('refuses an in-root symlink that points at a foreign repo (realpath, not lexical)', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const link = join(home, 'sneaky');
+    symlinkSync(neighbour, link);
+    await expect(validateDirectory(link)).rejects.toThrow(/Root allowlist/);
+  });
+
+  it('a readable-but-not-writable root refuses write-mode access', () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+    expect(() => assertRootAllowed(neighbour, 'read')).not.toThrow();
+    expect(() => assertRootAllowed(neighbour, 'write')).toThrow(/readable but not writable/);
+  });
+
+  it('no regression: the declared roots still validate exactly as before', async () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home, neighbour] });
+    await expect(validateDirectory(home)).resolves.toBe(home);
+    await expect(validateDirectory(neighbour)).resolves.toBe(neighbour);
+    mkdirSync(join(home, 'pkg', 'src'), { recursive: true });
+    await expect(validateDirectory(join(home, 'pkg', 'src'))).resolves.toBe(join(home, 'pkg', 'src'));
+    // …and a genuinely absent directory INSIDE the perimeter still fails for the
+    // honest reason, not the perimeter one.
+    await expect(validateDirectory(join(home, 'ghost'))).rejects.toThrow(/Directory not found/);
+  });
+
+  it('with no perimeter declared (a CLI process) nothing is confined', async () => {
+    // `openlore federation add /elsewhere/repo` is PDLC registering a product's
+    // repository set: the boundary is the MCP server, not the handler library.
+    await expect(validateDirectory(neighbour)).resolves.toBe(neighbour);
+  });
+
+  it('federation_status withholds repos outside the perimeter instead of advertising them', async () => {
+    // The home repo's registry knows a neighbour by absolute path. Refusing the
+    // CALL is only half a perimeter: an agent that can read the address will just
+    // probe it. The listing must not carry it at all.
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    writeFileSync(
+      join(home, '.openlore', 'federation.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        repos: [
+          { name: 'neighbour', path: neighbour, fingerprint: '', schemaVersion: 1, lastBuilt: '2026-01-01T00:00:00.000Z' },
+        ],
+      }, null, 2),
+      'utf-8',
+    );
+
+    // Without a perimeter the address is served (today's behaviour, still right for the CLI).
+    const open = await handleFederationStatus(home) as { registered: number; repos: Array<{ path: string }> };
+    expect(open.registered).toBe(1);
+    expect(open.repos[0].path).toBe(neighbour);
+
+    // With one, it is withheld — and the withholding is AUDIBLE, not silent.
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const closed = await handleFederationStatus(home) as {
+      registered: number; repos: Array<{ path: string }>; withheld?: number; note: string;
+    };
+    expect(closed.repos).toEqual([]);
+    expect(closed.registered).toBe(0);
+    expect(closed.withheld).toBe(1);
+    expect(closed.note).toMatch(/allowlist|perimeter|root/i);
+    expect(JSON.stringify(closed)).not.toContain(neighbour);
+  });
+
+  it('federation scope resolution does not READ repos outside the perimeter', async () => {
+    // resolveFederationScope is the choke point every `federation: true` query goes
+    // through — analyze_impact, select_tests, find_path, recall. It must not hand a
+    // foreign repo to the resolver, or the listing gate above would be cosmetic.
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    writeFileSync(
+      join(home, '.openlore', 'federation.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        repos: [
+          { name: 'neighbour', path: neighbour, fingerprint: '', schemaVersion: 1, lastBuilt: '2026-01-01T00:00:00.000Z' },
+        ],
+      }, null, 2),
+      'utf-8',
+    );
+    expect(resolveFederationScope(home, { federation: true }).repos).toHaveLength(1);
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    expect(resolveFederationScope(home, { federation: true }).repos).toEqual([]);
+  });
+
+  it('telemetry never writes outside the write roots', () => {
+    // emit() creates <directory>/.openlore/telemetry and appends to it — telemetry
+    // IS a write, and it runs on the transport path before any handler validates
+    // anything. PDLC enables it explicitly (OPENLORE_TELEMETRY=1), so this is a live
+    // write primitive pointed at a caller-supplied path.
+    const prev = process.env['OPENLORE_TELEMETRY'];
+    process.env['OPENLORE_TELEMETRY'] = '1';
+    try {
+      configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+      emit(neighbour, 'mcp', { event: 'tool_call', tool: 'orient' });
+      expect(existsSync(join(neighbour, '.openlore')), 'telemetry escaped the write roots').toBe(false);
+      // Positive control: inside a write root it still records.
+      emit(home, 'mcp', { event: 'tool_call', tool: 'orient' });
+      expect(existsSync(join(home, '.openlore', 'telemetry', 'mcp.jsonl'))).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env['OPENLORE_TELEMETRY'];
+      else process.env['OPENLORE_TELEMETRY'] = prev;
     }
   });
 });
