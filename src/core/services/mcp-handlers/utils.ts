@@ -65,31 +65,44 @@ export function attachCallGraph(ctx: CachedContext, store: EdgeStore | undefined
 import { logger } from '../../../utils/logger.js';
 import { emit } from '../telemetry.js';
 import { redactSecretString } from '../secret-redaction.js';
+import { assertRootAllowed } from './root-allowlist.js';
 
 /**
- * Resolve and validate a user-supplied directory path.
+ * Resolve and validate a caller-supplied project root.
  *
- * Ensures the path resolves to an existing directory, which prevents path
- * traversal attacks where a client supplies `"../../../../etc"` or a plain
- * file path instead of a project directory.
+ * TWO separate questions, in this order:
+ *
+ *   1. MAY this server touch that root at all? — the MCP root allowlist
+ *      (see root-allowlist.ts). A server raised for one repository must not
+ *      serve another, and until this check existed it served every path on the
+ *      machine that happened to be a directory.
+ *   2. IS it a usable project root? — it must exist and be a directory.
+ *
+ * The order is not cosmetic. `stat` first turned the second question into an
+ * oracle for the first: "Directory not found" / "Not a directory" / a real
+ * answer are three distinguishable replies, so a caller could map the filesystem
+ * by watching which one came back. The perimeter answers first, identically,
+ * for everything outside it.
+ *
+ * NOTE on the comment this replaces ("prevents path traversal attacks where a
+ * client supplies `../../../../etc`"): that was never true of THIS function.
+ * `resolve()` happily produces `/etc`, and an existence check then approved it.
+ * Traversal confinement is `safeJoin`'s job, and it applies to path fields
+ * joined UNDER a root — not to the root itself.
  */
-export async function validateDirectory(directory: string, maxDepth?: number): Promise<string> {
+export async function validateDirectory(directory: string): Promise<string> {
   logger.debug(`Validating directory: ${directory}`);
-  return validateDirectoryImpl(directory, maxDepth);
+  return validateDirectoryImpl(directory);
 }
 
-export async function validateDirectoryImpl(directory: string, maxDepth?: number): Promise<string> {
+export async function validateDirectoryImpl(directory: string): Promise<string> {
   if (!directory || typeof directory !== 'string') {
     logger.warning('Directory validation failed: directory parameter is required and must be a string');
     throw new Error('directory parameter is required and must be a string');
   }
-  const absDir = resolve(directory);
+  // Perimeter FIRST — before the filesystem is touched at all.
+  const absDir = assertRootAllowed(directory, 'read');
   logger.debug(`Resolved directory path: ${absDir}`);
-
-  // Validate directory traversal depth if maxDepth is specified
-  if (maxDepth !== undefined) {
-    validateDirectoryDepth(absDir, maxDepth);
-  }
 
   let s: Awaited<ReturnType<typeof stat>>;
   try {
@@ -104,20 +117,6 @@ export async function validateDirectoryImpl(directory: string, maxDepth?: number
   }
   logger.success(`Successfully validated directory: ${absDir}`);
   return absDir;
-}
-
-function calculateDirectoryDepth(path: string): number {
-  const normalizedPath = path.replace(/^\\|\\$/g, '');
-  const segments = normalizedPath.split(/[\\/]/);
-  return segments.length;
-}
-
-export function validateDirectoryDepth(absDir: string, maxDepth: number): void {
-  const depth = calculateDirectoryDepth(absDir);
-  if (depth > maxDepth) {
-    logger.error(`Directory validation failed: Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
-    throw new Error(`Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
-  }
 }
 
 /**

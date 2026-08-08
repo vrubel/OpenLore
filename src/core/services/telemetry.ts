@@ -13,6 +13,7 @@ import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'nod
 import { join } from 'node:path';
 import { OPENLORE_DIR } from '../../constants.js';
 import { redactSecrets } from './secret-redaction.js';
+import { isRootAllowed } from './mcp-handlers/root-allowlist.js';
 
 const TELEMETRY_SUBDIR = 'telemetry';
 const ROTATE_THRESHOLD_BYTES = 50 * 1024 * 1024;  // 50 MB
@@ -43,6 +44,18 @@ export function emit(
 ): void {
   if (!process.env['OPENLORE_TELEMETRY']) return;
   if (!directory) return;
+  // Telemetry IS a write: it mkdirs `<directory>/.openlore/telemetry` and appends
+  // to it. On the MCP transport path it runs on the RAW caller-supplied directory,
+  // before any handler has validated anything — so without this line the server
+  // creates a directory tree inside any repository an agent names, purely by being
+  // asked about it. (PDLC starts openlore with OPENLORE_TELEMETRY=1, so this is a
+  // live write primitive, not a theoretical one.)
+  //
+  // Choice: SKIP, not redirect. Folding repo B's events into repo A's log would
+  // silently corrupt per-repo analytics, and `emit` already treats "could not
+  // write" as a no-op — staying silent here matches its existing contract instead
+  // of inventing a new failure mode in the hot path.
+  if (!isRootAllowed(directory, 'write')) return;
   try {
     const dir = join(directory, OPENLORE_DIR, TELEMETRY_SUBDIR);
     if (!_createdDirs.has(dir)) { mkdirSync(dir, { recursive: true }); _createdDirs.add(dir); }

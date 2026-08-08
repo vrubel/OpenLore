@@ -46,6 +46,12 @@ import {
 } from '../../core/services/mcp-handlers/tool-guard.js';
 
 import { sanitizeMcpError, validateDirectory } from '../../core/services/mcp-handlers/utils.js';
+import {
+  configureRootAllowlist,
+  assertRootAllowed,
+  getRootAllowlist,
+  toolAccessMode,
+} from '../../core/services/mcp-handlers/root-allowlist.js';
 import { createTracker, updateTracker, updatePanic, resetPanicOnOrient, getFreshnessSignal, trackerToPanicState } from '../../core/services/mcp-handlers/epistemic-lease.js';
 import type { EpistemicTracker } from '../../core/services/mcp-handlers/epistemic-lease.js';
 import type { PanicResponseMode } from '../../types/index.js';
@@ -1718,7 +1724,11 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW> = 
   detect_changes: _RO, get_health_map: _RO, get_surprising_connections: _RO, record_decision: _RW, list_decisions: _RO,
   approve_decision: _RWI, reject_decision: _RWI, sync_decisions: _RWI,
   remember: _RW, recall: _RO, verify_claim: _RO,
-  spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RO,
+  // change_impact_certificate writes a certificate file when `persist: true` — it
+  // shipped as _RO, which made the annotation table (and the mutator gate that
+  // trusts it) wrong about a tool that touches disk. _RWI: it writes, and writing
+  // the same certificate twice is the same certificate.
+  spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RWI,
 };
 
 // Tools that touch external entities (LLM / network) → openWorldHint: true.
@@ -1817,6 +1827,38 @@ interface McpServerOptions {
   port?: string;        // порт (default 7787; '0' — эфемерный)
   token?: string;       // опц. Bearer-токен (если задан — auth обязателен; для изолированного контура)
   sseKeepAliveMs?: number;  // интервал SSE-heartbeat для GET-стрима (default 25000; тест задаёт малый)
+  // --- Корневой allowlist (периметр ФС сервера) ---
+  root?: string[];      // корни, разрешённые на ЧТЕНИЕ (повторяемый --root); default [process.cwd()]
+  writeRoot?: string[]; // корни, разрешённые на ЗАПИСЬ (повторяемый --write-root); default = корни чтения
+}
+
+/**
+ * Объявить периметр файловой системы этого сервера — ОДИН раз, до первого запроса.
+ *
+ * Закрыто по умолчанию: без флагов единственный корень — рабочий каталог процесса.
+ * Именно так openlore и запускают: PDLC ставит `cwd` = корень репозитория прогона,
+ * редакторные интеграции — корень открытого проекта. Расширение периметра —
+ * ЯВНЫЙ акт оператора, а не то, что достаётся молча.
+ *
+ * `--write-root` по умолчанию равен корням ЧТЕНИЯ, а не «cwd»: иначе `--root /a`
+ * без второго флага упирался бы в стартовую проверку «корень записи вне корней
+ * чтения» — отказ, который оператор ничем не заслужил. При отсутствии ОБОИХ
+ * флагов оба списка равны `[cwd]`, что и есть заявленный дефолт.
+ */
+function applyRootAllowlist(options: McpServerOptions): void {
+  const cwd = process.cwd();
+  const readRoots = options.root && options.root.length > 0 ? options.root : [cwd];
+  const writeRoots = options.writeRoot && options.writeRoot.length > 0 ? options.writeRoot : readRoots;
+  configureRootAllowlist({ readRoots, writeRoots });
+  // Периметр печатаем на stderr при СТАРТЕ: оператор, у которого агент вдруг стал
+  // получать отказы, должен видеть границу в логе запуска, а не выяснять её из
+  // текста отказа. stderr, а не stdout — в stdio-режиме stdout принадлежит протоколу.
+  const st = getRootAllowlist();
+  if (st) {
+    process.stderr.write(
+      `openlore MCP: периметр — чтение [${st.readRoots.join(', ')}], запись [${st.writeRoots.join(', ') || '—'}]\n`
+    );
+  }
 }
 
 /**
@@ -1897,6 +1939,43 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
 
+    const _dir = (args as Record<string, unknown>).directory;
+    const directory = typeof _dir === 'string' ? _dir : '';
+    const _t0 = Date.now();
+
+    // ── Периметр ФС — ПЕРВЫМ, до любого касания диска ─────────────────────────
+    //
+    // Второе место внедрения, и одного мало. `validateDirectory` в хендлере — это
+    // ГЛУБОКО: до него транспорт успевает поработать с сырым `args.directory`:
+    //   • emit() создаёт <dir>/.openlore/telemetry и дописывает туда — включая
+    //     ветку INVALID_ARGS ниже (PDLC поднимает openlore с OPENLORE_TELEMETRY=1);
+    //   • resolveDaemon() читает <dir>/.openlore/serve.json и МОЖЕТ делегировать
+    //     вызов чужому живому демону — мимо наших хендлеров вообще;
+    //   • createTracker() спавнит git с cwd=<dir>, mutatePanicStateLocked пишет
+    //     panic-state.json;
+    //   • --watch-auto (выше) усыновляет каталог из ПЕРВОГО вызова и поднимает на
+    //     нём вотчер — концептуальный антипод allowlist.
+    // Всё это происходило бы по пути, в котором хендлер через миг откажет.
+    //
+    // Отказ — результат инструмента с isError, а не -32602: это не протокольная
+    // ошибка запроса, а решение сервера, и текст обязан дойти до агента целиком.
+    if (directory) {
+      try {
+        assertRootAllowed(directory, toolAccessMode(name));
+      } catch (err) {
+        // Аудит пишем В СВОЙ периметр (первый корень записи), не по запрошенному пути.
+        const auditRoot = getRootAllowlist()?.writeRoots[0] ?? '';
+        emit(auditRoot, 'mcp', {
+          event: 'tool_denied', tool: name, reason: 'root_allowlist',
+          mode: toolAccessMode(name), requested: directory, agent: agentName,
+        });
+        return {
+          content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
+          isError: true,
+        };
+      }
+    }
+
     if (options.watchAuto && !autoWatcher) {
       const dir = (args as Record<string, unknown>).directory;
       if (typeof dir === 'string') {
@@ -1921,10 +2000,6 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
         }
       }
     }
-
-    const _dir = (args as Record<string, unknown>).directory;
-    const directory = typeof _dir === 'string' ? _dir : '';
-    const _t0 = Date.now();
 
     // Input validation (spec-10) against the tool's own declared inputSchema, before
     // dispatch. Invalid args become a JSON-RPC -32602 error (spec-12), not an
@@ -2164,6 +2239,7 @@ async function maybeStartWatcher(options: McpServerOptions): Promise<void> {
  * SDK StdioServerTransport пишет фреймы через process.stdout.write напрямую — он не затронут.
  */
 async function startStdioMcpServer(options: McpServerOptions = {}): Promise<void> {
+  applyRootAllowlist(options);   // периметр объявляем ДО того, как сервер начнёт принимать вызовы
   const toStderr = (...args: unknown[]): void => {
     process.stderr.write(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
   };
@@ -2200,6 +2276,7 @@ function bearerOk(authHeader: string | undefined, token: string): boolean {
 export interface HttpMcpHandle { port: number; close: () => Promise<void>; }
 
 export async function startHttpMcpServer(options: McpServerOptions = {}): Promise<HttpMcpHandle> {
+  applyRootAllowlist(options);   // периметр объявляем ДО listen — плохие корни валят запуск, а не первый вызов
   const host = options.host ?? '127.0.0.1';
   const port = parseInt(options.port ?? '7787', 10);
   const token = options.token;                         // опц.: задан → auth обязателен
@@ -2345,6 +2422,9 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
 // COMMAND EXPORT
 // ============================================================================
 
+/** commander collector for a repeatable path option (`--root a --root b`). */
+const collectPath = (value: string, previous?: string[]): string[] => [...(previous ?? []), value];
+
 export const mcpCommand = new Command('mcp')
   .description('Start openlore as an MCP server (stdio by default, or --http for remote/isolated agents)')
   .option('--watch <directory>', 'Watch a project directory and incrementally re-index signatures on file changes')
@@ -2359,4 +2439,6 @@ export const mcpCommand = new Command('mcp')
   .option('--host <host>', 'HTTP bind interface (default: 127.0.0.1)')
   .option('--port <port>', 'HTTP port (default: 7787; "0" = ephemeral)')
   .option('--token <token>', 'Optional Bearer token for HTTP transport — when set, every request must carry "Authorization: Bearer <token>" (closed-contour isolation)')
+  .option('--root <path>', 'Repository root this server may READ. Repeatable. Every tool call is confined to these roots (symlink-resolved), and nothing outside them is read, listed or disclosed. Default: the working directory — a server is always raised FOR something, so the perimeter is closed unless you widen it.', collectPath)
+  .option('--write-root <path>', 'Repository root this server may WRITE (analyze, decisions, generated tests, telemetry). Repeatable, and must be inside a --root. Default: the read roots. Use it to serve a repository read-only.', collectPath)
   .action((options: McpServerOptions) => startMcpServer(options));

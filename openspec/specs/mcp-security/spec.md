@@ -39,6 +39,48 @@ rather than obscuring it.
 
 ## Requirements
 
+### Requirement: Root Allowlist for the MCP Server
+
+The MCP server SHALL be confined to a set of repository roots declared at start
+(`--root` for read, `--write-root` for write), defaulting to the process working
+directory. Every caller-supplied `directory` SHALL be measured against that set BEFORE
+any filesystem access, on the **canonical (symlink-resolved)** path, and a directory
+outside the read roots SHALL be refused with a message that names the boundary and the
+reachable roots without disclosing whether the requested path exists. Tools that can
+write SHALL additionally require the directory to be inside a write root; that list of
+tools SHALL be held explicitly, and a static test SHALL keep it in agreement with the
+`readOnlyHint` annotations in both directions. Enforcement SHALL be applied at BOTH the
+handler layer (`validateDirectory`) and the transport layer, before telemetry, daemon
+resolution, panic-state writes, watcher adoption or any `git` spawn touch the path.
+Responses that ENUMERATE repositories (the federation registry, and every query that
+walks it) SHALL withhold members outside the read roots, and SHALL report the number
+withheld rather than omitting them silently. The allowlist SHALL apply to the MCP server
+only: CLI commands, which legitimately act on paths outside the working directory
+(`openlore federation add <path>`), declare no allowlist and are not confined by it.
+
+#### Scenario: A foreign repository is refused, not answered
+- **GIVEN** a server started for repository A
+- **WHEN** a tool is called with `directory` pointing at repository B
+- **THEN** the call is refused with a message that states the boundary and lists the
+  readable roots, and nothing in B is read, written or created
+
+#### Scenario: The refusal is not an existence oracle
+- **GIVEN** two paths outside the roots, one that exists and one that does not
+- **WHEN** each is passed as `directory`
+- **THEN** both receive the same perimeter refusal, with no "not found" / "not a
+  directory" distinction to read the filesystem from
+
+#### Scenario: Telemetry cannot escape the write roots
+- **GIVEN** telemetry is enabled and a tool is called on a directory outside the write roots
+- **WHEN** the transport handles the call
+- **THEN** no `.openlore/telemetry` tree is created at that directory
+
+#### Scenario: The registry does not advertise what the server will refuse
+- **GIVEN** a federation registry naming a repository outside the read roots
+- **WHEN** `federation_status` is called, or a `federation: true` query resolves scope
+- **THEN** that member is absent from the response and from the scope, its path is not
+  disclosed, and the count of withheld members is reported
+
 ### Requirement: Symlink-Aware Path Confinement
 
 Every tool argument that names a filesystem path SHALL be confined to the validated

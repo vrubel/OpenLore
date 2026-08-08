@@ -15,6 +15,7 @@ import {
   OPENLORE_ANALYSIS_REL_PATH,
   OPENLORE_DIR,
 } from '../../constants.js';
+import { isRootAllowed } from '../services/mcp-handlers/root-allowlist.js';
 import {
   FEDERATION_MANIFEST_FILENAME,
   FEDERATION_SCHEMA_VERSION,
@@ -160,8 +161,31 @@ export function removeRepo(homeDir: string, nameOrPath: string): boolean {
   return true;
 }
 
-/** List registry entries (sorted by name). */
+/**
+ * List the registry entries this process may actually consult (sorted by name).
+ *
+ * The registry is the one place where openlore itself hands out the absolute
+ * paths of OTHER repositories on the machine. Refusing a call on a foreign path
+ * while still publishing its address only converts a refusal into a probing
+ * exercise — so an MCP server behind a root allowlist does not see, list, or read
+ * the members it would refuse. This is the single choke point every consumer goes
+ * through: `federation_status`, `spec_store_status`, and `resolveFederationScope`
+ * (which is what `federation: true` on analyze_impact / select_tests / find_path /
+ * recall walks).
+ *
+ * A CLI process declares no allowlist, so `openlore federation list` is unchanged
+ * — and registry MUTATION (addRepo/removeRepo) reads `loadRegistry` directly, so a
+ * withheld member can never be dropped by a read-modify-write.
+ */
 export function listRepos(homeDir: string): FederationRepoEntry[] {
+  return loadRegistry(homeDir).repos.filter(r => isRootAllowed(r.path, 'read'));
+}
+
+/**
+ * Every registered entry, allowlist or not — for registry MANAGEMENT and for the
+ * one caller that must report HOW MANY members it is withholding.
+ */
+export function listRegisteredRepos(homeDir: string): FederationRepoEntry[] {
   return loadRegistry(homeDir).repos;
 }
 
