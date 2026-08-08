@@ -7,7 +7,7 @@
  * Bearer-auth) без запуска агента/LLM.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -313,6 +313,61 @@ describe('openlore mcp --http: корневой allowlist на транспор�
       process.chdir(prevCwd);
       rmSync(served, { recursive: true, force: true });
       rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  // panic-response ПИШЕТ <dir>/.openlore/panic-state.json (+ .lock, .tmp), и запускает
+  // его ЧИТАЮЩИЙ инструмент — режим на транспорте берётся из имени инструмента, так что
+  // гейт записи об этом не спрашивали. Хуже: включается он конфигом ЦЕЛЕВОГО каталога,
+  // то есть решение о записи принимает сосед.
+  it('panic-state не пишется в корень, разрешённый только на чтение, даже если его конфиг это просит', async () => {
+    const home = mk('p-home');
+    const readOnly = mk('p-ro');
+    const prevCwd = process.cwd();
+    try {
+      mkdirSync(join(readOnly, '.openlore'), { recursive: true });
+      writeFileSync(
+        join(readOnly, '.openlore', 'config.json'),
+        JSON.stringify({ projectType: 'typescript', openspecPath: 'openspec', panicResponse: { mode: 'warn' } }),
+        'utf-8',
+      );
+      process.chdir(home);
+      handle = await startHttpMcpServer({
+        http: true, port: '0', watchAuto: false, root: [home, readOnly],
+      });
+      const res = await callTool(handle.port, 'federation_status', { directory: readOnly });
+      expect(res.isError).toBeFalsy();                      // читать — можно
+      expect(existsSync(join(readOnly, '.openlore', 'panic-state.json')),
+        'panic-state записан в корень только для чтения').toBe(false);
+      expect(existsSync(join(readOnly, '.openlore', 'panic-state.json.lock'))).toBe(false);
+    } finally {
+      process.chdir(prevCwd);
+      rmSync(home, { recursive: true, force: true });
+      rmSync(readOnly, { recursive: true, force: true });
+    }
+  });
+
+  it('--daemon при периметре — громкий отказ запуска (демон без периметра и без токена)', async () => {
+    const home = mk('dm');
+    try {
+      await expect(startHttpMcpServer({
+        http: true, port: '0', watchAuto: false, root: [home], daemon: true,
+      })).rejects.toThrow(/--daemon/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('--watch вне явных корней чтения — громкий отказ запуска (вотчер пишет туда индекс)', async () => {
+    const served = mk('w-served');
+    const watched = mk('w-watched');
+    try {
+      await expect(startHttpMcpServer({
+        http: true, port: '0', watchAuto: false, root: [served], watch: watched,
+      })).rejects.toThrow(/--watch/);
+    } finally {
+      rmSync(served, { recursive: true, force: true });
+      rmSync(watched, { recursive: true, force: true });
     }
   });
 

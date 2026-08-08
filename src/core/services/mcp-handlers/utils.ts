@@ -65,7 +65,7 @@ export function attachCallGraph(ctx: CachedContext, store: EdgeStore | undefined
 import { logger } from '../../../utils/logger.js';
 import { emit } from '../telemetry.js';
 import { redactSecretString } from '../secret-redaction.js';
-import { assertRootAllowed } from './root-allowlist.js';
+import { assertRootAllowed, isPathAllowed } from './root-allowlist.js';
 
 /**
  * Resolve and validate a caller-supplied project root.
@@ -292,6 +292,45 @@ export async function primeContextCache(directory: string, ctx: CachedContext): 
   _contextCache.set(directory, { ctx, mtime });
 }
 
+/**
+ * Open the call-graph index for `analysisDir` at the access this server actually
+ * holds over it — the perimeter's WRITE point, not its entry point.
+ *
+ * `EdgeStore.open` writes: `PRAGMA journal_mode = WAL` rewrites the file header and
+ * drops `-wal`/`-shm` next to it, `CREATE TABLE IF NOT EXISTS` runs on every open,
+ * and a SCHEMA_VERSION mismatch DROPs every table. Every read-only tool arrives
+ * here through `readCachedContext`, and the federation resolver arrives here once
+ * per neighbouring repository — so a repository granted for READING was being
+ * modified, and on a version bump destroyed, by the act of reading it. Judging the
+ * caller's `directory` at the door never saw this: the write happens further in,
+ * on a path built by joining.
+ *
+ * Returns null when the index cannot be served under the perimeter — always after
+ * saying why. A silent null here is indistinguishable from "this repository was
+ * never analyzed", which sends the operator after the wrong bug.
+ */
+function openEdgeStoreForPerimeter(analysisDir: string): EdgeStore | null {
+  const dbPath = EdgeStore.dbPath(analysisDir);
+  if (isPathAllowed(dbPath, 'write')) return EdgeStore.open(dbPath);
+  try {
+    const ro = EdgeStore.openReadOnly(dbPath);
+    if (!ro.readOnlyUnusable) return ro;
+    ro.close();
+    logger.warning(
+      `${dbPath} cannot be served read-only: its schema predates this version, and rebuilding it would be a ` +
+      `write into a repository this server may only read. Graph tools will report no call graph for it. ` +
+      `Re-run "openlore analyze --force" in that repository, or start the server with --write-root for it.`
+    );
+  } catch (err) {
+    logger.warning(
+      `${dbPath} could not be opened read-only (${err instanceof Error ? err.message : String(err)}). ` +
+      `That repository is inside the read perimeter but not the write perimeter, so its index is not opened ` +
+      `for writing. Graph tools will report no call graph for it.`
+    );
+  }
+  return null;
+}
+
 export async function readCachedContext(directory: string, timeout?: number): Promise<CachedContext | null> {
   const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
   const filePath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
@@ -364,8 +403,8 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
       // "There is an analysis here at all" — used to tell a fresh, empty project
       // apart from an analysis whose graph went missing.
       const hasAnalysis = (ctx.signatures?.length ?? 0) > 0 || (ctx.phase1_survey?.files?.length ?? 0) > 0;
-      if (EdgeStore.exists(analysisDir)) {
-        const es = EdgeStore.open(EdgeStore.dbPath(analysisDir));
+      const es = EdgeStore.exists(analysisDir) ? openEdgeStoreForPerimeter(analysisDir) : null;
+      if (es) {
         // Schema-bump guard, for an analysis taken BEFORE the graph moved into the
         // store: opening a DB whose SCHEMA_VERSION is stale wipes it, and serving
         // the empty store next to a JSON that still has production nodes would give
@@ -394,7 +433,7 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
             );
           }
         }
-      } else if (hasAnalysis && jsonProdNodes === 0) {
+      } else if (hasAnalysis && jsonProdNodes === 0 && !EdgeStore.exists(analysisDir)) {
         logger.warning(
           `The analysis in ${analysisDir} has no call graph: ${EdgeStore.dbPath(analysisDir)} is missing, ` +
           `and llm-context.json does not carry one (the graph lives in that database). ` +

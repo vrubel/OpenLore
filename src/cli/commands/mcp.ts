@@ -23,6 +23,7 @@ const _pkgVersion = (_require('../../../package.json') as { version: string }).v
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { join, resolve } from 'node:path';
 
 import { Command } from 'commander';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -50,9 +51,14 @@ import {
   configureRootAllowlist,
   assertRootAllowed,
   getRootAllowlist,
+  isPathAllowed,
   isPathWithinRoots,
+  isRootAllowlistConfigured,
   toolAccessMode,
 } from '../../core/services/mcp-handlers/root-allowlist.js';
+
+/** Directories already reported as "panic-response wanted, but not writable here". */
+const _panicSkipNoted = new Set<string>();
 import { createTracker, updateTracker, updatePanic, resetPanicOnOrient, getFreshnessSignal, trackerToPanicState } from '../../core/services/mcp-handlers/epistemic-lease.js';
 import type { EpistemicTracker } from '../../core/services/mcp-handlers/epistemic-lease.js';
 import type { PanicResponseMode } from '../../types/index.js';
@@ -1860,11 +1866,42 @@ interface McpServerOptions {
  */
 function applyRootAllowlist(options: McpServerOptions): void {
   const cwd = process.cwd();
-  const readRoots = options.root && options.root.length > 0 ? options.root : [cwd];
-  const writeRoots = options.writeRoot && options.writeRoot.length > 0
-    ? options.writeRoot
-    : (isPathWithinRoots(cwd, readRoots) ? [cwd] : []);
+  // `--watch <dir>` is an instruction to WRITE: the watcher re-indexes into
+  // `<dir>/.openlore/analysis`. Left out of the perimeter it produced a command at
+  // war with itself — the watcher writing where tool calls were refused. So the
+  // watched directory joins the roots when they are implicit, and must be inside
+  // them when they were given explicitly (an operator who names both and means two
+  // different places has made a mistake worth hearing about at startup).
+  const watchDir = options.watch ? resolve(options.watch) : null;
+  const explicitRead = options.root && options.root.length > 0 ? options.root : null;
+  if (explicitRead && watchDir && !isPathWithinRoots(watchDir, explicitRead)) {
+    throw new Error(
+      `openlore mcp --watch ${watchDir}: наблюдаемый каталог обязан лежать внутри корней чтения ` +
+      `(${explicitRead.join(', ')}) — вотчер пишет в него индекс. Добавьте его в --root или уберите --watch.`
+    );
+  }
+  const readRoots = explicitRead ?? (watchDir && !isPathWithinRoots(watchDir, [cwd]) ? [cwd, watchDir] : [cwd]);
+  // Write default: own repository, never neighbours (see above). The watched
+  // directory is added because watching IS an explicit instruction to write there —
+  // that is stated intent, not writability by implication.
+  const implicitWrite = [
+    ...(isPathWithinRoots(cwd, readRoots) ? [cwd] : []),
+    ...(watchDir && isPathWithinRoots(watchDir, readRoots) ? [watchDir] : []),
+  ];
+  const writeRoots = options.writeRoot && options.writeRoot.length > 0 ? options.writeRoot : implicitWrite;
   configureRootAllowlist({ readRoots, writeRoots });
+  // A shared `openlore serve` daemon has no perimeter of its own and is discovered
+  // through a file the agent can write (see `resolveDaemon`). Spawning one from a
+  // perimeter-bearing server would export the whole tool surface past the boundary,
+  // so say so at startup instead of quietly ignoring the flag.
+  if (options.daemon) {
+    throw new Error(
+      'openlore mcp --daemon: делегирование общему `openlore serve`-демону несовместимо с корневым ' +
+      'периметром — демон поднимается БЕЗ токена и БЕЗ allowlist, а находят его через ' +
+      '<repo>/.openlore/serve.json, файл внутри доступного агенту корня. Уберите --daemon (сервер ' +
+      'отработает в своём процессе) либо запускайте `openlore serve` отдельно и осознанно.'
+    );
+  }
   // Периметр печатаем на stderr при СТАРТЕ: оператор, у которого агент вдруг стал
   // получать отказы, должен видеть границу в логе запуска, а не выяснять её из
   // текста отказа. stderr, а не stdout — в stdio-режиме stdout принадлежит протоколу.
@@ -1919,6 +1956,15 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
   const daemonPending = new Map<string, Promise<ServeEndpoint | null>>();
   function resolveDaemon(dir: string): Promise<ServeEndpoint | null> {
     if (!dir) return Promise.resolve(null);
+    // A perimeter and a shared daemon are mutually exclusive, and discovery is the
+    // reason. `openlore serve` knows nothing about root allowlists: it dispatches
+    // the same 62 tools with no perimeter at all, and it is found by reading
+    // `<repo>/.openlore/serve.json` — a file inside a root the agent can write, at
+    // whose host:port an unauthenticated endpoint answers. Delegating there hands
+    // the whole tool surface to a process outside this boundary, and lets the agent
+    // choose which process that is. Running in-process is always available and
+    // costs only warm caches, so refuse the delegation rather than the work.
+    if (isRootAllowlistConfigured()) return Promise.resolve(null);
     if (daemonByDir.has(dir)) return Promise.resolve(daemonByDir.get(dir) ?? null);
     // Dedup concurrent calls for the same dir — without this, two parallel tool
     // calls both miss the cache and each call ensureServeDaemon, potentially
@@ -1982,11 +2028,21 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
         assertRootAllowed(directory, toolAccessMode(name));
       } catch (err) {
         // Аудит пишем В СВОЙ периметр (первый корень записи), не по запрошенному пути.
+        // У read-only сервера корней записи НЕТ — и это САМАЯ безопасная конфигурация,
+        // терять в ней журнал попыток побега нельзя. Тогда пишем на stderr: канал
+        // оператора есть всегда (в stdio-режиме stdout занят протоколом, stderr нет).
         const auditRoot = getRootAllowlist()?.writeRoots[0] ?? '';
-        emit(auditRoot, 'mcp', {
-          event: 'tool_denied', tool: name, reason: 'root_allowlist',
-          mode: toolAccessMode(name), requested: directory, agent: agentName,
-        });
+        if (auditRoot) {
+          emit(auditRoot, 'mcp', {
+            event: 'tool_denied', tool: name, reason: 'root_allowlist',
+            mode: toolAccessMode(name), requested: directory, agent: agentName,
+          });
+        } else {
+          process.stderr.write(
+            `openlore MCP: отказ периметра — инструмент "${name}" (${toolAccessMode(name)}) на "${directory}", ` +
+            `агент "${agentName}"\n`
+          );
+        }
         return {
           content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
           isError: true,
@@ -2049,7 +2105,23 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
         const isOrient = name === 'orient';
         updateTracker(tracker, name, directory, typeof filePath === 'string' ? filePath : undefined);
 
-        if (panicPolicy !== 'off') {
+        // Panic response WRITES: `<directory>/.openlore/panic-state.json` plus a
+        // `.lock` and a `.tmp` beside it. The tool that triggers it is usually a
+        // READ tool, so the transport's write gate (keyed on the tool name) never
+        // asks — and whether it runs at all is decided by `panicResponse.mode` in
+        // the TARGET repository's own config, i.e. by the neighbour. Decide by the
+        // file about to be written, in write mode; degrade audibly, once per
+        // directory, rather than skipping in silence.
+        const panicFile = join(directory, '.openlore', 'panic-state.json');
+        const panicWritable = panicPolicy === 'off' || isPathAllowed(panicFile, 'write');
+        if (panicPolicy !== 'off' && !panicWritable && !_panicSkipNoted.has(trackerDir)) {
+          _panicSkipNoted.add(trackerDir);
+          process.stderr.write(
+            `openlore MCP: panic-response is enabled by the config in ${directory}, but that repository is ` +
+            `outside this server's write perimeter — panic state is NOT tracked there.\n`
+          );
+        }
+        if (panicPolicy !== 'off' && panicWritable) {
           // Read disk state to preserve hook-written fields (lastHookInterventionAt, gryphWindowStart)
           // that panic-check (separate process) may have set since the last MCP write.
           const diskState = readPanicState(directory);

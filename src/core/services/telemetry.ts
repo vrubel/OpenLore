@@ -13,7 +13,7 @@ import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'nod
 import { join } from 'node:path';
 import { OPENLORE_DIR } from '../../constants.js';
 import { redactSecrets } from './secret-redaction.js';
-import { isRootAllowed } from './mcp-handlers/root-allowlist.js';
+import { isPathAllowed } from './mcp-handlers/root-allowlist.js';
 
 const TELEMETRY_SUBDIR = 'telemetry';
 const ROTATE_THRESHOLD_BYTES = 50 * 1024 * 1024;  // 50 MB
@@ -55,9 +55,16 @@ export function emit(
   // silently corrupt per-repo analytics, and `emit` already treats "could not
   // write" as a no-op — staying silent here matches its existing contract instead
   // of inventing a new failure mode in the hot path.
-  if (!isRootAllowed(directory, 'write')) return;
+  //
+  // Judged on the DIRECTORY THE BYTES LAND IN, not on `directory`. In PDLC's
+  // isolated layout `scratch/.openlore` is a symlink onto `ws/.openlore`, so the
+  // write goes somewhere other than the directory that was approved; canonicalizing
+  // the actual target is what makes the permission mean what it says. Same defect of
+  // shape as the call-graph index and panic state: judge the directory, write to a
+  // path inside it.
+  const dir = join(directory, OPENLORE_DIR, TELEMETRY_SUBDIR);
+  if (!isPathAllowed(dir, 'write')) return;
   try {
-    const dir = join(directory, OPENLORE_DIR, TELEMETRY_SUBDIR);
     if (!_createdDirs.has(dir)) { mkdirSync(dir, { recursive: true }); _createdDirs.add(dir); }
     const filePath = join(dir, `${domain}.jsonl`);
     // Rotate before writing if file exceeds threshold

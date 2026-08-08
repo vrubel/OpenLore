@@ -6,7 +6,7 @@
  * tests for the argument-injection guards. Kept in a plain .test.ts so CI runs it.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { readFileSync, readdirSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +29,9 @@ import {
   _resetRootAllowlistForTesting,
 } from './root-allowlist.js';
 import { handleFederationStatus } from './federation.js';
+import { handleWorkingSetContext } from './working-set.js';
+import { handleSpecStoreStatus } from './spec-store.js';
+import { EdgeStore } from '../edge-store.js';
 import { resolveFederationScope } from '../../federation/resolver.js';
 import { emit } from '../telemetry.js';
 import { redactSecrets, redactSecretString } from '../secret-redaction.js';
@@ -870,5 +873,160 @@ describe('Root Allowlist (MCP filesystem perimeter)', () => {
       if (prev === undefined) delete process.env['OPENLORE_TELEMETRY'];
       else process.env['OPENLORE_TELEMETRY'] = prev;
     }
+  });
+});
+
+// ── Root Allowlist: the perimeter stands where the DISK is touched ────────────
+//
+// The first cut of the allowlist guarded the two places a request COMES IN (the
+// transport, and `validateDirectory` inside each handler). That is not where the
+// filesystem is actually touched. A path can arrive from a config file the agent
+// writes; a write can happen in the middle of a read; a background writer can fire
+// on a tool nobody classified as a writer. Each test below reproduces the actual
+// exploitation, not the helper that fixes it.
+
+describe('Root Allowlist — config-supplied paths (specStore.path)', () => {
+  let home: string;
+  let secret: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-cfg-home-')));
+    secret = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-cfg-secret-')));
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    // The store binding points at an ABSOLUTE path outside the served repo. This
+    // file lives inside `home` — a root the agent may write — so the value is agent
+    // input that simply took the scenic route.
+    writeFileSync(
+      join(home, '.openlore', 'config.json'),
+      JSON.stringify({
+        projectType: 'typescript', openspecPath: 'openspec',
+        specStore: { name: 'store', path: secret, targets: [] },
+      }, null, 2),
+      'utf-8',
+    );
+    // Content the perimeter refused to serve one line earlier, via `directory`.
+    mkdirSync(join(secret, 'openspec', 'changes', 'leak'), { recursive: true });
+    writeFileSync(
+      join(secret, 'openspec', 'changes', 'leak', 'proposal.md'),
+      '# Exfiltrated\n\n## Why\nTOP SECRET PAYLOAD\n',
+      'utf-8',
+    );
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(secret, { recursive: true, force: true });
+  });
+
+  it('working_set_context does not return the CONTENT of a store outside the perimeter', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleWorkingSetContext(home, 'leak') as {
+      change?: { intent?: string }; findings: Array<{ code: string }>;
+    };
+    const serialized = JSON.stringify(res);
+    expect(serialized, 'the proposal body crossed the perimeter').not.toContain('TOP SECRET PAYLOAD');
+    expect(res.findings.map(f => f.code)).toContain('store-out-of-perimeter');
+    // (The binding itself is echoed back, path and all. That is the caller's own
+    // config value coming home — not a disclosure. What must never come back is
+    // anything READ from behind it.)
+  });
+
+  it('spec_store_status does not answer "does this absolute path exist?" for a store outside the perimeter', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const present = await handleSpecStoreStatus(home);
+    // Same binding, but now pointing at a path that does NOT exist. If the perimeter
+    // let existsSync run, the two answers would differ — that difference IS the oracle.
+    writeFileSync(
+      join(home, '.openlore', 'config.json'),
+      JSON.stringify({
+        projectType: 'typescript', openspecPath: 'openspec',
+        specStore: { name: 'store', path: join(secret, 'no-such-thing'), targets: [] },
+      }, null, 2),
+      'utf-8',
+    );
+    const absent = await handleSpecStoreStatus(home);
+
+    const codes = (r: typeof present): string[] => r.findings.map(f => f.code).sort();
+    expect(codes(present)).toEqual(codes(absent));
+    expect(codes(present)).toContain('store-out-of-perimeter');
+    expect(codes(present)).not.toContain('store-path-missing');
+  });
+
+  it('a store INSIDE the perimeter still works exactly as before (no regression)', async () => {
+    const inside = join(home, 'store');
+    mkdirSync(join(inside, 'openspec', 'changes', 'ok'), { recursive: true });
+    writeFileSync(
+      join(inside, 'openspec', 'changes', 'ok', 'proposal.md'),
+      '# Fine\n\n## Why\nLEGITIMATE CONTENT\n',
+      'utf-8',
+    );
+    writeFileSync(
+      join(home, '.openlore', 'config.json'),
+      JSON.stringify({
+        projectType: 'typescript', openspecPath: 'openspec',
+        specStore: { name: 'store', path: inside, targets: [] },
+      }, null, 2),
+      'utf-8',
+    );
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleWorkingSetContext(home, 'ok') as {
+      change?: { intent?: string }; findings: Array<{ code: string }>;
+    };
+    expect(res.findings.map(f => f.code)).not.toContain('store-out-of-perimeter');
+    expect(String(res.change?.intent ?? '')).toContain('LEGITIMATE CONTENT');
+  });
+});
+
+describe('Root Allowlist — a read must not write (call-graph index)', () => {
+  let home: string;
+  let neighbour: string;
+  let analysisDir: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-ro-home-')));
+    neighbour = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-ro-nb-')));
+    analysisDir = join(neighbour, '.openlore', 'analysis');
+    mkdirSync(analysisDir, { recursive: true });
+    writeFileSync(join(analysisDir, 'llm-context.json'), JSON.stringify({ signatures: [] }), 'utf-8');
+    // A real index, written and closed by a legitimate writer.
+    dbPath = EdgeStore.dbPath(analysisDir);
+    EdgeStore.open(dbPath).close();
+    _resetContextCacheForTesting();
+  });
+  afterEach(() => {
+    _resetContextCacheForTesting();
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(neighbour, { recursive: true, force: true });
+  });
+
+  it('reading a read-only neighbour leaves its index byte-for-byte alone', async () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+    const before = statSync(dbPath).mtimeMs;
+    const sizeBefore = statSync(dbPath).size;
+
+    // The plain read path every read-only tool takes — and the one the federation
+    // resolver takes once per neighbouring repo.
+    await readCachedContext(neighbour);
+
+    // `EdgeStore.open` would have run PRAGMA journal_mode=WAL (rewriting the header
+    // and leaving -wal/-shm beside the file) and CREATE TABLE, and on a schema bump
+    // DROPped every table.
+    expect(existsSync(`${dbPath}-wal`), 'a read created a WAL sidecar in a read-only repo').toBe(false);
+    expect(existsSync(`${dbPath}-shm`), 'a read created a SHM sidecar in a read-only repo').toBe(false);
+    expect(statSync(dbPath).mtimeMs, 'a read modified the index of a read-only repo').toBe(before);
+    expect(statSync(dbPath).size).toBe(sizeBefore);
+  });
+
+  it('a writable root is still opened for writing (no regression)', async () => {
+    const ownAnalysis = join(home, '.openlore', 'analysis');
+    mkdirSync(ownAnalysis, { recursive: true });
+    writeFileSync(join(ownAnalysis, 'llm-context.json'), JSON.stringify({ signatures: [] }), 'utf-8');
+    EdgeStore.open(EdgeStore.dbPath(ownAnalysis)).close();
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const ctx = await readCachedContext(home);
+    expect(ctx).not.toBeNull();
+    expect(ctx?.edgeStore, 'the own repo lost its index').toBeTruthy();
   });
 });

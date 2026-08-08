@@ -120,7 +120,7 @@ describe('root allowlist — read confinement', () => {
     mkdirSync(real, { recursive: true });
     const link = join(allowed, 'inner');
     symlinkSync(real, link);
-    expect(assertRootAllowed(link)).toBe(link);
+    expect(assertRootAllowed(link)).toBe(real);   // canonical, see the TOCTOU test below
   });
 
   it('judges a not-yet-existing path by its nearest existing ancestor, without disclosing existence', () => {
@@ -142,13 +142,34 @@ describe('root allowlist — read confinement', () => {
     }
   });
 
-  it('returns the lexically resolved path, not the realpath (callers keep the value they had)', () => {
+  it('returns the CANONICAL path, not the lexical one (closes the TOCTOU window)', () => {
+    // Returning the lexical path let every later syscall re-traverse the symlinks,
+    // so a link swapped inside the root AFTER the check — an analyze_codebase run is
+    // minutes long — would land outside it. Callers must work on what was approved.
     const real = join(allowed, 'real');
     mkdirSync(real, { recursive: true });
     const link = join(allowed, 'alias');
     symlinkSync(real, link);
-    expect(assertRootAllowed(link)).toBe(link);
-    expect(assertRootAllowed(link)).not.toBe(real);
+    expect(assertRootAllowed(link)).toBe(real);
+    expect(assertRootAllowed(link)).not.toBe(link);
+  });
+
+
+  it('a dangling symlink out of the root is refused, exactly like a live one — no existence oracle', () => {
+    // The refusal used to be three-valued for any absolute path: target present →
+    // perimeter refusal; target absent → "Directory not found"; target a file →
+    // ENOTDIR. One symlink inside your own root was enough to read the difference.
+    const live = join(allowed, 'to-live');
+    const dead = join(allowed, 'to-dead');
+    const file = join(allowed, 'to-file');
+    const outFile = join(outside, 'f.txt');
+    writeFileSync(outFile, 'x', 'utf-8');
+    symlinkSync(outside, live);
+    symlinkSync(join(outside, 'never-existed'), dead);
+    symlinkSync(outFile, file);
+    for (const p of [live, dead, file]) {
+      expect(() => assertRootAllowed(p), p).toThrow(/Root allowlist/);
+    }
   });
 });
 

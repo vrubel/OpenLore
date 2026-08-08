@@ -17,6 +17,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
 import { validateDirectory } from './utils.js';
+import { isPathAllowed } from './root-allowlist.js';
 import { readOpenLoreConfig } from '../config-manager.js';
 import { listRepos, evaluateRepoState } from '../../federation/registry.js';
 import { recheckPersistedCertificates } from './impact-certificate.js';
@@ -34,7 +35,8 @@ export type SpecStoreFindingCode =
   | 'index-missing'       // a resolved target has no built `.openlore` index
   | 'index-stale'         // a resolved target's index is stale vs its working tree
   | 'reference-missing'   // a declared reference is unresolved or its path is gone
-  | 'certificate-stale';  // a target has a persisted impact certificate whose anchored symbols moved
+  | 'certificate-stale'   // a target has a persisted impact certificate whose anchored symbols moved
+  | 'store-out-of-perimeter'; // specStore.path points outside this server's root allowlist
 
 export type SpecStoreFindingSeverity = 'info' | 'warn' | 'error';
 
@@ -281,8 +283,18 @@ export async function handleSpecStoreStatus(directory: string): Promise<SpecStor
   const storeName = typeof binding.name === 'string' ? binding.name.trim() : '';
   const storePath = typeof binding.path === 'string' ? binding.path.trim() : '';
 
-  // Store path presence.
-  if (storePath && !existsSync(resolve(absDir, storePath))) {
+  // Store path presence — but the PERIMETER decides first, and it decides silently
+  // about existence. `resolve(absDir, storePath)` discards `absDir` for an absolute
+  // `storePath`, and `storePath` is read from `<root>/.openlore/config.json`, a file
+  // the agent can write. Without this gate the existsSync below is a boolean
+  // "does this absolute path exist?" oracle for anywhere on the machine.
+  if (storePath && !isPathAllowed(resolve(absDir, storePath), 'read')) {
+    findings.push({
+      code: 'store-out-of-perimeter', severity: 'error', subject: storeName || storePath,
+      message: 'The configured spec store lies outside this server\'s root allowlist and is not consulted.',
+      remediation: 'Point "specStore.path" inside a served repository, or start the server with --root for the store.',
+    });
+  } else if (storePath && !existsSync(resolve(absDir, storePath))) {
     findings.push({
       code: 'store-path-missing', severity: 'error', subject: storeName || storePath,
       message: `The spec store path does not exist: ${storePath}`,

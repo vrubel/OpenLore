@@ -28,6 +28,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { resolve, join, basename } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
+import { isPathAllowed } from './root-allowlist.js';
 import { handleSpecStoreStatus, type SpecStoreStatusReport } from './spec-store.js';
 import { handleOrient } from './orient.js';
 import { applyTokenBudget, omissionNote } from './progressive.js';
@@ -43,7 +44,8 @@ export type WorkingSetFindingCode =
   | 'change-not-found'    // the change id resolves to no proposal under the store
   | 'no-briefable-targets'// the binding has no resolved, indexed target to orient
   | 'target-not-briefable'// a declared target is unresolved/unindexed/stale → skipped
-  | 'orient-unavailable'; // a target resolved + indexed but orientation returned an error
+  | 'orient-unavailable'  // a target resolved + indexed but orientation returned an error
+  | 'store-out-of-perimeter'; // specStore.path points outside this server's root allowlist
 
 export type WorkingSetFindingSeverity = 'info' | 'warn' | 'error';
 
@@ -225,7 +227,18 @@ export function rankAndBudget(items: WorkingSetItem[], budget: number): { kept: 
   return applyTokenBudget(sorted, budget);
 }
 
-/** Canonicalize a path for presence checks, resolved relative to the home repo. */
+/**
+ * Canonicalize a path for presence checks, resolved relative to the home repo.
+ *
+ * NOTE the shape of the bug this used to carry: `resolve(base, p)` DISCARDS `base`
+ * whenever `p` is absolute. `p` here is `specStore.path`, read out of
+ * `<root>/.openlore/config.json` — a file inside a root the agent may write. So an
+ * absolute value in that field left the home repository entirely, and the
+ * `safeJoin` further down then confined the change id to the ESCAPED directory,
+ * confining nothing. A path is caller input whether it arrives as an argument or
+ * through a file the caller can author; the perimeter check belongs on both.
+ * Callers must therefore gate the result (see `storeDirWithinPerimeter`).
+ */
 function canonical(p: string, base: string): string {
   const abs = resolve(base, p);
   try {
@@ -383,6 +396,24 @@ export async function handleWorkingSetContext(
   // consistently on every surface (subject, message, echoed change.id).
   const id = changeId.trim();
   const storeDir = canonical(store.path, absDir);
+  // `storeDir` came out of the repository's own config, and an absolute value there
+  // leaves the home repo entirely (see `canonical`). Gate it exactly as if the agent
+  // had passed it as an argument — it did, just through a file it can write. Without
+  // this, `readChange` returns the CONTENT of `<any absolute path>/openspec/changes/
+  // <id>/proposal.md` in `change.intent`, and the "not found" branch below doubles as
+  // an existence oracle for the same path.
+  if (!isPathAllowed(storeDir, 'read')) {
+    findings.push({
+      code: 'store-out-of-perimeter', severity: 'error', subject: store.name || 'specStore.path',
+      message: 'The configured spec store lies outside this server\'s root allowlist and will not be read.',
+      remediation: 'Point "specStore.path" inside a served repository, or start the server with --root for the store.',
+    });
+    return {
+      bound: true, store, change: { id, intent: '' },
+      targets: [], items: [], findings, ready: false,
+      summary: `Spec store "${store.name}" is outside this server's perimeter; nothing was read.`,
+    };
+  }
   const change = await readChange(storeDir, id);
   if (!change) {
     findings.push({

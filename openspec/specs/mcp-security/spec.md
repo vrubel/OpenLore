@@ -53,9 +53,21 @@ tools SHALL be held explicitly, and a static test SHALL keep it in agreement wit
 become writable by implication**: the default write set is the working directory when it
 lies inside a read root, and otherwise EMPTY (a read-only server). Serving neighbouring
 repositories with several `--root` flags therefore cannot silently make them writable —
-write access is granted only by `--write-root`, which SHALL be a subset of the read roots. Enforcement SHALL be applied at BOTH the
-handler layer (`validateDirectory`) and the transport layer, before telemetry, daemon
-resolution, panic-state writes, watcher adoption or any `git` spawn touch the path.
+write access is granted only by `--write-root`, which SHALL be a subset of the read roots. Enforcement SHALL be applied WHEREVER THE
+FILESYSTEM IS TOUCHED, not only where a request arrives: at the handler layer
+(`validateDirectory`), at the transport layer (before telemetry, daemon resolution,
+panic-state writes, watcher adoption or any `git` spawn touch the path), on every path
+DERIVED FROM CONFIGURATION (`specStore.path` is read from a file the caller can write and
+is therefore caller input), and at each WRITE performed during a read — the call-graph
+index SHALL NOT be opened for writing, nor its WAL sidecars created, in a repository
+outside the write roots, and panic state SHALL NOT be written there. Where such a write is
+withheld, the degradation SHALL be reported, never silent. Canonicalization SHALL FAIL
+CLOSED: a path whose real location cannot be determined is refused, never judged by its
+lexical form. The CANONICAL path SHALL be what the check returns and what callers use, so
+a symlink swapped after the check cannot move the target outside the root. A shared
+`openlore serve` daemon SHALL NOT be spawned or delegated to while a perimeter is
+configured — it carries no allowlist and is discovered through a file inside the
+perimeter.
 Responses that ENUMERATE repositories (the federation registry, and every query that
 walks it) SHALL withhold members outside the read roots, and SHALL report the number
 withheld rather than omitting them silently. The allowlist SHALL apply to the MCP server
@@ -76,10 +88,25 @@ only: CLI commands, which legitimately act on paths outside the working director
   the same tool on `<own>` proceeds
 
 #### Scenario: The refusal is not an existence oracle
-- **GIVEN** two paths outside the roots, one that exists and one that does not
+- **GIVEN** two paths outside the roots, one that exists and one that does not —
+  reached directly OR through a symlink placed inside an allowed root
 - **WHEN** each is passed as `directory`
 - **THEN** both receive the same perimeter refusal, with no "not found" / "not a
   directory" distinction to read the filesystem from
+
+#### Scenario: A config-supplied path is caller input
+- **GIVEN** `specStore.path` in `<root>/.openlore/config.json` set to an absolute path
+  outside the read roots
+- **WHEN** `spec_store_status` or `working_set_context` runs
+- **THEN** nothing under that path is read or reported, the response carries no content
+  from it, and its existence is not distinguishable from its absence
+
+#### Scenario: Reading a repository does not modify it
+- **GIVEN** a repository inside the read roots but outside the write roots, holding a
+  built call-graph index
+- **WHEN** any read-only tool, or a federation-scoped query, loads its analysis
+- **THEN** the index file is unchanged, no `-wal`/`-shm` sidecars appear beside it, no
+  panic state is written, and any withheld capability is reported
 
 #### Scenario: Telemetry cannot escape the write roots
 - **GIVEN** telemetry is enabled and a tool is called on a directory outside the write roots
