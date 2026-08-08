@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -404,6 +404,32 @@ describe('openlore mcp --http: корневой allowlist на транспор�
     } finally {
       await new Promise<void>(r => trap.close(() => r()));
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // Отказ, поднятый ГЛУБОКО в хендлере (write-target), возвращается его обычным
+  // значением {error} — и без пометки уходит клиенту как УСПЕШНЫЙ вызов с полем
+  // error. Клиент MCP решает «упало или нет» по isError; агент, которому сказали
+  // «успех», понял, что граница — это особенность данных, а не граница. Дверные
+  // отказы помечались правильно, глубокие — нет.
+  it('глубокий отказ (симлинк .openlore наружу) приходит агенту как isError, а не как успех', async () => {
+    const home = mk('deep');
+    const elsewhere = mk('deep-out');
+    const prevCwd = process.cwd();
+    try {
+      symlinkSync(elsewhere, join(home, '.openlore'));
+      process.chdir(home);
+      handle = await startHttpMcpServer({ http: true, port: '0', watchAuto: false, root: [home] });
+      const res = await callTool(handle.port, 'record_decision', {
+        directory: home, title: 'T', rationale: 'R',
+      });
+      expect(res.isError, 'граница пришла агенту как успешный вызов').toBe(true);
+      expect(res.text).toMatch(/Root allowlist/);
+      expect(readdirSync(elsewhere), 'запись просочилась за периметр').toEqual([]);
+    } finally {
+      process.chdir(prevCwd);
+      rmSync(home, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
     }
   });
 

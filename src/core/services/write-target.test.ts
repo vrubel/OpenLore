@@ -10,7 +10,28 @@
  * The defect is not any one of those doors. It is that the set of doors lived in
  * people's heads. This test moves it into the build: every module in `src/` that
  * calls a filesystem write primitive must be classified, and an unclassified one
- * fails CI naming itself. Adding a writer is still easy; adding one SILENTLY is not.
+ * fails CI naming itself.
+ *
+ * WHAT THIS DOES AND DOES NOT GUARANTEE — stated narrowly on purpose, because the
+ * comfortable version of this sentence ("a new writer cannot bypass the helper by
+ * construction") is FALSE and would be exactly the false confidence this whole line
+ * exists to remove. What it actually guarantees:
+ *
+ *   a writer that calls one of the listed primitives — under its own name, or under
+ *   a local alias of it — from a .ts/.js/.mjs/.cjs file outside `src/pi`, and does
+ *   not edit these two lists, WILL be named by CI.
+ *
+ * It does NOT catch: a write performed by a helper this module merely hands a path
+ * to (the helper is classified, not the caller); a write through an external process
+ * (`execFileSync('sh', …)`); a primitive reached dynamically (`fs['write' + 'File']`);
+ * anything under `src/pi` (excluded from build, lint and tests alike); and — most
+ * importantly — it cannot stop someone EDITING these lists, since the gate lives in
+ * the repository it guards. The reason check below raises the cost of a careless
+ * exemption; only review of the registry diff can catch a deliberate one.
+ *
+ * That is a list of primitives with a maintenance rule, not a property of the
+ * construction. It is still far better than remembering — three rounds of review
+ * prove the remembering does not work — but it should be described as what it is.
  *
  * Classification is per-module, not per-line, on purpose — line numbers rot on
  * every edit, and a module is the unit that shares a notion of "where do I write".
@@ -31,7 +52,8 @@ const WRITE_PRIMITIVES = [
   'writeFile', 'writeFileSync', 'appendFile', 'appendFileSync',
   'mkdir', 'mkdirSync', 'mkdtemp', 'mkdtempSync',
   'rename', 'renameSync', 'unlink', 'unlinkSync', 'rmdir', 'rmdirSync',
-  'copyFile', 'copyFileSync', 'cpSync', 'createWriteStream',
+  'copyFile', 'copyFileSync', 'cp', 'cpSync', 'createWriteStream',
+  'openSync', 'writeSync', 'ftruncate', 'ftruncateSync',
   'symlink', 'symlinkSync', 'link', 'linkSync',
   'chmod', 'chmodSync', 'utimes', 'utimesSync', 'truncate', 'truncateSync',
   'EdgeStore.open', 'new DatabaseSync',
@@ -72,6 +94,8 @@ const PERIMETER_GATED = new Set([
   'core/services/mcp-handlers/impact-certificate.ts',
   'core/services/mcp-handlers/change.ts',
   'core/services/mcp-handlers/epistemic-lease.ts',
+  'core/services/mcp-handlers/analysis.ts',
+  'core/services/mcp-watcher.ts',
   'core/services/call-graph-loader.ts',
   'core/decisions/store.ts',
   'core/decisions/memory-store.ts',
@@ -84,6 +108,32 @@ const PERIMETER_GATED = new Set([
  * sound. A reason is a claim someone can check and disagree with — that is the
  * point. "It seemed fine" is not on this list.
  */
+/**
+ * The analyzer/generator writers do not choose a directory: they are HANDED one,
+ * and the two places that derive it (`handleAnalyzeCodebase`, the watcher) now
+ * derive it through the perimeter, so what arrives is already canonical and
+ * approved. This is the honest reason; "analysis output dir" was not — it justified
+ * the CHOICE of directory and said nothing about a symlink carrying the write out
+ * of the root, which is exactly what happened.
+ */
+const RECEIVES_APPROVED_DIR =
+  'Writes into an output directory it is GIVEN. The deriving call sites (handleAnalyzeCodebase, ' +
+  'McpWatcher) resolve that directory through openloreWriteTarget, so it arrives canonical and ' +
+  'inside the write perimeter; this module never builds a project path of its own.';
+
+/**
+ * The documented boundary of the whole feature: the allowlist is a property of the
+ * MCP SERVER, and a CLI process declares none. That is not an oversight to be fixed
+ * later — `openlore federation add /elsewhere/repo` is PDLC registering a product's
+ * repository set, and confining it would break registration. These modules run only
+ * on the CLI/library path, where `getRootAllowlist()` is null and every gate is a
+ * pass-through by design.
+ */
+const CLI_NO_PERIMETER =
+  'CLI/library entry point. The allowlist is declared only by `openlore mcp`; a CLI process ' +
+  'declares none by design (see the boundary note in root-allowlist.ts), so this module is not ' +
+  'reachable from a perimeter-bearing server.';
+
 const EXEMPT: Record<string, string> = {
   // ── The primitive itself ────────────────────────────────────────────────────
   'core/services/edge-store.ts':
@@ -94,19 +144,21 @@ const EXEMPT: Record<string, string> = {
   // analyze_codebase / generate are classified writers, so the transport already
   // required write access to `directory`; and their output dir is the analysis dir
   // under it. These do not accept a second, independent path from the caller.
-  'core/analyzer/artifact-generator.ts': 'Analysis output; runs only under analyze_codebase (write-gated tool).',
-  'core/analyzer/architecture-writer.ts': 'Analysis output dir supplied by the analyzer pipeline.',
-  'core/analyzer/ai-config-generator.ts': 'Analysis output; analyze/init only.',
-  'core/analyzer/codebase-digest.ts': 'Analysis output dir.',
-  'core/analyzer/repository-mapper.ts': 'Analysis output dir.',
-  'core/analyzer/spec-snapshot-generator.ts': 'Analysis output dir.',
-  'core/analyzer/spec-vector-index.ts': 'Analysis output dir (vector index).',
-  'core/analyzer/vector-index.ts': 'Analysis output dir (vector index).',
-  'core/analyzer/vector-store.ts': 'Analysis output dir (vector store files).',
-  'core/generator/mapping-generator.ts': 'Analysis output; generate only.',
+  'core/analyzer/artifact-generator.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/architecture-writer.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/ai-config-generator.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/codebase-digest.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/repository-mapper.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/spec-snapshot-generator.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/spec-vector-index.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/vector-index.ts': RECEIVES_APPROVED_DIR,
+  'core/analyzer/vector-store.ts': RECEIVES_APPROVED_DIR,
+  'core/generator/mapping-generator.ts': RECEIVES_APPROVED_DIR,
   'core/generator/openspec-writer.ts': 'openspec tree; generate only (CLI + write-gated tool).',
-  'core/generator/openspec-compat.ts': 'openspec config; generate/init only.',
-  'core/generator/spec-pipeline.ts': 'Generator output dir.',
+  'core/generator/openspec-compat.ts':
+    'Writes the openspec config during generate/init, into a root the caller already owns; not ' +
+    'reachable from a read-only or foreign root, and it derives no project path of its own.',
+  'core/generator/spec-pipeline.ts': RECEIVES_APPROVED_DIR,
   'core/verifier/verification-engine.ts': 'Verifier output dir, supplied by the CLI command.',
   'core/test-generator/test-writer.ts': 'generate_tests output; write-gated tool, own containment check.',
   'core/decisions/syncer.ts': 'Writes under openspecPath during sync_decisions (write-gated tool).',
@@ -118,50 +170,55 @@ const EXEMPT: Record<string, string> = {
     'twin is perimeter-derived, and the lock is created only on a write that already passed.',
   'core/services/config-manager.ts': 'Writes .openlore/config.json during init/analyze (CLI + write-gated).',
   'core/services/gitignore-manager.ts': 'Writes .gitignore during init/run (CLI only).',
-  'core/services/mcp-watcher.ts':
-    'Watcher writes the analysis index of the directory it watches. Adoption of an arbitrary ' +
-    'directory (--watch-auto) is disabled while a perimeter is configured, and explicit ' +
-    '--watch is validated into the roots at startup.',
   'core/services/llm-service.ts': 'LLM request log under a configured logDir; no caller-supplied project path.',
 
   // ── Process-local scratch ───────────────────────────────────────────────────
-  'core/services/mcp-handlers/analysis.ts': 'Writes only into an os.tmpdir() mkdtemp for git plumbing output.',
   'core/agent-eval/measure.ts': 'Writes only into the mkdtemp workdir created by the prove command.',
   'core/services/mcp-handlers/live-data/report.ts': 'Writes into openlore\'s own live-data cache, never a served repo.',
 
   // ── Not the MCP server: CLI commands and installers ─────────────────────────
   // The documented boundary: a CLI process declares no allowlist, and must not.
   // `openlore federation add <path>` is PDLC registering a product's repo set.
-  'cli/commands/analyze.ts': 'CLI command (no perimeter by design).',
-  'cli/commands/blast-radius.ts': 'CLI command: installs a git hook.',
-  'cli/commands/decisions.ts': 'CLI command: hooks and agent files.',
-  'cli/commands/digest.ts': 'CLI command: writes the requested output file.',
-  'cli/commands/drift.ts': 'CLI command: installs a git hook.',
-  'cli/commands/generate.ts': 'CLI command.',
-  'cli/commands/gryph-watch.ts': 'CLI command: pid file.',
-  'cli/commands/impact-certificate.ts': 'CLI command: installs a git hook.',
-  'cli/commands/panic-hotspots.ts': 'CLI command.',
-  'cli/commands/refresh-stories.ts': 'CLI command: installs a git hook.',
-  'cli/commands/reindex.ts': 'CLI command.',
-  'cli/commands/run.ts': 'CLI command.',
-  'cli/commands/serve.ts': 'Separate long-lived daemon command; MCP refuses to spawn or delegate to it under a perimeter.',
-  'cli/commands/setup.ts': 'CLI command: agent integration files.',
-  'cli/commands/prove.ts': 'CLI command: mkdtemp workdir.',
-  'cli/export/scip.ts': 'CLI export: writes the --out path the operator named.',
-  'cli/manifest/emit.ts': 'CLI export: writes the --out path the operator named.',
-  'cli/install/adapters/claude-code.ts': 'Installer: writes agent config under the detected project root.',
-  'cli/install/adapters/continue.ts': 'Installer.',
-  'cli/install/adapters/cursor.ts': 'Installer.',
-  'cli/install/adapters/markdown-block.ts': 'Installer.',
-  'api/analyze.ts': 'Library/CLI entry point (no perimeter by design).',
-  'api/audit.ts': 'Library/CLI entry point.',
-  'api/generate.ts': 'Library/CLI entry point.',
-  'api/run.ts': 'Library/CLI entry point.',
+  'cli/commands/analyze.ts': CLI_NO_PERIMETER + ' Specifically: CLI command (no perimeter by design).',
+  'cli/commands/blast-radius.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: installs a git hook.',
+  'cli/commands/decisions.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: hooks and agent files.',
+  'cli/commands/digest.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: writes the requested output file.',
+  'cli/commands/drift.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: installs a git hook.',
+  'cli/commands/generate.ts': CLI_NO_PERIMETER,
+  'cli/commands/gryph-watch.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: pid file.',
+  'cli/commands/impact-certificate.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: installs a git hook.',
+  'cli/commands/panic-hotspots.ts': CLI_NO_PERIMETER,
+  'cli/commands/refresh-stories.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: installs a git hook.',
+  'cli/commands/reindex.ts': CLI_NO_PERIMETER,
+  'cli/commands/run.ts': CLI_NO_PERIMETER,
+  'cli/commands/serve.ts': CLI_NO_PERIMETER + ' Specifically: Separate long-lived daemon command; MCP refuses to spawn or delegate to it under a perimeter.',
+  'cli/commands/setup.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: agent integration files.',
+  'cli/commands/prove.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: mkdtemp workdir.',
+  'cli/export/scip.ts': CLI_NO_PERIMETER + ' Specifically: CLI export: writes the --out path the operator named.',
+  'cli/manifest/emit.ts': CLI_NO_PERIMETER + ' Specifically: CLI export: writes the --out path the operator named.',
+  'cli/install/adapters/claude-code.ts': CLI_NO_PERIMETER + ' Specifically: Installer: writes agent config under the detected project root.',
+  'cli/install/adapters/continue.ts': CLI_NO_PERIMETER + ' Specifically: Installer.',
+  'cli/install/adapters/cursor.ts': CLI_NO_PERIMETER + ' Specifically: Installer.',
+  'cli/install/adapters/markdown-block.ts': CLI_NO_PERIMETER + ' Specifically: Installer.',
+  'api/analyze.ts': CLI_NO_PERIMETER + ' Specifically: Library/CLI entry point (no perimeter by design).',
+  'api/audit.ts': CLI_NO_PERIMETER,
+  'api/generate.ts': CLI_NO_PERIMETER,
+  'api/run.ts': CLI_NO_PERIMETER,
   'utils/shutdown.ts': 'Shutdown state file for the process that owns the directory.',
 };
 
 /** Import specifiers that count as "this module consults the perimeter". */
 const GATE_IMPORTS = ['write-target', 'edge-store-access', 'root-allowlist'];
+
+/**
+ * A REAL import statement, not `includes()` over the raw text. The loose form
+ * accepted the word appearing anywhere — including a comment — so a module could
+ * list itself as perimeter-gated merely by mentioning `root-allowlist` in prose.
+ */
+function importsGuard(src: string): boolean {
+  return GATE_IMPORTS.some(g =>
+    new RegExp(`(?:import|require)[^;\n]*['"][^'"]*${g}(?:\\.js)?['"]`).test(src));
+}
 
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];
@@ -170,7 +227,7 @@ function sourceFiles(dir: string): string[] {
     if (entry.isDirectory()) {
       if (entry.name === 'node_modules' || entry.name === 'pi') continue;  // src/pi is out of scope (see vitest.config)
       out.push(...sourceFiles(p));
-    } else if (entry.name.endsWith('.ts') && !entry.name.includes('.test.')) {
+    } else if (/\.(ts|js|mjs|cjs)$/.test(entry.name) && !entry.name.includes('.test.')) {
       out.push(p);
     }
   }
@@ -189,6 +246,15 @@ describe('Write-Site Census Gate', () => {
   for (const file of files) {
     const src = code(readFileSync(file, 'utf-8'));
     const found = new Set<string>();
+    // A primitive can arrive under another name — `import { writeFileSync as _w }`
+    // or `const put = writeFileSync` — and the plain name scan walks straight past
+    // both. Collect the local aliases first and look for those too.
+    for (const m of src.matchAll(/\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g)) {
+      if (WRITE_PRIMITIVES.includes(m[1])) found.add(`${m[1]} as ${m[2]}`);
+    }
+    for (const m of src.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*[;,\n]/g)) {
+      if (WRITE_PRIMITIVES.includes(m[2])) found.add(`${m[2]} aliased as ${m[1]}`);
+    }
     for (const m of src.matchAll(WRITE_RE)) {
       const prim = m[0].replace(/\s*\($/, '').replace(/^[^A-Za-z]+/, '').trim();
       if (prim.endsWith('DatabaseSync') && isReadOnlyDbOpen(src, m.index ?? 0)) continue;
@@ -220,12 +286,21 @@ describe('Write-Site Census Gate', () => {
 
   it('every perimeter-gated module actually imports the guard', () => {
     const notGated = [...PERIMETER_GATED]
-      .filter(f => {
-        const src = readFileSync(join(SRC, f), 'utf-8');
-        return !GATE_IMPORTS.some(g => src.includes(g));
-      })
+      .filter(f => !importsGuard(readFileSync(join(SRC, f), 'utf-8')))
       .sort();
     expect(notGated, `listed as perimeter-gated but importing no guard: ${notGated.join(', ')}`).toEqual([]);
+  });
+
+  it('every exemption states a reason a human can actually check', () => {
+    // Not a proof of correctness — no test can read intent — but it stops the
+    // cheapest evasion: adding yourself with `'ok'`. A reason has to be long enough
+    // to say something, and must not be one of the non-answers.
+    const NON_ANSWERS = /^(ok|n\/a|na|safe|fine|todo|see above|by design|trusted)\.?$/i;
+    const bad = Object.entries(EXEMPT)
+      .filter(([, why]) => why.trim().length < 40 || NON_ANSWERS.test(why.trim()))
+      .map(([f, why]) => `${f}: "${why}"`)
+      .sort();
+    expect(bad, `exemption without a checkable reason:\n  ${bad.join('\n  ')}`).toEqual([]);
   });
 
   it('the exemption list has no stale entries (a module that no longer writes)', () => {
@@ -243,13 +318,20 @@ describe('Write-Site Census Gate', () => {
   it('no MCP handler builds an .openlore write path with a bare join', () => {
     // The exact shape every round of this review kept re-discovering. Handlers are
     // the MCP-reachable surface; they must go through the helper.
+    //
+    // This check deliberately does NOT skip EXEMPT modules any more. It used to, and
+    // that is how `analyze_codebase` shipped writing 14 artifacts through a symlinked
+    // `.openlore`: the module carried an exemption whose stated reason ("writes only
+    // into an os.tmpdir() mkdtemp") was untrue of the line that mattered, and the
+    // exemption ALSO switched off the one check built to catch that exact shape. An
+    // exemption is a claim about a module's write TARGETS; it is not a licence to
+    // stop looking.
     const offenders: string[] = [];
     for (const rel of writers.keys()) {
       if (!rel.startsWith('core/services/mcp-handlers/')) continue;
-      if (rel in EXEMPT) continue;   // already justified above, with a stated reason
       const src = code(readFileSync(join(SRC, rel), 'utf-8'));
       if (/join\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*(OPENLORE_DIR|['"]\.openlore['"])/.test(src)
-          && !GATE_IMPORTS.some(g => src.includes(g))) {
+          && !importsGuard(src)) {
         offenders.push(rel);
       }
     }

@@ -41,7 +41,7 @@ import { emit } from '../telemetry.js';
 import { redactSecrets, redactSecretString } from '../secret-redaction.js';
 import { TOOL_DEFINITIONS, toolAnnotations } from '../../../cli/commands/mcp.js';
 import { handleAnnotateStory } from './change.js';
-import { handleGetFunctionBody, handleGetMiddlewareInventory, handleGetRouteInventory } from './analysis.js';
+import { handleGetFunctionBody, handleGetMiddlewareInventory, handleGetRouteInventory, handleAnalyzeCodebase } from './analysis.js';
 import { handleSearchCode } from './semantic.js';
 import { handleOrient } from './orient.js';
 import { REPO_CONTENT_PROVENANCE, MAX_QUERY_LENGTH } from '../../../constants.js';
@@ -1214,4 +1214,54 @@ describe('Root Allowlist — the panic write-point gate is live on its own', () 
     mutatePanicStateLocked(home, (fresh) => ({ ...fresh, panicScore: 42, panicLevel: 2 }));
     expect(existsSync(join(home, '.openlore', 'panic-state.json'))).toBe(true);
   });
+});
+
+// ── analyze_codebase is the biggest writer of all ─────────────────────────────
+//
+// Reported repro, reproduced here: `--root scratch --write-root scratch` with
+// `scratch/.openlore -> outside/.openlore`, then `analyze_codebase{force:true}`
+// put 14 artifacts (call-graph.db, llm-context.json, SUMMARY.md, fingerprint.json
+// and ten inventories) into `outside/.openlore/analysis/` — while the startup
+// banner truthfully reported the write perimeter as `scratch`.
+//
+// Two things had to be wrong at once, and the second is the worse one: the output
+// dir was derived by a bare `join`, AND the census exempted this module with a
+// reason ("writes only into an os.tmpdir() mkdtemp") that was simply untrue of
+// that line — and the exemption ALSO switched off the bare-join check built to
+// catch exactly this.
+describe('Root Allowlist — analyze_codebase does not write through a symlinked .openlore', () => {
+  let scratch: string;
+  let outside: string;
+
+  beforeEach(() => {
+    scratch = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-an-scratch-')));
+    outside = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-an-ws-')));
+    mkdirSync(join(outside, '.openlore'), { recursive: true });
+    symlinkSync(join(outside, '.openlore'), join(scratch, '.openlore'));
+    writeFileSync(join(scratch, 'a.ts'), 'export function a(): number { return 1; }\n', 'utf-8');
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(scratch, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('refuses instead of dropping the analysis outside the granted root', async () => {
+    configureRootAllowlist({ readRoots: [scratch], writeRoots: [scratch] });
+    const res = await handleAnalyzeCodebase(scratch, true).catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(res)).toMatch(/Root allowlist|perimeter/i);
+    expect(
+      readdirSync(join(outside, '.openlore')),
+      'analysis artifacts landed outside the write perimeter',
+    ).toEqual([]);
+  }, 120_000);
+
+  it('writes normally when the link target IS granted (--root scratch --root ws)', async () => {
+    configureRootAllowlist({ readRoots: [scratch, outside], writeRoots: [scratch, outside] });
+    await handleAnalyzeCodebase(scratch, true);
+    expect(
+      readdirSync(join(outside, '.openlore')).length,
+      'the honest configuration must still produce an analysis',
+    ).toBeGreaterThan(0);
+  }, 120_000);
 });

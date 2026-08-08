@@ -245,6 +245,27 @@ export function _resetRootAllowlistForTesting(): void {
  * reachable (so it can carry on doing useful work instead of probing), and reveal
  * nothing about the path it asked for — in particular not whether it exists.
  */
+/**
+ * Marker every perimeter refusal carries. Deep refusals (a write target inside an
+ * otherwise-readable root) surface as a handler's `{ error }` value rather than as
+ * a thrown transport error, and the transport has to recognise them to set
+ * `isError` — an agent that sees a SUCCESSFUL call with an error field has been told
+ * this is a failure of the operation, not a boundary, which is the opposite of what
+ * the refusal says.
+ */
+export const PERIMETER_REFUSAL_MARKER = 'Root allowlist:';
+
+/** True when `value` is (or contains) a perimeter refusal produced by this module. */
+export function isPerimeterRefusal(value: unknown): boolean {
+  if (value instanceof Error) return value.message.includes(PERIMETER_REFUSAL_MARKER);
+  if (typeof value === 'string') return value.includes(PERIMETER_REFUSAL_MARKER);
+  if (value && typeof value === 'object') {
+    const e = (value as { error?: unknown }).error;
+    return typeof e === 'string' && e.includes(PERIMETER_REFUSAL_MARKER);
+  }
+  return false;
+}
+
 function denialMessage(requested: string, mode: RootAccessMode, state: RootAllowlist, readable: boolean): string {
   const verb = mode === 'write' ? 'write to' : 'read';
   const scoped = mode === 'write' && readable;

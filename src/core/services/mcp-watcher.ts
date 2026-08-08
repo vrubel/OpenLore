@@ -48,6 +48,7 @@ import {
 } from '../../constants.js';
 import { stringifyArtifact } from '../analyzer/artifact-json.js';
 import { attachCallGraphFromStore } from './call-graph-loader.js';
+import { openloreWriteTarget } from './write-target.js';
 
 // Languages the watcher incrementally re-graphs on edit. MUST include every
 // graphable language whose extension is in SOURCE_EXTENSIONS, otherwise editing
@@ -219,7 +220,9 @@ export class McpWatcher {
   constructor(options: McpWatcherOptions) {
     this.rootPath   = options.rootPath;
     this.outputPath = options.outputPath
-      ?? join(options.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+      // Perimeter-derived: the watcher WRITES the index here, so a symlinked
+      // `.openlore` would carry a continuous stream of writes out of the root.
+      ?? openloreWriteTarget(options.rootPath, OPENLORE_ANALYSIS_SUBDIR);
     this.contextPath = join(this.outputPath, ARTIFACT_LLM_CONTEXT);
     this.debounceMs  = options.debounceMs ?? WATCH_DEBOUNCE_MS;
     this.maxBatchMs  = options.maxBatchMs ?? WATCH_MAX_BATCH_MS;

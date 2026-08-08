@@ -43,7 +43,18 @@ import { assertPathAllowed, isPathAllowed } from './mcp-handlers/root-allowlist.
  * ordinary perimeter refusal when this server may not write there.
  */
 export function writeTarget(absDir: string, ...segments: string[]): string {
-  return assertPathAllowed(join(absDir, ...segments), 'write');
+  const target = join(absDir, ...segments);
+  try {
+    return assertPathAllowed(target, 'write');
+  } catch (err) {
+    // The round that moved the perimeter INWARD did not move the audit with it: the
+    // door refusal printed to stderr, this one printed nowhere. An escape attempt
+    // that gets further into the code should be more visible, not less.
+    process.stderr.write(
+      `openlore MCP: отказ периметра на записи — "${target}" (каталог "${absDir}")\n`
+    );
+    throw err;
+  }
 }
 
 /**

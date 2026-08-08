@@ -53,6 +53,7 @@ import type { SerializedCallGraph } from '../../analyzer/call-graph.js';
 import type { MappingArtifact } from '../../generator/mapping-generator.js';
 import { openloreAudit } from '../../../api/audit.js';
 import type { DriftResult } from '../../../types/index.js';
+import { openloreWriteTarget } from '../write-target.js';
 
 // ============================================================================
 // HANDLERS
@@ -66,7 +67,13 @@ export async function handleAnalyzeCodebase(
   force: boolean
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const outputPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  // The analysis output dir is a WRITE target, and the biggest one there is: a full
+  // pass drops the call graph, llm-context, SUMMARY, fingerprint and ten inventories
+  // here. Derived by a bare `join` it followed a symlinked `.openlore` clean out of
+  // the granted root — with the startup banner still truthfully reporting the root as
+  // the write perimeter. That is the ordinary PDLC isolated layout
+  // (`scratch/.openlore -> ws/.openlore`), not a contrived escape.
+  const outputPath = openloreWriteTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   if (!force && await isCacheFresh(absDir)) {
     const ctx = await readCachedContext(absDir);

@@ -13,7 +13,7 @@ import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'nod
 import { join } from 'node:path';
 import { OPENLORE_DIR } from '../../constants.js';
 import { redactSecrets } from './secret-redaction.js';
-import { isPathAllowed } from './mcp-handlers/root-allowlist.js';
+import { tryWriteTarget } from './write-target.js';
 
 const TELEMETRY_SUBDIR = 'telemetry';
 const ROTATE_THRESHOLD_BYTES = 50 * 1024 * 1024;  // 50 MB
@@ -62,8 +62,12 @@ export function emit(
   // the actual target is what makes the permission mean what it says. Same defect of
   // shape as the call-graph index and panic state: judge the directory, write to a
   // path inside it.
-  const dir = join(directory, OPENLORE_DIR, TELEMETRY_SUBDIR);
-  if (!isPathAllowed(dir, 'write')) return;
+  // Judge AND write the same path. The previous version checked the canonical path
+  // and then wrote to the lexical one — no leak was found, but it is precisely the
+  // TOCTOU shape that write-target.ts declares closed, and a claim that holds only
+  // by luck is worse than one that is enforced.
+  const dir = tryWriteTarget(directory, OPENLORE_DIR, TELEMETRY_SUBDIR);
+  if (dir === null) return;
   try {
     if (!_createdDirs.has(dir)) { mkdirSync(dir, { recursive: true }); _createdDirs.add(dir); }
     const filePath = join(dir, `${domain}.jsonl`);

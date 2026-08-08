@@ -53,6 +53,7 @@ import {
   getRootAllowlist,
   isPathAllowed,
   isPathWithinRoots,
+  isPerimeterRefusal,
   isRootAllowlistConfigured,
   toolAccessMode,
 } from '../../core/services/mcp-handlers/root-allowlist.js';
@@ -2249,6 +2250,20 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
       // the agent's context. capStructuredResult truncates at the STRUCTURED level so a
       // JSON result stays valid+parseable (naive byte-truncation of serialized JSON cuts
       // mid-string-literal — e.g. get_spec on a >256 KB spec — and is unusable).
+      // A perimeter refusal raised DEEP in a handler comes back as the handler's
+      // ordinary `{ error }` value, and without this the call is reported to the
+      // client as a SUCCESS carrying an error field. MCP clients decide "did this
+      // fail" from `isError`; an agent told the call succeeded has been told the
+      // boundary is a data quirk rather than a boundary. Door-level refusals were
+      // already flagged — this makes the deep ones agree with them.
+      if (isPerimeterRefusal(result)) {
+        const msg = (result as { error?: string }).error ?? String(result);
+        process.stderr.write(
+          `openlore MCP: отказ периметра (глубокий) — инструмент "${name}" на "${directory}", агент "${agentName}"\n`
+        );
+        return { content: [{ type: 'text', text: msg }], isError: true };
+      }
+
       const { text, truncated } = capStructuredResult(result, MCP_TOOL_MAX_BYTES);
 
       emit(directory, 'mcp', {
