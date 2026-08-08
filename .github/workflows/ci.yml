@@ -77,6 +77,16 @@ jobs:
       # snapshot drift (java-commons-cli totalEdges 443 → 449) that predates
       # this change and deserves its own fix rather than a silent skip here.
       # Everything else in the suite passes.
+      # Build BEFORE the integration suite, and not for the artifact: parts of that
+      # suite exercise the built CLI and guard themselves with
+      # `describe.skipIf(!existsSync(dist/cli/index.js))`. Without a build they do
+      # not fail — they SKIP, silently, and the job stays green. The first green run
+      # of this very step reported "16 passed | 1 skipped": 23 panic e2e tests had
+      # quietly not run. That is the same false-witness defect this change exists to
+      # remove, so it does not get to survive inside the fix for it.
+      - name: Build (integration specs exercise the built CLI)
+        run: npm run build
+
       - name: Run integration tests
         run: npm run test:integration -- --exclude '**/live-data/**'
 
