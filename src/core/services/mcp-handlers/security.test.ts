@@ -32,6 +32,7 @@ import { handleFederationStatus } from './federation.js';
 import { handleWorkingSetContext } from './working-set.js';
 import { handleRecordDecision } from './decisions.js';
 import { handleRemember, handleRecall } from './memory.js';
+import { mutatePanicStateLocked } from './panic-response.js';
 import { handleSpecStoreStatus } from './spec-store.js';
 import { EdgeStore } from '../edge-store.js';
 import { DatabaseSync } from 'node:sqlite';
@@ -1164,5 +1165,53 @@ describe('Root Allowlist — reading through AnchorContext does not rebuild a ne
     const v = (db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number }).version;
     db.close();
     expect(v, 'a writable repo must still get its index rebuilt').not.toBe(1);
+  });
+});
+
+// ── Both panic layers must stay ALIVE, not merely present ────────────────────
+//
+// panic state is guarded twice: a door gate on the transport (skip the whole panic
+// block when the directory is not writable) and a gate at the write point
+// (`tryOpenloreWriteTarget` inside panic-response). In normal operation the door
+// short-circuits first, so the inner gate is never REACHED — which means a test that
+// only drives the transport cannot tell "two live layers" from "one live layer and
+// one decorative". Measured with instrumentation, both are live; this test pins the
+// INNER one directly, bypassing the transport, so it cannot rot into decoration.
+describe('Root Allowlist — the panic write-point gate is live on its own', () => {
+  let home: string;
+  let readOnly: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-panic-home-')));
+    readOnly = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-panic-ro-')));
+    mkdirSync(join(readOnly, '.openlore'), { recursive: true });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(readOnly, { recursive: true, force: true });
+  });
+
+  it('refuses a panic write into a read-only root even when called directly', () => {
+    configureRootAllowlist({ readRoots: [home, readOnly], writeRoots: [home] });
+    // Straight at the store, with no transport in front of it.
+    let mutatorCalls = 0;
+    mutatePanicStateLocked(readOnly, (fresh) => { mutatorCalls++; return { ...fresh, panicScore: 99, panicLevel: 3 }; });
+
+    expect(existsSync(join(readOnly, '.openlore', 'panic-state.json')),
+      'panic state written into a root that is read-only').toBe(false);
+    // The LOCK gate has its own line, and its effect is otherwise invisible: the
+    // lock file is transient, so "no .lock on disk afterwards" holds either way.
+    // What it really guarantees is that the locked section is never ENTERED — no
+    // create-exclusive lock file, no read-modify-write — so observe that instead.
+    expect(mutatorCalls, 'the locked read-modify-write section ran inside a read-only root').toBe(0);
+    expect(existsSync(join(readOnly, '.openlore', 'panic-state.json.lock'))).toBe(false);
+  });
+
+  it('still writes panic state into a writable root (the gate is not a blanket off-switch)', () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    mutatePanicStateLocked(home, (fresh) => ({ ...fresh, panicScore: 42, panicLevel: 2 }));
+    expect(existsSync(join(home, '.openlore', 'panic-state.json'))).toBe(true);
   });
 });

@@ -310,6 +310,17 @@ export function mutatePanicStateLocked(
   directory: string,
   mutate: (fresh: PanicState) => PanicState,
 ): PanicState {
+  // PERIMETER FIRST, and at the TOP — not inside the lock helper.
+  //
+  // The lock helper's own refusal returns its `fallback`, and the last line of this
+  // function is `withPanicStateLock(...) ?? apply()`: a deliberate fail-open, so that
+  // an unobtainable lock degrades to an unlocked write rather than blocking the hot
+  // path. A perimeter refusal returned through that same channel is therefore not a
+  // refusal at all — it falls straight through to `apply()`, which runs the
+  // read-modify-write unlocked. The gate has to stand before the fail-open, or it is
+  // decoration. (Found by proving each layer live separately; the lock-level gate
+  // alone let the mutation run and was stopped only by the gate inside writePanicState.)
+  if (tryOpenloreWriteTarget(directory, PANIC_STATE_FILE) === null) return readPanicState(directory);
   const apply = (): PanicState => {
     const fresh = readPanicState(directory);
     // Seed revision from the freshest disk read so writePanicState bumps to fresh+1
