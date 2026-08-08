@@ -12,9 +12,6 @@
  */
 
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { OPENLORE_DIR } from '../../constants.js';
 
 /** Subset of the daemon's serve.json we need to reach it. */
 interface ServeDescriptor {
@@ -39,9 +36,6 @@ const HEALTH_PROBE_TIMEOUT_MS = 2500;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function descriptorPath(directory: string): string {
-  return join(directory, OPENLORE_DIR, 'serve.json');
-}
 
 /**
  * CLI args to spawn the daemon. Exported + asserted in tests because the daemon
@@ -53,12 +47,22 @@ export function serveSpawnArgs(directory: string): string[] {
   return ['serve', '--directory', directory];
 }
 
+/**
+ * Read `<dir>/.openlore/serve.json` — an UNTRUSTED on-disk artifact. It sits inside
+ * a repository the agent can write, and the very next thing that happens to it is a
+ * `fetch` at the host:port it names. Parsed without validation, that is an outbound
+ * request to any address the agent chooses (metadata service, internal network,
+ * port scanning by true/false), and on `ok:true` every tool call is then routed
+ * through it.
+ *
+ * `serve.ts` already had the fail-closed reader — every field type-checked and the
+ * host confined to loopback. This one JSON.parse'd and cast. Two readers of one
+ * untrusted format, one of them careless, is how the careless one gets forgotten:
+ * reuse the strict one.
+ */
 async function readDescriptor(directory: string): Promise<ServeDescriptor | null> {
-  try {
-    return JSON.parse(await readFile(descriptorPath(directory), 'utf-8')) as ServeDescriptor;
-  } catch {
-    return null;
-  }
+  const { readDescriptor: readValidated } = await import('../../cli/commands/serve.js');
+  return readValidated(directory);
 }
 
 /** True when a descriptor points at a LIVE daemon (ok:true /health), not a stale

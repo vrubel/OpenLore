@@ -17,6 +17,7 @@ import { existsSync } from 'node:fs';
 import { EdgeStore } from './edge-store.js';
 import type { SerializedCallGraph } from '../analyzer/call-graph.js';
 import { logger } from '../../utils/logger.js';
+import { openEdgeStoreForPerimeter } from './edge-store-access.js';
 
 /** Any parsed llm-context.json — only the graph slot matters here. */
 export interface ContextWithCallGraph {
@@ -80,7 +81,9 @@ export function loadCallGraph(analysisDir: string): SerializedCallGraph | null {
   }
   let store: EdgeStore;
   try {
-    store = EdgeStore.open(dbPath);
+    const opened = openEdgeStoreForPerimeter(analysisDir);
+    if (!opened.store) return null;
+    store = opened.store;
   } catch (err) {
     // A corrupt/locked database must not take down a read-only command; the
     // caller degrades to "no call graph", which every consumer already handles.

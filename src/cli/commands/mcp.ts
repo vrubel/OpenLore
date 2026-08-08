@@ -1864,6 +1864,23 @@ interface McpServerOptions {
  * на стартовой проверке «корень записи вне корней чтения» — отказ, которого оператор
  * не заслужил, и read-only сервер стал бы невыразим. Пустая запись выражает его честно.
  */
+/**
+ * `--watch-auto` (дефолт ВКЛ) усыновляет каталог из ПЕРВОГО tool-вызова и поднимает
+ * на нём вотчер, который ПИШЕТ `<dir>/.openlore/analysis`. Это концептуальный
+ * антипод allowlist: агент выбирает, где сервер начнёт писать, — и выбирал успешно,
+ * баннер печатал «запись НИКУДА», а один read-вызов по соседу делал его
+ * записываемым. Под периметром усыновление глушится (в HTTP так было и раньше);
+ * ЯВНЫЙ `--watch <dir>` не трогаем — там каталог назван оператором и введён в корни.
+ */
+function withWatchAutoOffUnderPerimeter(options: McpServerOptions): McpServerOptions {
+  if (!isRootAllowlistConfigured() || options.watchAuto === false) return options;
+  process.stderr.write(
+    'openlore MCP: --watch-auto выключен периметром (усыновление каталога из вызова агента ' +
+    'сделало бы его записываемым). Нужен вотчер — назовите каталог явно: --watch <dir>.\n'
+  );
+  return { ...options, watchAuto: false };
+}
+
 function applyRootAllowlist(options: McpServerOptions): void {
   const cwd = process.cwd();
   // `--watch <dir>` is an instruction to WRITE: the watcher re-indexes into
@@ -2027,21 +2044,26 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
       try {
         assertRootAllowed(directory, toolAccessMode(name));
       } catch (err) {
-        // Аудит пишем В СВОЙ периметр (первый корень записи), не по запрошенному пути.
-        // У read-only сервера корней записи НЕТ — и это САМАЯ безопасная конфигурация,
-        // терять в ней журнал попыток побега нельзя. Тогда пишем на stderr: канал
-        // оператора есть всегда (в stdio-режиме stdout занят протоколом, stderr нет).
+        // Попытка выйти за периметр записывается ВСЕГДА — на stderr, канал оператора,
+        // который есть в любом режиме (в stdio stdout занят протоколом, stderr нет).
+        //
+        // Раньше журнал шёл только через `emit`, а тот выходит сразу без
+        // OPENLORE_TELEMETRY=1, и ветка stderr срабатывала лишь когда корней записи
+        // нет вовсе. То есть рассуждение было перевёрнуто: защищён редкий случай
+        // (read-only сервер), а самый частый — обычный `openlore mcp` без телеметрии —
+        // оставался немым. Побеги должны быть видны в конфигурации по умолчанию.
+        process.stderr.write(
+          `openlore MCP: отказ периметра — инструмент "${name}" (${toolAccessMode(name)}) ` +
+          `на "${directory}", агент "${agentName}"\n`
+        );
+        // Плюс машинный след в телеметрию СВОЕГО периметра (не по запрошенному пути),
+        // когда она включена и есть куда писать.
         const auditRoot = getRootAllowlist()?.writeRoots[0] ?? '';
         if (auditRoot) {
           emit(auditRoot, 'mcp', {
             event: 'tool_denied', tool: name, reason: 'root_allowlist',
             mode: toolAccessMode(name), requested: directory, agent: agentName,
           });
-        } else {
-          process.stderr.write(
-            `openlore MCP: отказ периметра — инструмент "${name}" (${toolAccessMode(name)}) на "${directory}", ` +
-            `агент "${agentName}"\n`
-          );
         }
         return {
           content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
@@ -2302,10 +2324,17 @@ async function maybeStartWatcher(options: McpServerOptions): Promise<void> {
   const { resolve } = await import('node:path');
   const watchDir = resolve(options.watch);
   // Don't start a second watcher when a daemon is already watching this
-  // directory — that's exactly the invariant this PR establishes.
-  // Check discover-only (spawn:false): --watch is an explicit opt-in; if the
-  // user also started a daemon, they want delegation, not two watchers racing.
-  const existingDaemon = await ensureServeDaemon(watchDir, { spawn: false });
+  // directory. Check discover-only (spawn:false): --watch is an explicit opt-in;
+  // if the user also started a daemon, they want delegation, not two watchers.
+  //
+  // …but NOT while a perimeter is configured. Discovery reads
+  // `<dir>/.openlore/serve.json` — a file inside a root the agent can write — and
+  // then fetches the host:port it names. `resolveDaemon` was already guarded; this
+  // second call site was not, so the outbound request survived the guard it was
+  // supposed to be behind. Under a perimeter we simply own the watcher ourselves.
+  const existingDaemon = isRootAllowlistConfigured()
+    ? null
+    : await ensureServeDaemon(watchDir, { spawn: false });
   if (existingDaemon) return;
   const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
   const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
@@ -2330,6 +2359,7 @@ async function maybeStartWatcher(options: McpServerOptions): Promise<void> {
  */
 async function startStdioMcpServer(options: McpServerOptions = {}): Promise<void> {
   applyRootAllowlist(options);   // периметр объявляем ДО того, как сервер начнёт принимать вызовы
+  options = withWatchAutoOffUnderPerimeter(options);
   const toStderr = (...args: unknown[]): void => {
     process.stderr.write(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
   };
@@ -2383,6 +2413,7 @@ export async function startHttpMcpServer(options: McpServerOptions = {}): Promis
   // watch-auto — editor/stdio-фича (инкрементальный реиндекс при правках в редакторе). У REMOTE-агента
   // свежесть анализа держит ИСПОЛНИТЕЛЬ (пере-запуск analyze), а per-session-вотчеры бы текли — отключаем.
   const httpOptions: McpServerOptions = { ...options, watchAuto: false };
+  void withWatchAutoOffUnderPerimeter;   // HTTP уже гасит watch-auto безусловно (строка выше)
 
   // fail-loud: привязка к НЕ-loopback интерфейсу БЕЗ токена открыла бы анализ кода всем в сети.
   const isLoopback = host === '127.0.0.1' || host === '::1' || host === 'localhost';

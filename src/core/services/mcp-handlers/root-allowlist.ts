@@ -289,12 +289,19 @@ export function assertPathAllowed(fsPath: string, mode: RootAccessMode = 'read')
   try {
     cand = canonical(fsPath);
   } catch (err) {
-    // Fail CLOSED: a path we cannot canonicalize is a path we cannot vouch for.
-    throw new Error(
-      `Root allowlist: this openlore MCP server cannot verify where "${resolve(fsPath)}" leads ` +
-      `(${err instanceof Error ? err.message : String(err)}), so it refuses to touch it. This is a ` +
-      'deliberate boundary, not a transient failure.'
+    // Fail CLOSED — and fail IDENTICALLY. The first version said "cannot verify
+    // where X leads (ENOTDIR)", which handed the agent a filesystem probe far
+    // better than the symlink trick it replaced: `/etc/passwd/x` answered
+    // ENOTDIR (a file is there), `/root/x` answered EACCES (a directory is there,
+    // closed), `/etc/no-such/x` answered with the ordinary refusal. Three
+    // distinguishable replies, no write access needed, the whole machine
+    // enumerable. The errno is an OPERATOR fact: it goes to stderr, and the agent
+    // gets the same sentence it would get for any other path outside the roots.
+    process.stderr.write(
+      `openlore MCP: не удалось канонизировать "${resolve(fsPath)}" ` +
+      `(${err instanceof Error ? err.message : String(err)}) — отказ по периметру (fail closed)\n`
     );
+    throw new Error(denialMessage(resolve(fsPath), 'read', state, false));
   }
   const readable = withinAny(cand, state.readRoots);
   if (!readable) throw new Error(denialMessage(resolve(fsPath), 'read', state, false));

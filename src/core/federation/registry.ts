@@ -16,6 +16,7 @@ import {
   OPENLORE_DIR,
 } from '../../constants.js';
 import { isRootAllowed } from '../services/mcp-handlers/root-allowlist.js';
+import { openloreWriteTarget } from '../services/write-target.js';
 import {
   FEDERATION_MANIFEST_FILENAME,
   FEDERATION_SCHEMA_VERSION,
@@ -96,7 +97,9 @@ export function loadRegistry(homeDir: string): FederationRegistry {
 
 /** Persist the registry atomically (write-tmp-then-rename) under `.openlore/`. */
 export function saveRegistry(homeDir: string, registry: FederationRegistry): void {
-  const manifest = federationManifestPath(homeDir);
+  // Perimeter-derived (a no-op in CLI processes, which declare no allowlist and
+  // must keep working — `openlore federation add` is exactly that).
+  const manifest = openloreWriteTarget(homeDir, FEDERATION_MANIFEST_FILENAME);
   mkdirSync(join(resolve(homeDir), OPENLORE_DIR), { recursive: true });
   const tmp = `${manifest}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');

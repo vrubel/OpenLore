@@ -32,15 +32,14 @@
 
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import {
   OPENLORE_DIR,
   OPENLORE_ANALYSIS_SUBDIR,
-  ARTIFACT_CALL_GRAPH_DB,
 } from '../../../constants.js';
 import { emit } from '../telemetry.js';
 import { applyPanicHysteresis } from './panic-response.js';
 import type { PanicLevel, PanicState } from './panic-response.js';
+import { openEdgeStoreForPerimeter } from '../edge-store-access.js';
 import {
   PANIC_SCORE_MAX,
   PANIC_TRAJECTORY_DENSITY,
@@ -384,12 +383,19 @@ function getGitHash(directory: string): string {
 
 export function getSourceRoots(directory: string): string[] {
   try {
-    const dbPath = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_CALL_GRAPH_DB);
-    const db = new DatabaseSync(dbPath);
+    // This function only READS source roots, but a bare `new DatabaseSync` opens
+    // for writing — same defect as the two EdgeStore doors, in a third place. Use
+    // the shared opener: writable repo → normal handle, read-only repo → immutable
+    // handle that leaves no -wal/-shm behind, unopenable → no roots (silent here is
+    // correct: module tracking is advisory and already returns [] when there is no
+    // analysis).
+    const opened = openEdgeStoreForPerimeter(join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR));
+    if (!opened.store) return [];
+    const db = opened.store;
     // is_test = 0: since PDLC-156 the store also holds the test side of the graph,
     // which this query predates — without the filter a repo's `tests/` directory
     // would start counting as a source root.
-    const rows = db.prepare('SELECT DISTINCT file_path FROM nodes WHERE is_external = 0 AND is_test = 0').all() as Array<{ file_path: string }>;
+    const rows = db.sourceRootRows();
     db.close();
     const roots = new Set<string>();
     for (const { file_path } of rows) {

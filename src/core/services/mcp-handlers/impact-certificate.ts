@@ -40,6 +40,7 @@ import { memoryFreshness } from '../../decisions/anchor.js';
 import { readOpenLoreConfig } from '../config-manager.js';
 import { OPENLORE_DIR } from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode, CallEdge } from '../../analyzer/call-graph.js';
+import { openloreWriteTarget } from '../write-target.js';
 import type {
   StructuralAnchor,
   CoveringSurfaceConfig,
@@ -645,7 +646,9 @@ function certFileName(change: string): string {
 
 /** Persist a certificate under `.openlore/impact-certificates/` for later decay re-checks. */
 export function persistCertificate(absDir: string, cert: ImpactCertificate): void {
-  const dir = certDir(absDir);
+  // Perimeter-derived: `certDir` is a lexical join and would follow a symlinked
+  // `.openlore` straight out of the granted root.
+  const dir = openloreWriteTarget(absDir, CERT_SUBDIR);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, certFileName(cert.change)), JSON.stringify(cert, null, 2), 'utf-8');
 }

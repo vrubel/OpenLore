@@ -536,6 +536,20 @@ export class EdgeStore {
     return row.n;
   }
 
+  /**
+   * Distinct production file paths — the input to source-root inference.
+   *
+   * Exposed as a method so its caller can reach the graph through the shared,
+   * perimeter-aware opener instead of running `new DatabaseSync(dbPath)` itself:
+   * that bare constructor opens for WRITING, which is how a purely read-shaped
+   * helper ended up modifying a repository this server may only read.
+   */
+  sourceRootRows(): Array<{ file_path: string }> {
+    return this.db
+      .prepare('SELECT DISTINCT file_path FROM nodes WHERE is_external = 0 AND is_test = 0')
+      .all() as unknown as Array<{ file_path: string }>;
+  }
+
   // ── Node mutations ────────────────────────────────────────────────────────────
 
   deleteNodesForFile(file: string): void {

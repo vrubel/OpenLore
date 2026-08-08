@@ -13,7 +13,7 @@
  * suite is not part of CI, and this is exactly the case CI must not lose.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, realpathSync, existsSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +37,23 @@ afterEach(async () => {
   if (client) { await client.close().catch(() => {}); client = undefined; }
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
+
+/** Start `openlore mcp` over stdio with NO flags beyond those given — in
+ * particular WITHOUT `--no-watch-auto`, i.e. exactly how it runs in the field. */
+const connectRaw = async (args: string[], cwd: string): Promise<{ client: Client; stderr: () => string }> => {
+  const c = new Client({ name: 'openlore-stdio-test', version: '1.0.0' });
+  const t = new StdioClientTransport({
+    command: TSX,
+    args: [CLI, 'mcp', ...args],
+    cwd,
+    env: { ...process.env, OPENLORE_TELEMETRY: '1' } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  await c.connect(t);
+  let buf = '';
+  t.stderr?.on('data', (d: Buffer) => { buf += d.toString(); });
+  return { client: c, stderr: () => buf };
+};
 
 /** Start `openlore mcp` over stdio with the given extra args and cwd. */
 const connect = async (args: string[], cwd: string): Promise<Client> => {
@@ -70,6 +87,43 @@ describe('openlore mcp (stdio): корневой периметр', () => {
 
     const ok = await call(client, 'federation_status', { directory: home });
     expect(ok.isError).toBeFalsy();
+  }, 120_000);
+
+  // Прошлый круг: оба stdio-теста запускали сервер с `--no-watch-auto`, то есть
+  // замок сознательно смотрел мимо самой опасной части. `--watch-auto` включён ПО
+  // УМОЛЧАНИЮ и усыновляет каталог из ПЕРВОГО вызова, поднимая на нём вотчер,
+  // который ПИШЕТ индекс. Баннер печатал «запись НИКУДА», а один read-вызов по
+  // соседу делал его записываемым. Здесь сервер запускается ровно так, как его
+  // запускают реально: без единого флага, кроме корней.
+  it('ДЕФОЛТНАЯ конфигурация: --watch-auto не усыновляет каталог из вызова агента', async () => {
+    const home = mk('wa-home');
+    const neighbour = mk('wa-nb');
+    // У соседа УЖЕ есть индекс — иначе вотчеру нечего переписывать и тест зелен
+    // по случайности, а не по существу.
+    const analysis = join(neighbour, '.openlore', 'analysis');
+    mkdirSync(analysis, { recursive: true });
+    const ctxFile = join(analysis, 'llm-context.json');
+    writeFileSync(ctxFile, JSON.stringify({ signatures: [] }), 'utf-8');
+    const src = join(neighbour, 'a.ts');
+    writeFileSync(src, 'export const a = 1;\n', 'utf-8');
+    const before = statSync(ctxFile).mtimeMs;
+
+    // Обоим корням дано ЧТЕНИЕ; запись по дефолту достаётся только cwd (= home).
+    const conn = await connectRaw(['--root', home, '--root', neighbour], home);
+    client = conn.client;
+
+    const res = await call(client, 'federation_status', { directory: neighbour });
+    expect(res.isError, 'сосед должен читаться').toBeFalsy();
+
+    // (1) Прямой наблюдаемый признак гейта: сервер СКАЗАЛ, что погасил усыновление.
+    expect(conn.stderr(), 'нет следа того, что watch-auto погашен периметром')
+      .toMatch(/--watch-auto выключен периметром/);
+
+    // (2) И поведение: правим файл у соседа — вотчер, если он усыновлён, перепишет
+    //     его индекс. Дебаунс по умолчанию 400мс, ждём с запасом.
+    writeFileSync(src, 'export const a = 2;\n', 'utf-8');
+    await new Promise(r => setTimeout(r, 2500));
+    expect(statSync(ctxFile).mtimeMs, 'индекс соседа переписан усыновлённым вотчером').toBe(before);
   }, 120_000);
 
   it('--root задаёт периметр и по stdio тоже', async () => {

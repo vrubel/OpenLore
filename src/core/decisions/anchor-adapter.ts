@@ -20,6 +20,7 @@ import {
   OPENLORE_ANALYSIS_SUBDIR,
 } from '../../constants.js';
 import { EdgeStore } from '../services/edge-store.js';
+import { openEdgeStoreForPerimeter } from '../services/edge-store-access.js';
 import type { FunctionNode } from '../analyzer/call-graph.js';
 import type { StructuralAnchor, GroundingCertificate } from '../../types/index.js';
 import {
@@ -114,12 +115,21 @@ export class AnchorContext {
     private readonly rootPath: string,
   ) {}
 
-  /** Open the adapter, or return null when no analysis (edge store) exists yet. */
+  /**
+   * Open the adapter, or return null when no analysis (edge store) exists yet — or
+   * when the perimeter will not let this process open it.
+   *
+   * This is the SECOND door onto the index, and it is reached from tools that only
+   * read: `recall`, `verify_claim`, `record_decision`, the impact certificate. It
+   * used to call the read-WRITE `EdgeStore.open` directly, so reading a neighbour
+   * with an older schema silently destroyed its index. Both doors now go through
+   * the one opener that asks the perimeter first.
+   */
   static open(rootPath: string): AnchorContext | null {
     const dir = analysisDir(rootPath);
-    if (!EdgeStore.exists(dir)) return null;
     try {
-      return new AnchorContext(EdgeStore.open(EdgeStore.dbPath(dir)), rootPath);
+      const { store } = openEdgeStoreForPerimeter(dir);
+      return store ? new AnchorContext(store, rootPath) : null;
     } catch {
       return null;
     }

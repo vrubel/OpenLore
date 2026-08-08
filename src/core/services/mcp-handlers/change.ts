@@ -16,6 +16,7 @@ import { validateDirectory, safeJoin } from './utils.js';
 import { handleOrient } from './orient.js';
 import { handleSearchSpecs } from './semantic.js';
 import { handleAnalyzeImpact } from './graph.js';
+import { writeTarget } from '../write-target.js';
 
 // ============================================================================
 // INTERNAL TYPES  (narrow slices of handler outputs we actually use)
@@ -287,7 +288,9 @@ export async function handleGenerateChangeProposal(
     return { error: 'Invalid slug. Use alphanumeric characters and hyphens, e.g. "add-payment-retry".' };
   }
 
-  const changeDir = join(absDir, 'openspec', 'changes', safeSlug);
+  // Perimeter-derived write target: `join` alone would follow a symlinked
+  // `openspec/` (or `changes/`) out of the granted root.
+  const changeDir = writeTarget(absDir, 'openspec', 'changes', safeSlug);
   const proposalPath = join(changeDir, 'proposal.md');
 
   const generatedAt = new Date().toISOString().split('T')[0];

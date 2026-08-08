@@ -7,6 +7,7 @@
  * Bearer-auth) без запуска агента/LLM.
  */
 import { describe, it, expect, afterEach } from 'vitest';
+import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -368,6 +369,41 @@ describe('openlore mcp --http: корневой allowlist на транспор�
     } finally {
       rmSync(served, { recursive: true, force: true });
       rmSync(watched, { recursive: true, force: true });
+    }
+  });
+
+  // Долг, который я сам назвал в прошлом круге: возврат делегирования демону не
+  // ловился НИЧЕМ — ни гейтом, ни тестом. `openlore serve` не знает про allowlist,
+  // поднимается без токена, а находят его через <repo>/.openlore/serve.json — файл
+  // внутри разрешённого корня, то есть адрес выбирает агент. Проверяем наблюдаемо:
+  // подсовываем валидный дескриптор, указывающий на НАШ сервер-ловушку, и требуем,
+  // чтобы к нему не ушло ни одного запроса.
+  it('делегирование чужому serve-демону не происходит: дескриптор в корне игнорируется', async () => {
+    const home = mk('dlg');
+    const hits: string[] = [];
+    const trap = createServer((req, res) => {
+      hits.push(req.url ?? '');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, version: '2.1.3', root: home }));
+    });
+    await new Promise<void>(r => trap.listen(0, '127.0.0.1', () => r()));
+    const trapPort = (trap.address() as { port: number }).port;
+    try {
+      mkdirSync(join(home, '.openlore'), { recursive: true });
+      writeFileSync(
+        join(home, '.openlore', 'serve.json'),
+        JSON.stringify({
+          port: trapPort, pid: process.pid, host: '127.0.0.1',
+          startedAt: new Date().toISOString(), version: '2.1.3',
+        }),
+        'utf-8',
+      );
+      handle = await startHttpMcpServer({ http: true, port: '0', watchAuto: false, root: [home] });
+      await callTool(handle.port, 'federation_status', { directory: home });
+      expect(hits, `сервер сходил к демону из serve.json: ${hits.join(', ')}`).toEqual([]);
+    } finally {
+      await new Promise<void>(r => trap.close(() => r()));
+      rmSync(home, { recursive: true, force: true });
     }
   });
 

@@ -20,6 +20,7 @@ import {
   PANIC_SESSION_EXPIRY_MS,
   PANIC_SCORE_MAX,
 } from './panic-constants.js';
+import { tryOpenloreWriteTarget } from '../write-target.js';
 
 // ============================================================================
 // TYPES
@@ -185,7 +186,11 @@ function atomicWriteState(path: string, state: PanicState, revision: number): bo
  */
 export function writePanicState(directory: string, state: PanicState): number {
   const newRevision = (state.revision ?? 0) + 1;
-  const path = join(directory, OPENLORE_DIR, PANIC_STATE_FILE);
+  // Perimeter-derived: panic state is a WRITE performed on behalf of tools that
+  // only read, into a directory chosen by the target repo's own config. `join`
+  // would not follow a symlinked `.openlore`.
+  const path = tryOpenloreWriteTarget(directory, PANIC_STATE_FILE);
+  if (path === null) return state.revision ?? 0;
   return atomicWriteState(path, state, newRevision) ? newRevision : (state.revision ?? 0);
 }
 
@@ -212,7 +217,9 @@ function sleepSyncMs(ms: number): void {
  * the panic subsystem must never block or crash a tool call over a contended/failed write).
  */
 function withPanicStateLock<T>(directory: string, fn: () => T, fallback: T, maxAttempts = LOCK_MAX_ATTEMPTS): T {
-  const lockPath = `${join(directory, OPENLORE_DIR, PANIC_STATE_FILE)}.lock`;
+  const stateForLock = tryOpenloreWriteTarget(directory, PANIC_STATE_FILE);
+  if (stateForLock === null) return fallback;   // outside the write perimeter — do not lock, do not write
+  const lockPath = `${stateForLock}.lock`;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let fd: number;
     try {

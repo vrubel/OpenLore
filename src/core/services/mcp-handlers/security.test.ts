@@ -30,8 +30,11 @@ import {
 } from './root-allowlist.js';
 import { handleFederationStatus } from './federation.js';
 import { handleWorkingSetContext } from './working-set.js';
+import { handleRecordDecision } from './decisions.js';
+import { handleRemember, handleRecall } from './memory.js';
 import { handleSpecStoreStatus } from './spec-store.js';
 import { EdgeStore } from '../edge-store.js';
+import { DatabaseSync } from 'node:sqlite';
 import { resolveFederationScope } from '../../federation/resolver.js';
 import { emit } from '../telemetry.js';
 import { redactSecrets, redactSecretString } from '../secret-redaction.js';
@@ -1028,5 +1031,138 @@ describe('Root Allowlist — a read must not write (call-graph index)', () => {
     const ctx = await readCachedContext(home);
     expect(ctx).not.toBeNull();
     expect(ctx?.edgeStore, 'the own repo lost its index').toBeTruthy();
+  });
+});
+
+// ── Root Allowlist: a symlinked .openlore must not move the write outside ─────
+//
+// This is not a contrived escape. `scratch/.openlore -> ws/.openlore` is the
+// ORDINARY PDLC isolated layout — the agent works in a scratch dir whose
+// `.openlore` is a link onto the workspace. So `join(dir, '.openlore', …)` on a
+// write path routinely lands somewhere other than `dir`, and every writer that
+// built its path that way was writing outside whatever was granted.
+
+describe('Root Allowlist — a symlinked .openlore does not carry writes out', () => {
+  let home: string;
+  let elsewhere: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-link-home-')));
+    elsewhere = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-link-out-')));
+    // The whole `.openlore` tree of `home` actually lives in `elsewhere`.
+    symlinkSync(elsewhere, join(home, '.openlore'));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(elsewhere, { recursive: true, force: true });
+  });
+
+  /** Everything the writers would have created, had they followed the link. */
+  const strayFiles = (): string[] =>
+    readdirSync(elsewhere, { recursive: true, encoding: 'utf-8' }).filter(f => !f.startsWith('.'));
+
+  it('record_decision does not write through the link', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleRecordDecision(home, 'Title', 'Rationale') as Record<string, unknown>;
+    expect(String(res.error ?? ''), 'the write should be refused, not silently succeed').toMatch(/allowlist|perimeter/i);
+    expect(strayFiles(), 'decision written outside the granted root').toEqual([]);
+  });
+
+  it('remember does not write through the link', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleRemember(home, 'a memory worth keeping') as Record<string, unknown>;
+    expect(String(res.error ?? '')).toMatch(/allowlist|perimeter/i);
+    expect(strayFiles(), 'memory written outside the granted root').toEqual([]);
+  });
+
+  it('the same writes succeed when the link target IS granted (no false lockout)', async () => {
+    // Granting `elsewhere` too is the honest configuration for the PDLC layout:
+    // `--root scratch --root ws`. The writes must then work exactly as before.
+    configureRootAllowlist({ readRoots: [home, elsewhere], writeRoots: [home, elsewhere] });
+    const res = await handleRecordDecision(home, 'Title', 'Rationale') as Record<string, unknown>;
+    expect(String(res.error ?? '')).not.toMatch(/allowlist|perimeter/i);
+    expect(strayFiles().length, 'the decision should have been written into the granted target').toBeGreaterThan(0);
+  });
+});
+
+// ── Root Allowlist: the SECOND door onto the index (AnchorContext) ────────────
+//
+// The first attempt gated `readCachedContext` and declared "a read never writes".
+// It was false at a door nobody had listed: `AnchorContext.open` called the
+// read-WRITE `EdgeStore.open` directly, and `recall` / `verify_claim` /
+// `record_decision` / the impact certificate all arrive through it. Measured
+// consequence on a neighbour whose index predated a SCHEMA_VERSION bump: reading
+// it ran DROP TABLE over every table and the analysis was gone.
+
+describe('Root Allowlist — reading through AnchorContext does not rebuild a neighbour\'s index', () => {
+  let home: string;
+  let neighbour: string;
+  let dbPath: string;
+
+  /** Force the on-disk schema to a stale version — the case that triggers the wipe. */
+  const makeStaleIndex = (analysisDir: string): void => {
+    mkdirSync(analysisDir, { recursive: true });
+    writeFileSync(join(analysisDir, 'llm-context.json'), JSON.stringify({ signatures: [] }), 'utf-8');
+    EdgeStore.open(EdgeStore.dbPath(analysisDir)).close();
+    const db = new DatabaseSync(EdgeStore.dbPath(analysisDir));
+    db.exec('UPDATE schema_version SET version = 1');
+    db.close();
+  };
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-anchor-home-')));
+    neighbour = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-anchor-nb-')));
+    const analysisDir = join(neighbour, '.openlore', 'analysis');
+    makeStaleIndex(analysisDir);
+    dbPath = EdgeStore.dbPath(analysisDir);
+    _resetContextCacheForTesting();
+  });
+  afterEach(() => {
+    _resetContextCacheForTesting();
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(neighbour, { recursive: true, force: true });
+  });
+
+  const schemaVersion = (): number => {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return (db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number }).version;
+    } finally {
+      db.close();
+    }
+  };
+
+  it('recall on a read-only neighbour leaves its stale index exactly as it found it', async () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+    const analysisDir = join(neighbour, '.openlore', 'analysis');
+    const listing = (): string[] => readdirSync(analysisDir).sort();
+    const before = {
+      v: schemaVersion(), mtime: statSync(dbPath).mtimeMs,
+      size: statSync(dbPath).size, files: listing(),
+    };
+    expect(before.v).toBe(1);
+
+    await handleRecall(neighbour, 'anything at all');
+
+    expect(schemaVersion(), 'the neighbour\'s index was rebuilt by a read').toBe(1);
+    expect(statSync(dbPath).mtimeMs, 'the neighbour\'s index was modified by a read').toBe(before.mtime);
+    expect(statSync(dbPath).size).toBe(before.size);
+    // Nothing NEW appeared beside it either — a plain read-only SQLite connection
+    // would have materialized -wal/-shm here (measured), which is why the shared
+    // opener uses an immutable URI.
+    expect(listing(), 'a read created files in a repository it may only read').toEqual(before.files);
+  });
+
+  it('the SAME call on a writable root still repairs the schema (no regression)', async () => {
+    const ownAnalysis = join(home, '.openlore', 'analysis');
+    makeStaleIndex(ownAnalysis);
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    await handleRecall(home, 'anything at all');
+    const db = new DatabaseSync(EdgeStore.dbPath(ownAnalysis), { readOnly: true });
+    const v = (db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number }).version;
+    db.close();
+    expect(v, 'a writable repo must still get its index rebuilt').not.toBe(1);
   });
 });
