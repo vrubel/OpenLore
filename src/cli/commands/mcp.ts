@@ -50,6 +50,7 @@ import {
   configureRootAllowlist,
   assertRootAllowed,
   getRootAllowlist,
+  isPathWithinRoots,
   toolAccessMode,
 } from '../../core/services/mcp-handlers/root-allowlist.js';
 import { createTracker, updateTracker, updatePanic, resetPanicOnOrient, getFreshnessSignal, trackerToPanicState } from '../../core/services/mcp-handlers/epistemic-lease.js';
@@ -1829,35 +1830,52 @@ interface McpServerOptions {
   sseKeepAliveMs?: number;  // интервал SSE-heartbeat для GET-стрима (default 25000; тест задаёт малый)
   // --- Корневой allowlist (периметр ФС сервера) ---
   root?: string[];      // корни, разрешённые на ЧТЕНИЕ (повторяемый --root); default [process.cwd()]
-  writeRoot?: string[]; // корни, разрешённые на ЗАПИСЬ (повторяемый --write-root); default = корни чтения
+  writeRoot?: string[]; // корни, разрешённые на ЗАПИСЬ (повторяемый --write-root); default: [cwd], если cwd внутри корня чтения, иначе ПУСТО
 }
 
 /**
  * Объявить периметр файловой системы этого сервера — ОДИН раз, до первого запроса.
  *
- * Закрыто по умолчанию: без флагов единственный корень — рабочий каталог процесса.
- * Именно так openlore и запускают: PDLC ставит `cwd` = корень репозитория прогона,
- * редакторные интеграции — корень открытого проекта. Расширение периметра —
- * ЯВНЫЙ акт оператора, а не то, что достаётся молча.
+ * Чтение закрыто по умолчанию: без флагов единственный корень — рабочий каталог
+ * процесса. Именно так openlore и запускают: PDLC ставит `cwd` = каталог с
+ * `.openlore/analysis`, редакторные интеграции — корень открытого проекта.
+ * Расширение периметра — ЯВНЫЙ акт оператора, а не то, что достаётся молча.
  *
- * `--write-root` по умолчанию равен корням ЧТЕНИЯ, а не «cwd»: иначе `--root /a`
- * без второго флага упирался бы в стартовую проверку «корень записи вне корней
- * чтения» — отказ, который оператор ничем не заслужил. При отсутствии ОБОИХ
- * флагов оба списка равны `[cwd]`, что и есть заявленный дефолт.
+ * ЗАПИСЬ ПО УМОЛЧАНИЮ — РОВНО СВОЙ РЕПОЗИТОРИЙ, НИКОГДА НЕ СОСЕДИ: `[cwd]`, если
+ * `cwd` лежит внутри какого-то корня чтения, иначе ПУСТОЙ список (сервер только на
+ * чтение). Это не мелочь настройки, а само требование: пишущие инструменты по чужому
+ * `directory` (`analyze_codebase` перепишет `.openlore` соседа) закрываются НЕЗАВИСИМО
+ * от allowlist — даже разрешённый на ЧТЕНИЕ репозиторий не может быть изменён из
+ * прогона по другому репозиторию.
+ *
+ * Почему не «write = все корни чтения»: типовой запуск federation-стадии —
+ * `--root <свой> --root <сосед1> --root <сосед2>` (соседи нужны на чтение, писать в них
+ * незачем). При таком дефолте каждый сосед оказался бы записываемым, и периметр записи
+ * держался бы на том, что вызывающий не забудет `--write-root`. Это тихий fail-open —
+ * ровно тот класс, который здесь и чинится.
+ *
+ * Почему не буквальный `[cwd]` всегда: тогда `--root /a` при `cwd` вне `/a` падал бы
+ * на стартовой проверке «корень записи вне корней чтения» — отказ, которого оператор
+ * не заслужил, и read-only сервер стал бы невыразим. Пустая запись выражает его честно.
  */
 function applyRootAllowlist(options: McpServerOptions): void {
   const cwd = process.cwd();
   const readRoots = options.root && options.root.length > 0 ? options.root : [cwd];
-  const writeRoots = options.writeRoot && options.writeRoot.length > 0 ? options.writeRoot : readRoots;
+  const writeRoots = options.writeRoot && options.writeRoot.length > 0
+    ? options.writeRoot
+    : (isPathWithinRoots(cwd, readRoots) ? [cwd] : []);
   configureRootAllowlist({ readRoots, writeRoots });
   // Периметр печатаем на stderr при СТАРТЕ: оператор, у которого агент вдруг стал
   // получать отказы, должен видеть границу в логе запуска, а не выяснять её из
   // текста отказа. stderr, а не stdout — в stdio-режиме stdout принадлежит протоколу.
   const st = getRootAllowlist();
   if (st) {
-    process.stderr.write(
-      `openlore MCP: периметр — чтение [${st.readRoots.join(', ')}], запись [${st.writeRoots.join(', ') || '—'}]\n`
-    );
+    // Пустой список записи — законная и ВАЖНАЯ конфигурация (сервер только на чтение),
+    // поэтому она пишется словами, а не пустыми скобками, которые читаются как «не знаю».
+    const w = st.writeRoots.length > 0
+      ? `запись [${st.writeRoots.join(', ')}]`
+      : 'запись НИКУДА (сервер только на чтение)';
+    process.stderr.write(`openlore MCP: периметр — чтение [${st.readRoots.join(', ')}], ${w}\n`);
   }
 }
 
@@ -2440,5 +2458,5 @@ export const mcpCommand = new Command('mcp')
   .option('--port <port>', 'HTTP port (default: 7787; "0" = ephemeral)')
   .option('--token <token>', 'Optional Bearer token for HTTP transport — when set, every request must carry "Authorization: Bearer <token>" (closed-contour isolation)')
   .option('--root <path>', 'Repository root this server may READ. Repeatable. Every tool call is confined to these roots (symlink-resolved), and nothing outside them is read, listed or disclosed. Default: the working directory — a server is always raised FOR something, so the perimeter is closed unless you widen it.', collectPath)
-  .option('--write-root <path>', 'Repository root this server may WRITE (analyze, decisions, generated tests, telemetry). Repeatable, and must be inside a --root. Default: the read roots. Use it to serve a repository read-only.', collectPath)
+  .option('--write-root <path>', 'Repository root this server may WRITE (analyze, decisions, generated tests, telemetry). Repeatable, and must be inside a --root. Default: the working directory when it lies inside a read root, otherwise NOTHING is writable — a repository you granted for reading is never writable by implication, so serving neighbours with several --root flags cannot silently make them writable.', collectPath)
   .action((options: McpServerOptions) => startMcpServer(options));

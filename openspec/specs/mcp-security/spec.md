@@ -49,7 +49,11 @@ outside the read roots SHALL be refused with a message that names the boundary a
 reachable roots without disclosing whether the requested path exists. Tools that can
 write SHALL additionally require the directory to be inside a write root; that list of
 tools SHALL be held explicitly, and a static test SHALL keep it in agreement with the
-`readOnlyHint` annotations in both directions. Enforcement SHALL be applied at BOTH the
+`readOnlyHint` annotations in both directions. **A root granted for reading SHALL NOT
+become writable by implication**: the default write set is the working directory when it
+lies inside a read root, and otherwise EMPTY (a read-only server). Serving neighbouring
+repositories with several `--root` flags therefore cannot silently make them writable —
+write access is granted only by `--write-root`, which SHALL be a subset of the read roots. Enforcement SHALL be applied at BOTH the
 handler layer (`validateDirectory`) and the transport layer, before telemetry, daemon
 resolution, panic-state writes, watcher adoption or any `git` spawn touch the path.
 Responses that ENUMERATE repositories (the federation registry, and every query that
@@ -63,6 +67,13 @@ only: CLI commands, which legitimately act on paths outside the working director
 - **WHEN** a tool is called with `directory` pointing at repository B
 - **THEN** the call is refused with a message that states the boundary and lists the
   readable roots, and nothing in B is read, written or created
+
+#### Scenario: A read-granted neighbour is not writable
+- **GIVEN** a server started with `--root <own> --root <neighbour>` and no `--write-root`,
+  with the working directory inside `<own>`
+- **WHEN** a mutating tool is called with `directory` = `<neighbour>`
+- **THEN** it is refused as readable-but-not-writable, and nothing is created there, while
+  the same tool on `<own>` proceeds
 
 #### Scenario: The refusal is not an existence oracle
 - **GIVEN** two paths outside the roots, one that exists and one that does not

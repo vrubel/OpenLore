@@ -248,6 +248,74 @@ describe('openlore mcp --http: корневой allowlist на транспор�
     }
   });
 
+  // ── Дефолт записи: свой репозиторий, НИКОГДА не соседи ──────────────────────
+  //
+  // Требование владельца (PDLC-110): «пишущие инструменты по чужому `directory`
+  // закрываются НЕЗАВИСИМО от allowlist: даже разрешённый на ЧТЕНИЕ репозиторий не
+  // может быть изменён из прогона по другому репозиторию». Типовой запуск
+  // federation-стадии — `--root <свой> --root <сосед>`; если бы запись по умолчанию
+  // равнялась корням чтения, сосед стал бы записываемым молча, и периметр держался бы
+  // на том, что вызывающий не забыл `--write-root`. Это и есть замок на то решение.
+  it('--root СВОЙ --root СОСЕД без --write-root: писать можно только в свой, в соседа — отказ', async () => {
+    const home = mk('d-home');
+    const neighbour = mk('d-nb');
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(home);                       // как в проде: cwd = каталог своего репозитория
+      handle = await startHttpMcpServer({
+        http: true, port: '0', watchAuto: false, root: [home, neighbour],
+      });
+
+      // сосед ЧИТАЕТСЯ (ради него его и объявили)…
+      const read = await callTool(handle.port, 'federation_status', { directory: neighbour });
+      expect(read.isError).toBeFalsy();
+
+      // …но НЕ пишется, хотя --write-root не передавали вовсе
+      const write = await callTool(handle.port, 'record_decision', {
+        directory: neighbour, title: 'x', rationale: 'y',
+      });
+      expect(write.isError).toBe(true);
+      expect(write.text).toMatch(/readable but not writable/);
+      expect(existsSync(join(neighbour, '.openlore')), 'запись просочилась в соседа').toBe(false);
+
+      // а свой репозиторий записываем — иначе периметр был бы просто выключен
+      const own = await callTool(handle.port, 'record_decision', {
+        directory: home, title: 'x', rationale: 'y',
+      });
+      expect(own.text).not.toMatch(/Root allowlist/);
+    } finally {
+      process.chdir(prevCwd);
+      rmSync(home, { recursive: true, force: true });
+      rmSync(neighbour, { recursive: true, force: true });
+    }
+  });
+
+  it('cwd вне всех корней чтения: запись пуста, чтение работает, пишущий инструмент отбивается', async () => {
+    const served = mk('r-served');
+    const elsewhere = mk('r-elsewhere');
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(elsewhere);                  // сервер поднят «не из» обслуживаемого репозитория
+      // Это ЗАКОННАЯ конфигурация (read-only сервер), а не ошибка запуска.
+      handle = await startHttpMcpServer({ http: true, port: '0', watchAuto: false, root: [served] });
+
+      const read = await callTool(handle.port, 'federation_status', { directory: served });
+      expect(read.isError).toBeFalsy();
+
+      const write = await callTool(handle.port, 'record_decision', {
+        directory: served, title: 'x', rationale: 'y',
+      });
+      expect(write.isError).toBe(true);
+      expect(write.text).toMatch(/readable but not writable/);
+      expect(write.text).toMatch(/Writable roots: \(none\)/);
+      expect(existsSync(join(served, '.openlore')), 'read-only сервер что-то записал').toBe(false);
+    } finally {
+      process.chdir(prevCwd);
+      rmSync(served, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
   it('несуществующий корень — громкий отказ ЗАПУСКА, а не сюрприз на первом вызове', async () => {
     await expect(startHttpMcpServer({
       http: true, port: '0', watchAuto: false, root: ['/definitely/not/here/openlore'],

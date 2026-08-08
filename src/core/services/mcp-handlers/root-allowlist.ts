@@ -118,6 +118,17 @@ function withinAny(candidate: string, roots: string[]): boolean {
 }
 
 /**
+ * Containment by the SAME rule the perimeter uses (canonical on both sides), but
+ * usable BEFORE `configureRootAllowlist`: the caller has to decide the DEFAULT write
+ * root ("is my cwd inside the roots I am about to declare?") at a moment when the
+ * allowlist does not exist yet. Kept here so there is exactly one definition of
+ * "inside a root" — a second, subtly different one over in the CLI is how perimeters rot.
+ */
+export function isPathWithinRoots(candidate: string, roots: string[]): boolean {
+  return withinAny(canonical(candidate), roots.map(canonical));
+}
+
+/**
  * Declare the perimeter. Called ONCE, at MCP server start, before any request is
  * served. Fails loudly rather than degrading: a root that does not exist, or a
  * write root outside every read root, is an operator mistake that must surface at

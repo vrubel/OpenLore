@@ -14,6 +14,7 @@ import {
   assertRootAllowed,
   isRootAllowed,
   isRootAllowlistConfigured,
+  isPathWithinRoots,
   getRootAllowlist,
   toolAccessMode,
   WRITING_TOOLS,
@@ -171,6 +172,28 @@ describe('root allowlist — write confinement', () => {
     expect(isRootAllowed(allowed, 'read')).toBe(true);
     expect(isRootAllowed(allowed, 'write')).toBe(false);
     expect(isRootAllowed(outside, 'read')).toBe(false);
+  });
+});
+
+describe('isPathWithinRoots — the pre-configuration containment probe', () => {
+  // Used to decide the DEFAULT write root before the allowlist exists ("is my cwd
+  // inside the roots I am about to declare?"). It must answer by the SAME rule the
+  // perimeter later enforces, or the default and the enforcement would disagree.
+  it('answers containment against roots that are not yet declared', () => {
+    const nested = join(allowed, 'sub');
+    mkdirSync(nested, { recursive: true });
+    expect(isRootAllowlistConfigured()).toBe(false);
+    expect(isPathWithinRoots(allowed, [allowed])).toBe(true);
+    expect(isPathWithinRoots(nested, [allowed])).toBe(true);
+    expect(isPathWithinRoots(outside, [allowed])).toBe(false);
+    expect(isPathWithinRoots(outside, [allowed, outside])).toBe(true);
+    expect(isPathWithinRoots(allowed, [])).toBe(false);
+  });
+
+  it('resolves symlinks on both sides, like the perimeter does', () => {
+    const link = join(allowed, 'escape');
+    symlinkSync(outside, link);
+    expect(isPathWithinRoots(link, [allowed])).toBe(false);
   });
 });
 
