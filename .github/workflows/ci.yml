@@ -57,6 +57,29 @@ jobs:
       - name: Run tests
         run: npm run test:run
 
+      # The integration suite had never run in CI. `vitest.config.ts` excludes
+      # `*.integration.test.ts` and this job only ran `test:run`, so 18 files —
+      # the MCP transport conformance and e2e specs, the watcher, the analyzer
+      # regression suite — were collected by nobody. They were not slow or
+      # flaky; they were simply invisible. A gate that reports green over tests
+      # it does not execute is worse than no gate: it is a false witness, and it
+      # let real defects through review twice.
+      #
+      # Added as a STEP of this job rather than a fourth parallel job on
+      # purpose: this runner shares one workspace directory between concurrent
+      # jobs, and two `npm ci` starting in the same second have already
+      # deadlocked a run (2216). Sequential here costs ~45s and races nothing.
+      #
+      # live-data is excluded, and that exclusion is a decision, not an
+      # oversight: it clones third-party repositories over the network and
+      # asserts golden snapshots of their analysis, so it needs egress and a
+      # warm cache to be meaningful. It is ALSO currently failing on a real
+      # snapshot drift (java-commons-cli totalEdges 443 → 449) that predates
+      # this change and deserves its own fix rather than a silent skip here.
+      # Everything else in the suite passes.
+      - name: Run integration tests
+        run: npm run test:integration -- --exclude '**/live-data/**'
+
   build:
     name: Build
     runs-on: ubuntu-latest
