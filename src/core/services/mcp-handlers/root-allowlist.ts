@@ -124,6 +124,10 @@ class UncanonicalizablePath extends Error {}
  * its canonical parent plus the missing tail — inside the root, refused later by
  * `stat` for the honest reason. That case leaks nothing: it is already inside.
  */
+export function canonicalPath(p: string): string {
+  return canonical(p);
+}
+
 function canonical(p: string, depth = 0): string {
   if (depth > 40) throw new UncanonicalizablePath(`too many symlink hops resolving "${p}"`);
   const cur = resolve(p);
@@ -294,11 +298,21 @@ function denialMessage(requested: string, mode: RootAccessMode, state: RootAllow
  * perimeter has to stand at the second one. A config value is still caller input:
  * the config lives inside a root the agent can write.
  *
- * Returning the CANONICAL path is deliberate and is the fix for a TOCTOU window:
- * checking the canonical path and then handing back the lexical one lets every
- * subsequent syscall re-traverse the symlinks, so a link swapped inside your own
- * root after the check (an `analyze_codebase` run is minutes long) lands outside.
- * Callers must operate on what was actually approved.
+ * Returning the CANONICAL path is deliberate: handing back the lexical one leaves
+ * every later syscall re-traversing whatever the names point at now.
+ *
+ * IT IS NOT, HOWEVER, A FIX FOR TOCTOU — an earlier version of this comment said it
+ * was, and that was false. Node has no `openat`, so a write still re-walks the path
+ * by name; an attacker who swaps a component between this check and the syscall
+ * redirects the syscall. Demonstrated, not theorised: swapping `.openlore` for a
+ * symlink five seconds into an `analyze_codebase` run placed 5.7 MB of artifacts
+ * outside the root. What narrows it: `writeTarget` materializes the chain out of
+ * real, non-symlink directories, and the long-running writers (analyzer, watcher)
+ * RE-DERIVE their target instead of trusting one approval for a whole run. The
+ * residual window is a swap between the last resolution and the syscall.
+ *
+ * A false reassurance in a comment is worse than the hole it describes: the next
+ * reader stops checking.
  */
 export function assertPathAllowed(fsPath: string, mode: RootAccessMode = 'read'): string {
   if (!fsPath || typeof fsPath !== 'string') {

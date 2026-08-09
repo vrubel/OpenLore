@@ -26,6 +26,7 @@
 import { open, rename, stat, unlink, mkdir, access, readFile, link } from 'node:fs/promises';
 import { dirname, basename, join } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { isPathAllowed } from '../services/mcp-handlers/root-allowlist.js';
 
 /** Any persisted store that carries the monotonic CAS counter. */
 export interface SequencedStore {
@@ -189,6 +190,23 @@ async function exists(p: string): Promise<boolean> {
  * still degrades to empty, but loudly).
  */
 export async function quarantineCorrupt(path: string, reason: string): Promise<string | null> {
+  // Quarantine is a REPAIR performed on a READ, and it is destructive: link+unlink
+  // RENAMES the operator's file. It therefore needs write permission on a path the
+  // caller reached while merely reading — which is exactly how `orient` on a
+  // read-only root renamed `notes.json` to `notes.json.corrupt-0`. The gate belongs
+  // here, at the one primitive all six load-time branches of both stores share,
+  // rather than at six call sites someone will extend to seven.
+  //
+  // Note for anyone re-testing this: it only fires on a CORRUPT store, so a sweep
+  // over healthy fixtures reports "this tool never writes" and is wrong.
+  if (!isPathAllowed(path, 'write')) {
+    logger.warning(
+      `store quarantine SKIPPED: ${path} failed validation (${reason}), but this repository is outside ` +
+      `this server's write perimeter, so the file was left untouched. The store degrades to empty for ` +
+      `this call; nothing was renamed or lost.`,
+    );
+    return null;
+  }
   try {
     for (let n = 0; ; n++) {
       const dest = `${path}.corrupt-${n}`;

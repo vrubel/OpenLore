@@ -53,7 +53,7 @@ import type { SerializedCallGraph } from '../../analyzer/call-graph.js';
 import type { MappingArtifact } from '../../generator/mapping-generator.js';
 import { openloreAudit } from '../../../api/audit.js';
 import type { DriftResult } from '../../../types/index.js';
-import { openloreWriteTarget } from '../write-target.js';
+import { ensureWriteDir } from '../write-target.js';
 
 // ============================================================================
 // HANDLERS
@@ -73,7 +73,7 @@ export async function handleAnalyzeCodebase(
   // the granted root — with the startup banner still truthfully reporting the root as
   // the write perimeter. That is the ordinary PDLC isolated layout
   // (`scratch/.openlore -> ws/.openlore`), not a contrived escape.
-  const outputPath = openloreWriteTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
+  const outputPath = ensureWriteDir(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
 
   if (!force && await isCacheFresh(absDir)) {
     const ctx = await readCachedContext(absDir);

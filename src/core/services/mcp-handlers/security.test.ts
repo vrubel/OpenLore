@@ -6,7 +6,7 @@
  * tests for the argument-injection guards. Kept in a plain .test.ts so CI runs it.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { readFileSync, readdirSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync, existsSync, statSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +33,10 @@ import { handleWorkingSetContext } from './working-set.js';
 import { handleRecordDecision } from './decisions.js';
 import { handleRemember, handleRecall } from './memory.js';
 import { mutatePanicStateLocked } from './panic-response.js';
+import { writeTestFiles } from '../../test-generator/test-writer.js';
+import { openloreWriteTarget, ensureWriteDir } from '../write-target.js';
+import { loadMemoryStore } from '../../decisions/memory-store.js';
+import { loadDecisionStore } from '../../decisions/store.js';
 import { handleSpecStoreStatus } from './spec-store.js';
 import { EdgeStore } from '../edge-store.js';
 import { DatabaseSync } from 'node:sqlite';
@@ -1264,4 +1268,210 @@ describe('Root Allowlist — analyze_codebase does not write through a symlinked
       'the honest configuration must still produce an analysis',
     ).toBeGreaterThan(0);
   }, 120_000);
+});
+
+// ── safeJoin and a DANGLING symlink (generate_tests) ─────────────────────────
+//
+// `root-allowlist.canonicalPath` was hardened to follow a symlink even when its
+// target does not exist, and its header called that hole closed. `safeJoin` two
+// modules away kept its own copy — `realPathOrNearestExisting` — which on ENOENT
+// fell back to the nearest EXISTING ancestor, i.e. judged a dangling link by the
+// directory holding it instead of by where it points. A live link to a dir or a
+// file was refused; a DANGLING one walked through.
+//
+// Reachable: `generate_tests` is write-gated, but it publishes the filenames it
+// intends to write under `dryRun: true`. Learn a name, drop a dangling symlink
+// there, repeat with `dryRun: false`.
+describe('safeJoin — a dangling symlink is followed, not shrugged off', () => {
+  let root: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-dangle-root-')));
+    outside = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-dangle-out-')));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('refuses a dangling in-root link the same way it refuses a live one', () => {
+    const live = join(root, 'live');
+    symlinkSync(outside, live);                                   // live → dir
+    const deadTarget = join(outside, 'not-created-yet.ts');
+    const dead = join(root, 'dead.ts');
+    symlinkSync(deadTarget, dead);                                // DANGLING → file that does not exist
+
+    expect(() => safeJoin(root, 'live/x.ts')).toThrow(/escape|traversal/i);
+    expect(() => safeJoin(root, 'dead.ts'), 'dangling link walked through the guard').toThrow(/escape|traversal/i);
+  });
+
+  it('generate_tests does not write through a dangling symlink', async () => {
+    // The two-step the agent would run: learn the name, plant the link, write.
+    const outPath = 'tests/generated.spec.ts';
+    mkdirSync(join(root, 'tests'), { recursive: true });
+    const planted = join(outside, 'stolen.spec.ts');
+    symlinkSync(planted, join(root, outPath));                    // dangling: target absent
+
+    const res = await writeTestFiles({
+      files: [{ outputPath: outPath, content: 'PROBE-CONTENT', framework: 'vitest' }],
+      rootPath: root,
+      dryRun: false,
+      merge: false,
+    } as Parameters<typeof writeTestFiles>[0]);
+
+    expect(existsSync(planted), 'generate_tests wrote outside the root through a dangling link').toBe(false);
+    expect(res.written, 'the escaping write must be skipped, not performed').toBe(0);
+  });
+
+  it('an ordinary in-root path still gets written (no false lockout)', async () => {
+    mkdirSync(join(root, 'tests'), { recursive: true });
+    const res = await writeTestFiles({
+      files: [{ outputPath: 'tests/ok.spec.ts', content: 'FINE', framework: 'vitest' }],
+      rootPath: root,
+      dryRun: false,
+      merge: false,
+    } as Parameters<typeof writeTestFiles>[0]);
+    expect(res.written).toBe(1);
+    expect(readFileSync(join(root, 'tests', 'ok.spec.ts'), 'utf-8')).toContain('FINE');
+  });
+});
+
+// ── TOCTOU: swapping a component AFTER approval ──────────────────────────────
+//
+// The approval is one moment; the writes are many, and Node has no `openat`, so
+// each one re-walks the path by name. Demonstrated against the previous version:
+// replacing `.openlore` with a symlink five seconds into an `analyze_codebase` run
+// put 5.7 MB of artifacts (13 files) into a honeypot, and the call returned
+// success. The watcher was worse — approval happened once per PROCESS, so a swap
+// 30 seconds in redirected every later re-index for the lifetime of the server.
+//
+// What is asserted here is what is actually claimed: the approved path is built out
+// of REAL, non-symlink directories, and a component that turns into a symlink after
+// approval is REFUSED at the next derivation rather than followed. The residual
+// window — a swap between the final resolution and the syscall — is stated in
+// write-target.ts and is not claimed to be closed.
+describe('Root Allowlist — a component swapped after approval is refused, not followed', () => {
+  let root: string;
+  let honeypot: string;
+
+  beforeEach(() => {
+    root = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-toctou-root-')));
+    honeypot = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-toctou-pot-')));
+    configureRootAllowlist({ readRoots: [root], writeRoots: [root] });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(honeypot, { recursive: true, force: true });
+  });
+
+  it('ensureWriteDir builds the chain out of real directories, not mere names', () => {
+    // `writeTarget` stays PURE — deriving a path must not create anything (it also
+    // names files, and materializing there turned federation.json into a directory).
+    // The stronger form is opt-in, for callers that write into a directory over a
+    // long run: the analyzer and the watcher.
+    const target = ensureWriteDir(root, '.openlore', 'analysis');
+    for (const p of [join(root, '.openlore'), target]) {
+      expect(existsSync(p), `${p} was not materialized`).toBe(true);
+      expect(lstatSync(p).isSymbolicLink(), `${p} must be a real directory`).toBe(false);
+      expect(lstatSync(p).isDirectory()).toBe(true);
+    }
+  });
+
+  it('refuses re-derivation once a component has been swapped for a symlink', () => {
+    ensureWriteDir(root, '.openlore', 'analysis');      // approve + materialize
+    // …the swap the exploit performs mid-run.
+    rmSync(join(root, '.openlore'), { recursive: true, force: true });
+    symlinkSync(honeypot, join(root, '.openlore'));
+
+    expect(() => ensureWriteDir(root, '.openlore', 'analysis'),
+      're-derivation followed a swapped component instead of refusing').toThrow(/Root allowlist/);
+    expect(readdirSync(honeypot), 'the honeypot received a write').toEqual([]);
+  });
+
+  it('analyze_codebase re-derives, so a mid-run swap does not silently redirect it', async () => {
+    writeFileSync(join(root, 'a.ts'), 'export const a = 1;\n', 'utf-8');
+    await handleAnalyzeCodebase(root, true);            // first run: legitimate
+
+    rmSync(join(root, '.openlore'), { recursive: true, force: true });
+    symlinkSync(honeypot, join(root, '.openlore'));
+
+    const res = await handleAnalyzeCodebase(root, true).catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(res)).toMatch(/Root allowlist/);
+    expect(readdirSync(honeypot), 'analysis artifacts landed in the honeypot').toEqual([]);
+  }, 120_000);
+});
+
+// ── Repair-on-read: `orient` renamed a file on a READ-ONLY root ──────────────
+//
+// The chain writes through a helper two modules away, and only on a CORRUPT input:
+//   orient → loadMemoryStore → (invalid JSON) → quarantineCorrupt → link()+unlink()
+// so `notes.json` became `notes.json.corrupt-0` on a root granted for reading only,
+// with no refusal, no isError and nothing in stderr.
+//
+// Two lessons are baked into this test. First, the write is reached through a
+// helper, which is exactly the shape the census cannot see. Second — and this is why
+// an earlier sweep of all 20 tools reported "no writes" — it only happens when the
+// store is INVALID: a negative result over healthy fixtures proves nothing here.
+describe('Root Allowlist — repairing a corrupt store is a WRITE, and needs the write perimeter', () => {
+  let readOnly: string;
+  let writable: string;
+
+  const plantCorruptStores = (root: string): { notes: string; decisions: string } => {
+    const mem = join(root, '.openlore', 'memory');
+    const dec = join(root, '.openlore', 'decisions');
+    mkdirSync(mem, { recursive: true });
+    mkdirSync(dec, { recursive: true });
+    const notes = join(mem, 'notes.json');
+    const decisions = join(dec, 'pending.json');
+    writeFileSync(notes, '{ this is not valid json', 'utf-8');
+    writeFileSync(decisions, '{ neither is this', 'utf-8');
+    return { notes, decisions };
+  };
+
+  beforeEach(() => {
+    readOnly = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-quar-ro-')));
+    writable = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-quar-rw-')));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(readOnly, { recursive: true, force: true });
+    rmSync(writable, { recursive: true, force: true });
+  });
+
+  it('loading a corrupt store on a read-only root renames nothing', async () => {
+    const { notes, decisions } = plantCorruptStores(readOnly);
+    configureRootAllowlist({ readRoots: [readOnly, writable], writeRoots: [writable] });
+
+    // Straight at the loaders. `orient` is one CALLER of these (orient.ts:491), but
+    // it returns early on a repository with no analysis, so driving the exploit
+    // through orient alone makes the test pass for the wrong reason — it did, until
+    // the mutation check caught the vacuity.
+    await loadMemoryStore(readOnly);
+    await loadDecisionStore(readOnly);
+    await handleOrient(readOnly, 'anything');
+
+    expect(existsSync(notes), 'notes.json was renamed on a read-only root').toBe(true);
+    expect(existsSync(decisions), 'pending.json was renamed on a read-only root').toBe(true);
+    expect(
+      readdirSync(join(readOnly, '.openlore', 'memory')).filter(f => f.includes('corrupt')),
+      'a .corrupt-N file was created on a read-only root',
+    ).toEqual([]);
+    expect(
+      readdirSync(join(readOnly, '.openlore', 'decisions')).filter(f => f.includes('corrupt')),
+    ).toEqual([]);
+  }, 60_000);
+
+  it('quarantine still happens on a WRITABLE root (the repair is not simply disabled)', async () => {
+    const { notes } = plantCorruptStores(writable);
+    configureRootAllowlist({ readRoots: [writable], writeRoots: [writable] });
+
+    await loadMemoryStore(writable);
+
+    expect(existsSync(notes), 'the corrupt file should have been moved aside').toBe(false);
+    expect(
+      readdirSync(join(writable, '.openlore', 'memory')).filter(f => f.includes('corrupt')).length,
+    ).toBeGreaterThan(0);
+  }, 60_000);
 });

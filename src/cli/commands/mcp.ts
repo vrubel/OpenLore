@@ -23,7 +23,7 @@ const _pkgVersion = (_require('../../../package.json') as { version: string }).v
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { join, resolve as nodeResolve } from 'node:path';
 
 import { Command } from 'commander';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -1890,7 +1890,7 @@ function applyRootAllowlist(options: McpServerOptions): void {
   // watched directory joins the roots when they are implicit, and must be inside
   // them when they were given explicitly (an operator who names both and means two
   // different places has made a mistake worth hearing about at startup).
-  const watchDir = options.watch ? resolve(options.watch) : null;
+  const watchDir = options.watch ? nodeResolve(options.watch) : null;
   const explicitRead = options.root && options.root.length > 0 ? options.root : null;
   if (explicitRead && watchDir && !isPathWithinRoots(watchDir, explicitRead)) {
     throw new Error(
@@ -2336,6 +2336,21 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
 /** Запустить watcher для явного --watch <dir> (общий для stdio/http). watch-auto живёт в самом сервере. */
 async function maybeStartWatcher(options: McpServerOptions): Promise<void> {
   if (!options.watch) return;
+  // The watcher's constructor derives its output dir through the perimeter and
+  // THROWS when it cannot. Unhandled, that killed the server: on stdio a raw stack
+  // and exit 1, on HTTP the same but AFTER listen() — a client saw an open port
+  // answering `initialize`, then a dead transport. A refusal has to read as an
+  // instruction to the operator, not as a crash.
+  const watchProbe = nodeResolve(options.watch);
+  if (!isPathAllowed(join(watchProbe, '.openlore'), 'write')) {
+    throw new Error(
+      `openlore mcp --watch ${watchProbe}: вотчер пишет индекс в ${join(watchProbe, '.openlore', 'analysis')}, ` +
+      'а этот путь вне корней ЗАПИСИ сервера. Обычная причина — раскладка, где `.openlore` внутри ' +
+      'наблюдаемого каталога является симлинком на другой репозиторий: тогда в периметр нужно ввести и ' +
+      'цель ссылки, например `--root <куда указывает .openlore> --write-root <туда же>`. ' +
+      'Либо уберите --watch.'
+    );
+  }
   const { resolve } = await import('node:path');
   const watchDir = resolve(options.watch);
   // Don't start a second watcher when a daemon is already watching this

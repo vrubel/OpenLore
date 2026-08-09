@@ -6,13 +6,12 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
-  OPENLORE_DIR,
   OPENLORE_DECISIONS_SUBDIR,
   DECISIONS_PENDING_FILE,
 } from '../../constants.js';
 import { fileExists } from '../../utils/command-helpers.js';
 import { atomicWriteFile, casUpdate, quarantineCorrupt } from './atomic-store.js';
-import { openloreWriteTarget } from '../services/write-target.js';
+import { openloreReadTarget, openloreWriteTarget } from '../services/write-target.js';
 import type { PendingDecision, DecisionStore, DecisionStatus } from '../../types/index.js';
 
 /**
@@ -23,7 +22,7 @@ import type { PendingDecision, DecisionStore, DecisionStatus } from '../../types
  * the granted root. Reads keep the lexical path: they are gated at the door.
  */
 export function decisionsDir(rootPath: string): string {
-  return join(rootPath, OPENLORE_DIR, OPENLORE_DECISIONS_SUBDIR);
+  return openloreReadTarget(rootPath, OPENLORE_DECISIONS_SUBDIR);
 }
 
 /** Write-side twin of {@link decisionsDir}: canonical and perimeter-approved. */

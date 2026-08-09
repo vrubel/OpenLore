@@ -4,8 +4,7 @@
 
 import { createHash } from 'node:crypto';
 import { readFile, readdir, stat } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
-import { dirname, extname, join, relative, resolve, sep } from 'node:path';
+import { extname, join, relative, resolve, sep } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
 import { MAX_STRING_LENGTH } from '../../analyzer/artifact-json.js';
 import { EdgeStore } from '../edge-store.js';
@@ -71,7 +70,7 @@ export function attachCallGraph(ctx: CachedContext, store: EdgeStore | undefined
 import { logger } from '../../../utils/logger.js';
 import { emit } from '../telemetry.js';
 import { redactSecretString } from '../secret-redaction.js';
-import { assertRootAllowed } from './root-allowlist.js';
+import { assertRootAllowed, canonicalPath } from './root-allowlist.js';
 import { openEdgeStoreForPerimeter } from '../edge-store-access.js';
 
 /**
@@ -149,24 +148,13 @@ export function sanitizeMcpError(err: unknown, format: 'string' | 'json' = 'stri
   return sanitized;
 }
 
-/**
- * The canonical (symlink-resolved) path of `p`, or — when `p` does not exist (a
- * write target) — the canonical path of its nearest existing ancestor. Used to
- * confine on the REAL filesystem location rather than the lexical path.
- */
-function realPathOrNearestExisting(p: string): string {
-  let cur = p;
-  for (;;) {
-    try {
-      return realpathSync(cur);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-      const parent = dirname(cur);
-      if (parent === cur) return cur; // reached filesystem root
-      cur = parent;
-    }
-  }
-}
+// `realPathOrNearestExisting` used to live here: on ENOENT it fell back to the
+// nearest EXISTING ancestor, so a DANGLING symlink was judged by the directory that
+// contains it rather than by where it points. `root-allowlist.canonicalPath` had
+// already been hardened against exactly that (it follows the link even when the
+// target does not exist) and its header called the hole closed — while this copy,
+// two modules away, still had it. Two canonicalizers, one hardened, one not, is how
+// the unhardened one gets forgotten: there is now one.
 
 /**
  * Resolve a user-supplied relative file path against a validated project root and
@@ -182,18 +170,25 @@ export function safeJoin(absDir: string, filePath: string): string {
   if (!resolved.startsWith(absDir + sep) && resolved !== absDir) {
     throw new Error(`Path traversal blocked: "${filePath}" resolves outside project directory`);
   }
-  // Canonical (symlink-aware) confinement. realpath the root (it exists — it was
-  // validated) and the target's real location; reject if the real target escapes.
+  // Canonical (symlink-aware) confinement, including DANGLING links: `generate_tests`
+  // is a write-gated tool that publishes its filenames under `dryRun: true`, so an
+  // agent can learn a name, drop a dangling symlink there, and repeat with
+  // `dryRun: false` — the target does not exist at check time, which is precisely
+  // the case the old fallback waved through.
+  let realRoot: string;
+  let realTarget: string;
   try {
-    const realRoot = realpathSync(absDir);
-    const realTarget = realPathOrNearestExisting(resolved);
-    if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) {
-      throw new Error(`Path escape blocked: "${filePath}" canonicalizes outside the project directory`);
-    }
+    realRoot = canonicalPath(absDir);
+    realTarget = canonicalPath(resolved);
   } catch (err) {
-    // A "Path escape blocked" error must propagate; only swallow realpath I/O errors
-    // on the root itself (which would be unexpected for a validated root).
-    if (err instanceof Error && err.message.startsWith('Path escape blocked')) throw err;
+    // Fail CLOSED: a path we cannot canonicalize is one we cannot vouch for.
+    throw new Error(
+      `Path escape blocked: "${filePath}" could not be canonicalized ` +
+      `(${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) {
+    throw new Error(`Path escape blocked: "${filePath}" canonicalizes outside the project directory`);
   }
   return resolved;
 }
