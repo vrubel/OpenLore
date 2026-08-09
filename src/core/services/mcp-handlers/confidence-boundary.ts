@@ -18,9 +18,10 @@
 
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { extname } from 'node:path';
 import { promisify } from 'node:util';
-import { ARTIFACT_FINGERPRINT, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR } from '../../../constants.js';
+import { ARTIFACT_FINGERPRINT, OPENLORE_ANALYSIS_SUBDIR } from '../../../constants.js';
+import { openloreReadTarget } from '../write-target.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -199,7 +200,7 @@ export function buildStalenessMarker(indexCommit: string | null, changedSourceFi
 /** Read the build commit the index was analyzed at, if it was captured. */
 async function readBuildCommit(absDir: string): Promise<string | null> {
   try {
-    const raw = await readFile(join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT), 'utf-8');
+    const raw = await readFile(openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT), 'utf-8');
     const fp = JSON.parse(raw) as { commit?: string | null };
     return fp.commit ?? null;
   } catch {

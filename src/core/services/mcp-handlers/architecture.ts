@@ -10,24 +10,20 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import {
-  OPENLORE_DIR,
-  OPENLORE_ANALYSIS_SUBDIR,
-  ARTIFACT_DEPENDENCY_GRAPH,
-} from '../../../constants.js';
+import { OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH,  } from '../../../constants.js';
 import { validateDirectory } from './utils.js';
 import { loadArchitectureRules } from '../../architecture/rules.js';
 import type { ArchitectureRule } from '../../architecture/rules.js';
 import { scanViolations, canImport } from '../../architecture/check.js';
 import type { DependencyGraphResult } from '../../analyzer/dependency-graph.js';
+import { openloreReadTarget } from '../write-target.js';
 
 const VIOLATION_REPORT_CAP = 200;
 
 async function loadDepGraph(absDir: string): Promise<DependencyGraphResult | null> {
   try {
     const raw = await readFile(
-      join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH),
+      openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH),
       'utf-8',
     );
     return JSON.parse(raw) as DependencyGraphResult;

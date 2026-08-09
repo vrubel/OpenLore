@@ -940,8 +940,9 @@ export async function computeImpactCertificate(
       // write-target.ts: a withheld write obliges the caller to SAY it degraded.
       if (isPerimeterRefusal(err)) {
         caveats.push(
-          'This certificate was NOT persisted: the repository is outside this server\'s write ' +
-          'perimeter, so the decay re-check on a later run will not find it.'
+          'This certificate was NOT persisted: its storage location is outside this server\'s write ' +
+          'perimeter, so the decay re-check on a later run will not find it. (The repository itself may ' +
+          'well be inside the perimeter — it is where `.openlore` actually leads that was refused.)'
         );
         cert.headline = renderHeadline(cert);
       }

@@ -149,8 +149,13 @@ export function writeTarget(absDir: string, ...segments: string[]): string {
     // The round that moved the perimeter INWARD did not move the audit with it: the
     // door refusal printed to stderr, this one printed nowhere. An escape attempt
     // that gets further into the code should be more visible, not less.
+    // The RESOLVED location, not the lexical one: `<root>/.openlore/x` says nothing
+    // when `.openlore` is the link that carries the write out — the operator needs to
+    // see where it would actually have landed.
+    let resolved = target;
+    try { resolved = canonicalPath(target); } catch { /* unresolvable — show the lexical form */ }
     process.stderr.write(
-      `openlore MCP: отказ периметра на записи — "${target}" (каталог "${absDir}")\n`
+      `openlore MCP: отказ периметра на записи — "${target}" → "${resolved}" (каталог "${absDir}")\n`
     );
     throw err;
   }
@@ -166,8 +171,19 @@ export function writeTarget(absDir: string, ...segments: string[]): string {
  */
 export function tryWriteTarget(absDir: string, ...segments: string[]): string | null {
   const p = join(absDir, ...segments);
-  return isPathAllowed(p, 'write') ? assertPathAllowed(p, 'write') : null;
+  if (isPathAllowed(p, 'write')) return assertPathAllowed(p, 'write');
+  // Say it. The rule at the top of this file obliges a withheld write to be audible,
+  // and this path — telemetry, panic state — was the one place still returning null
+  // in silence. Once per target, so a hot loop cannot turn the log into noise.
+  if (!_degradedOnce.has(p)) {
+    _degradedOnce.add(p);
+    process.stderr.write(`openlore MCP: запись пропущена (вне корней записи) — "${p}"\n`);
+  }
+  return null;
 }
+
+/** Targets already reported as skipped, so a hot path logs once, not per call. */
+const _degradedOnce = new Set<string>();
 
 /** {@link writeTarget} rooted at the project's `.openlore/` tree. */
 export function openloreWriteTarget(absDir: string, ...segments: string[]): string {

@@ -9,40 +9,14 @@ import { validateDirectory, readCachedContext } from './utils.js';
 import { resolveFederationScope, findCrossRepoConsumersBatch } from '../../federation/resolver.js';
 import type { CachedContext } from './utils.js';
 import { join } from 'node:path';
-import {
-  RISK_SCORE_FAN_IN_WEIGHT,
-  RISK_SCORE_FAN_OUT_WEIGHT,
-  RISK_SCORE_HUB_BONUS,
-  RISK_SCORE_BLAST_RADIUS_WEIGHT,
-  RISK_SCORE_LOW_THRESHOLD,
-  RISK_SCORE_MEDIUM_THRESHOLD,
-  GOD_FUNCTION_FAN_OUT_THRESHOLD,
-  REFACTOR_SRP_FAN_OUT_THRESHOLD,
-  LOW_RISK_MAX_FAN_IN,
-  LOW_RISK_MAX_FAN_OUT,
-  CRITICAL_HUBS_DEFAULT_MIN_FAN_IN,
-  SUBGRAPH_DEFAULT_MAX_DEPTH,
-  SUBGRAPH_MAX_DEPTH_LIMIT,
-  CRITICALITY_FAN_IN_WEIGHT,
-  CRITICALITY_FAN_OUT_WEIGHT,
-  CRITICALITY_VIOLATION_BONUS,
-  STABILITY_SCORE_CAN_REFACTOR,
-  STABILITY_SCORE_STABILISE_FIRST,
-  LOW_RISK_REFACTOR_CANDIDATES_DEFAULT_LIMIT,
-  LEAF_FUNCTIONS_DEFAULT_LIMIT,
-  HUB_HIGH_FAN_IN_THRESHOLD,
-  HUB_HIGH_FAN_OUT_THRESHOLD,
-  OPENLORE_DIR,
-  OPENLORE_ANALYSIS_SUBDIR,
-  TRACE_PATH_DEFAULT_MAX_DEPTH,
-  TRACE_PATH_MAX_PATHS,
-} from '../../../constants.js';
+import { RISK_SCORE_FAN_IN_WEIGHT, RISK_SCORE_FAN_OUT_WEIGHT, RISK_SCORE_HUB_BONUS, RISK_SCORE_BLAST_RADIUS_WEIGHT, RISK_SCORE_LOW_THRESHOLD, RISK_SCORE_MEDIUM_THRESHOLD, GOD_FUNCTION_FAN_OUT_THRESHOLD, REFACTOR_SRP_FAN_OUT_THRESHOLD, LOW_RISK_MAX_FAN_IN, LOW_RISK_MAX_FAN_OUT, CRITICAL_HUBS_DEFAULT_MIN_FAN_IN, SUBGRAPH_DEFAULT_MAX_DEPTH, SUBGRAPH_MAX_DEPTH_LIMIT, CRITICALITY_FAN_IN_WEIGHT, CRITICALITY_FAN_OUT_WEIGHT, CRITICALITY_VIOLATION_BONUS, STABILITY_SCORE_CAN_REFACTOR, STABILITY_SCORE_STABILISE_FIRST, LOW_RISK_REFACTOR_CANDIDATES_DEFAULT_LIMIT, LEAF_FUNCTIONS_DEFAULT_LIMIT, HUB_HIGH_FAN_IN_THRESHOLD, HUB_HIGH_FAN_OUT_THRESHOLD, OPENLORE_ANALYSIS_SUBDIR, TRACE_PATH_DEFAULT_MAX_DEPTH, TRACE_PATH_MAX_PATHS,  } from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode } from '../../analyzer/call-graph.js';
 import { callDistance } from '../../analyzer/call-graph.js';
 import type { DecisionNode } from '../../decisions/project.js';
 import { isIacLanguage } from '../../analyzer/iac/types.js';
 import { getFileGodFunctions, extractSubgraph } from '../../analyzer/subgraph-extractor.js';
 import { readOpenLoreConfig } from '../config-manager.js';
+import { openloreReadTarget } from '../write-target.js';
 import {
   assembleBoundary,
   buildPairEdgeIndex,
@@ -406,7 +380,7 @@ export async function handleGetSubgraph(
     try {
       const { VectorIndex } = await import('../../analyzer/vector-index.js');
       const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
-      const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+      const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
       if (VectorIndex.exists(outputDir)) {
         let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
@@ -568,7 +542,7 @@ export async function handleAnalyzeImpact(
     try {
       const { VectorIndex } = await import('../../analyzer/vector-index.js');
       const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
-      const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+      const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
       if (VectorIndex.exists(outputDir)) {
         let embedSvc: InstanceType<typeof EmbeddingService> | null = null;

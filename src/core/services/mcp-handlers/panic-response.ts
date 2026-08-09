@@ -257,6 +257,8 @@ export function casWritePanicState(
   state: PanicState,
   maxAttempts: number = LOCK_MAX_ATTEMPTS,
 ): boolean {
+  // Same form as F1: derive through the perimeter rather than lexically, even inside
+  // a section the gate has already opened.
   return withPanicStateLock(directory, () => {
     const path = join(directory, OPENLORE_DIR, PANIC_STATE_FILE);
     let currentRevision = 0;

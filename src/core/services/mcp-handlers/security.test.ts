@@ -34,7 +34,7 @@ import { handleRecordDecision } from './decisions.js';
 import { handleRemember, handleRecall } from './memory.js';
 import { mutatePanicStateLocked } from './panic-response.js';
 import { writeTestFiles } from '../../test-generator/test-writer.js';
-import { openloreWriteTarget, ensureWriteDir } from '../write-target.js';
+import { ensureWriteDir } from '../write-target.js';
 import { loadMemoryStore } from '../../decisions/memory-store.js';
 import { loadDecisionStore } from '../../decisions/store.js';
 import { handleSpecStoreStatus } from './spec-store.js';

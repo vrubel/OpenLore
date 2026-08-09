@@ -210,23 +210,6 @@ const EXEMPT: Record<string, string> = {
   'utils/shutdown.ts': 'Shutdown state file for the process that owns the directory.',
 };
 
-/**
- * Handlers that join `.openlore` but never write — they locate an index and READ it
- * (`VectorIndex.exists`, `readCachedContext`, a fingerprint). Listing them is not a
- * judgement call: the test below re-derives "this module calls no write primitive"
- * from the source and fails if that stops being true, so an entry here cannot
- * quietly become a writer.
- */
-const OPENLORE_JOIN_READERS: Record<string, string> = {
-  'core/services/mcp-handlers/architecture.ts': 'Reads the analysis artifacts for the overview.',
-  'core/services/mcp-handlers/claim-verification.ts': 'Locates the index to verify a claim against it.',
-  'core/services/mcp-handlers/confidence-boundary.ts': 'Reads fingerprint.json to judge staleness.',
-  'core/services/mcp-handlers/graph.ts': 'Locates the vector index for semantic expansion (read).',
-  'core/services/mcp-handlers/orient.ts': 'Reads analysis + vector index to orient.',
-  'core/services/mcp-handlers/reachability.ts': 'Reads the graph to compute reachability.',
-  'core/services/mcp-handlers/semantic.ts': 'Locates the vector index for search (read).',
-};
-
 /** Import specifiers that count as "this module consults the perimeter". */
 const GATE_IMPORTS = ['write-target', 'edge-store-access', 'root-allowlist'];
 
@@ -236,8 +219,11 @@ const GATE_IMPORTS = ['write-target', 'edge-store-access', 'root-allowlist'];
  * list itself as perimeter-gated merely by mentioning `root-allowlist` in prose.
  */
 function importsGuard(src: string): boolean {
+  // Comments stripped (a mention in prose is not an import) and `import type`
+  // rejected (a type-only import is erased at build time and gates nothing).
+  const bare = code(src);
   return GATE_IMPORTS.some(g =>
-    new RegExp(`(?:import|require)[^;\n]*['"][^'"]*${g}(?:\\.js)?['"]`).test(src));
+    new RegExp(`(?:import|require)\\s+(?!type\\s)[^;\n]*['"][^'"]*${g}(?:\\.js)?['"]`).test(bare));
 }
 
 function sourceFiles(dir: string): string[] {
@@ -247,7 +233,7 @@ function sourceFiles(dir: string): string[] {
     if (entry.isDirectory()) {
       if (entry.name === 'node_modules' || entry.name === 'pi') continue;  // src/pi is out of scope (see vitest.config)
       out.push(...sourceFiles(p));
-    } else if (/\.(ts|js|mjs|cjs)$/.test(entry.name) && !entry.name.includes('.test.')) {
+    } else if (/\.(ts|mts|cts|js|mjs|cjs)$/.test(entry.name) && !entry.name.includes('.test.')) {
       out.push(p);
     }
   }
@@ -274,6 +260,12 @@ describe('Write-Site Census Gate', () => {
     }
     for (const m of src.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*[;,\n]/g)) {
       if (WRITE_PRIMITIVES.includes(m[2])) found.add(`${m[2]} aliased as ${m[1]}`);
+    }
+    // `const { writeFileSync: putBytes } = await import('node:fs')` — destructuring
+    // with rename. Neither the import-alias regex nor the variable-alias regex saw
+    // it, and a probe planted this way passed the census green.
+    for (const m of src.matchAll(/\{[^{}]*?\b([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)[^{}]*?\}\s*=/g)) {
+      if (WRITE_PRIMITIVES.includes(m[1])) found.add(`${m[1]} destructured as ${m[2]}`);
     }
     for (const m of src.matchAll(WRITE_RE)) {
       const prim = m[0].replace(/\s*\($/, '').replace(/^[^A-Za-z]+/, '').trim();
@@ -323,15 +315,6 @@ describe('Write-Site Census Gate', () => {
     expect(bad, `exemption without a checkable reason:\n  ${bad.join('\n  ')}`).toEqual([]);
   });
 
-  it('no read-only-join entry has quietly become a writer', () => {
-    const nowWriting = Object.keys(OPENLORE_JOIN_READERS).filter(f => writers.has(f)).sort();
-    expect(
-      nowWriting,
-      'listed as joining .openlore only to READ, but now calls a write primitive — ' +
-      `route it through openloreWriteTarget: ${nowWriting.join(', ')}`,
-    ).toEqual([]);
-  });
-
   it('the exemption list has no stale entries (a module that no longer writes)', () => {
     // Only EXEMPT is checked: an exemption is a standing claim that THIS module
     // writes without a gate, and it must expire when that stops being true.
@@ -344,11 +327,19 @@ describe('Write-Site Census Gate', () => {
     expect(stale, `registered as a writer but writes nothing any more — drop it: ${stale.join(', ')}`).toEqual([]);
   });
 
-  it('no MCP handler builds an .openlore write path with a bare join', () => {
+  it('no MCP handler builds an .openlore path with a bare join — read or write', () => {
     // The exact shape every round of this review kept re-discovering. Handlers are
     // the MCP-reachable surface; they must go through the helper.
     //
-    // This check deliberately does NOT skip EXEMPT modules any more. It used to, and
+    // Nor does it exempt "this module only READS". That exemption existed, it was
+    // re-derived from the source and it was still a blindspot: `orient` joined
+    // `.openlore` to read, handed the path to a store loader, and the loader renamed
+    // the operator's file when the JSON was corrupt. "Reads only" is a claim about
+    // THIS module, and the write happened one module over. There is now a read-side
+    // helper (`openloreReadTarget`), so every `.openlore` derivation — read or write —
+    // goes through the perimeter and the exemption has nothing left to justify.
+    //
+    // This check deliberately does NOT skip EXEMPT modules either. It used to, and
     // that is how `analyze_codebase` shipped writing 14 artifacts through a symlinked
     // `.openlore`: the module carried an exemption whose stated reason ("writes only
     // into an os.tmpdir() mkdtemp") was untrue of the line that mattered, and the
@@ -360,22 +351,29 @@ describe('Write-Site Census Gate', () => {
     // hands it to someone else to write would never have been looked at. The limit of
     // this gate should be "you edited the gate", not "you split the write across two
     // files".
+    // Scope is no longer just `mcp-handlers/`: the watcher, the decision stores, the
+    // federation registry and the generators all derive `.openlore` paths too, and
+    // limiting the sweep to one directory was another way of not looking.
+    // `cli/commands/` is deliberately NOT swept: a CLI process declares no perimeter
+    // (the documented boundary), so a bare join there is correct, not a defect. Those
+    // modules are classified in EXEMPT above with that reason.
+    const SWEPT = ['core/services/', 'core/decisions/', 'core/federation/', 'core/generator/'];
     const handlerFiles = files
       .map(f => relative(SRC, f).split(sep).join('/'))
-      .filter(rel => rel.startsWith('core/services/mcp-handlers/'))
+      .filter(rel => SWEPT.some(d => rel.startsWith(d)))
       .sort();
     expect(handlerFiles.length, 'handler sweep collected nothing — the scan is broken').toBeGreaterThan(20);
 
     const offenders: string[] = [];
     for (const rel of handlerFiles) {
       const src = code(readFileSync(join(SRC, rel), 'utf-8'));
-      const joinsOpenlore = /join\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*(OPENLORE_DIR|['"]\.openlore['"])/.test(src);
+      // `join(o.rootPath, …)`, `resolve(dir, '.openlore')` and a template literal are
+      // all the same derivation; matching only `join(<identifier>, OPENLORE_DIR` let
+      // each of the others through.
+      const joinsOpenlore =
+        /(?:join|resolve)\s*\(\s*[^,)]+,\s*(?:OPENLORE_DIR|['"]\.openlore['"])/.test(src)
+        || /`[^`]*\$\{[^}]*\}\/\.openlore/.test(src);
       if (!joinsOpenlore || importsGuard(src)) continue;
-      // A bare join is fine in a module that writes NOTHING — it is locating
-      // something to read. That claim is re-derived here from the source, not taken
-      // on trust: if such a module ever gains a write primitive, it drops out of
-      // this branch and is reported.
-      if (rel in OPENLORE_JOIN_READERS && !writers.has(rel)) continue;
       offenders.push(rel);
     }
     expect(offenders, `bare join(dir, '.openlore', …) on a write path: ${offenders.join(', ')}`).toEqual([]);

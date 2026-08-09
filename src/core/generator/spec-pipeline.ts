@@ -25,6 +25,7 @@ import { runStage5 } from './stages/stage5-architecture.js';
 import { runStage6 } from './stages/stage6-adr.js';
 import { PROMPTS } from './prompts.js';
 import { SUBSPEC_SCHEMA } from './schemas.js';
+import { openloreReadTarget } from '../services/write-target.js';
 import type {
   ProjectSurveyResult,
   ExtractedEntity,
@@ -829,7 +830,7 @@ export class SpecGenerationPipeline implements PipelineContext {
       // This ensures that running `openlore analyze` followed by `openlore generate`
       // always re-runs the pipeline rather than serving stale LLM results.
       if (this.options.rootPath) {
-        const analysisFile = join(this.options.rootPath, '.openlore', 'analysis', 'llm-context.json');
+        const analysisFile = openloreReadTarget(this.options.rootPath, 'analysis', 'llm-context.json');
         try {
           const [stageStat, analysisStat] = await Promise.all([stat(filepath), stat(analysisFile)]);
           if (analysisStat.mtimeMs > stageStat.mtimeMs) {

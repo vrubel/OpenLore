@@ -8,7 +8,7 @@ import { extname, join, relative, resolve, sep } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
 import { MAX_STRING_LENGTH } from '../../analyzer/artifact-json.js';
 import { EdgeStore } from '../edge-store.js';
-import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR, OPENSPEC_DIR } from '../../../constants.js';
+import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENSPEC_DIR } from '../../../constants.js';
 
 /** LLMContext with optional SQLite edge store attached (present when call-graph.db exists). */
 export type CachedContext = LLMContext & {
@@ -72,6 +72,7 @@ import { emit } from '../telemetry.js';
 import { redactSecretString } from '../secret-redaction.js';
 import { assertRootAllowed, canonicalPath } from './root-allowlist.js';
 import { openEdgeStoreForPerimeter } from '../edge-store-access.js';
+import { openloreReadTarget } from '../write-target.js';
 
 /**
  * Resolve and validate a caller-supplied project root.
@@ -278,7 +279,7 @@ export function _resetContextCacheForTesting(): void {
  *     differs from this entry → next read MISSes and re-reads disk → correct.
  */
 export async function primeContextCache(directory: string, ctx: CachedContext): Promise<void> {
-  const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const analysisDir = openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR);
   const filePath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
   let mtime: number;
   try {
@@ -295,7 +296,7 @@ export async function primeContextCache(directory: string, ctx: CachedContext): 
 }
 
 export async function readCachedContext(directory: string, timeout?: number): Promise<CachedContext | null> {
-  const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const analysisDir = openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR);
   const filePath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
 
   async function load(): Promise<CachedContext | null> {
@@ -550,7 +551,7 @@ export async function computeProjectFingerprint(rootDir: string): Promise<string
  * Uses content-hash fingerprint when available; falls back to TTL check.
  */
 export async function isCacheFresh(directory: string): Promise<boolean> {
-  const fingerprintPath = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT);
+  const fingerprintPath = openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT);
   try {
     const stored = JSON.parse(await readFile(fingerprintPath, 'utf-8')) as { hash: string };
     const current = await computeProjectFingerprint(directory);
@@ -558,7 +559,7 @@ export async function isCacheFresh(directory: string): Promise<boolean> {
   } catch {
     // No fingerprint yet — fall back to TTL
     try {
-      const s = await stat(join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT));
+      const s = await stat(openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT));
       return Date.now() - s.mtimeMs < ANALYSIS_STALE_THRESHOLD_MS;
     } catch {
       return false;
