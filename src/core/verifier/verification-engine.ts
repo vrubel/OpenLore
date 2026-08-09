@@ -8,7 +8,8 @@
 import { readFile, writeFile, mkdir, access, readdir } from 'node:fs/promises';
 import { join, basename, relative } from 'node:path';
 import logger from '../../utils/logger.js';
-import { VERIFICATION_PREDICTION_MAX_TOKENS } from '../../constants.js';
+import { VERIFICATION_PREDICTION_MAX_TOKENS, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING } from '../../constants.js';
+import { openloreReadTarget } from '../services/write-target.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { DependencyGraphResult, DependencyNode } from '../analyzer/dependency-graph.js';
 import { ImportExportParser } from '../analyzer/import-parser.js';
@@ -299,7 +300,9 @@ export class SpecVerificationEngine {
    */
   private async loadFileDomainMap(): Promise<void> {
     this.fileDomainMap = new Map();
-    const mappingPath = join(this.options.rootPath, '.openlore', 'analysis', 'mapping.json');
+    // Through the perimeter: a symlinked `<root>/.openlore` made this map — and so
+    // the verdict built on it — describe a different repository.
+    const mappingPath = openloreReadTarget(this.options.rootPath, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING);
     try {
       const raw = await readFile(mappingPath, 'utf-8');
       const data = JSON.parse(raw) as {

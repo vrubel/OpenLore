@@ -8,7 +8,7 @@ import { extname, join, relative, resolve, sep } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
 import { MAX_STRING_LENGTH } from '../../analyzer/artifact-json.js';
 import { EdgeStore } from '../edge-store.js';
-import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENSPEC_DIR } from '../../../constants.js';
+import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, ARTIFACT_MAPPING, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENSPEC_DIR } from '../../../constants.js';
 
 /** LLMContext with optional SQLite edge store attached (present when call-graph.db exists). */
 export type CachedContext = LLMContext & {
@@ -600,8 +600,13 @@ export async function loadMappingIndex(absDir: string, retryCount: number = 1): 
   }
   
   const loadAttempt = async (attempt: number): Promise<MappingIndex | null> => {
+    // Perimeter, not a lexical join. `mapping.json` is the index behind search_code,
+    // get_spec, search_specs and unified_search, so a `<root>/.openlore` symlinked at
+    // a neighbouring repository turned every one of them into a reader of that
+    // repository. Derived before the try: a refusal must not be filed under "no
+    // mapping found" together with the ordinary ENOENT.
+    const mappingPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING);
     try {
-      const mappingPath = join(absDir, '.openlore', 'analysis', 'mapping.json');
       // mcp-security: "Parsing SHALL bound input size" covers mapping.json too, not
       // just llm-context.json. Without this, an oversized artifact spends the read
       // before failing — and past the string ceiling it cannot be read at all.

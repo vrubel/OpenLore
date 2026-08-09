@@ -11,7 +11,6 @@ import { promisify } from 'node:util';
 import { readFile, stat, readdir, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import {
-  OPENLORE_DIR,
   OPENLORE_ANALYSIS_SUBDIR,
   ARTIFACT_LLM_CONTEXT,
   ARTIFACT_MAPPING,
@@ -24,6 +23,7 @@ import type { LLMContext } from './artifact-generator.js';
 import type { MappingArtifact } from '../generator/mapping-generator.js';
 import type { SerializedCallGraph, FunctionNode } from './call-graph.js';
 import { attachCallGraphFromStore } from '../services/call-graph-loader.js';
+import { openloreReadTarget, openloreWriteTarget } from '../services/write-target.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -141,8 +141,20 @@ export class SpecSnapshotGenerator {
     private readonly openspecRelPath: string = OPENSPEC_DIR,
   ) {}
 
-  async generate(): Promise<SpecSnapshot> {
-    const analysisDir = join(this.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  /**
+   * Build the snapshot — and, unless told otherwise, persist it.
+   *
+   * `save` is not a convenience switch. This generator ran unconditionally from
+   * `audit_spec_coverage`, a tool published to clients as read-only and absent from
+   * `WRITING_TOOLS`, so a server holding a repository on READ alone still had
+   * `spec-snapshot.json` appear inside it. A caller that has no write grant asks for
+   * `save: false` and gets the value without the file.
+   */
+  async generate(opts: { save?: boolean } = {}): Promise<SpecSnapshot> {
+    const save = opts.save ?? true;
+    // Read side goes through the perimeter too: `<root>/.openlore` may be a symlink,
+    // and a lexical join here reads the artifacts of whatever it points at.
+    const analysisDir = openloreReadTarget(this.rootPath, OPENLORE_ANALYSIS_SUBDIR);
     const openspecPath = join(this.rootPath, this.openspecRelPath);
 
     // Load artifacts in parallel
@@ -228,11 +240,13 @@ export class SpecSnapshotGenerator {
       hubs,
     };
 
-    // Persist
-    await writeFile(
-      join(analysisDir, ARTIFACT_SPEC_SNAPSHOT),
-      JSON.stringify(snapshot, null, 2),
-    );
+    // Persist — only when the caller holds a write grant for this root.
+    if (save) {
+      await writeFile(
+        openloreWriteTarget(this.rootPath, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_SPEC_SNAPSHOT),
+        JSON.stringify(snapshot, null, 2),
+      );
+    }
 
     return snapshot;
   }
@@ -241,7 +255,7 @@ export class SpecSnapshotGenerator {
   static async load(rootPath: string): Promise<SpecSnapshot | null> {
     try {
       const raw = await readFile(
-        join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_SPEC_SNAPSHOT),
+        openloreReadTarget(rootPath, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_SPEC_SNAPSHOT),
         'utf-8',
       );
       return JSON.parse(raw) as SpecSnapshot;

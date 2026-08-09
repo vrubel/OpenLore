@@ -3,10 +3,19 @@
  *
  * Takes all analysis results and generates structured output files
  * that will be consumed by the LLM generation phase and optionally by humans.
+ *
+ * PERIMETER NOTE. This is the analyzer's largest writer — a dozen artifacts, several
+ * megabytes, minutes after its output directory was approved. It does not CHOOSE that
+ * directory; but "handed an approved directory" is worth something only at the instant
+ * of the approval, and the demonstrated escape (swapping `.openlore` for a symlink
+ * mid-run) happened entirely inside that window. Every path is therefore re-derived
+ * through `reassertWriteDir` at the moment it is built. In a CLI process, which
+ * declares no perimeter, that is a pass-through and nothing changes.
  */
 
 import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import { join, basename, isAbsolute } from 'node:path';
+import { reassertWriteDir, writeUnderApprovedDir } from '../services/write-target.js';
 import {
   TOKENS_PER_CHAR_DEFAULT,
   PHASE2_FILE_CONTENT_MAX_CHARS,
@@ -392,14 +401,14 @@ export class AnalysisArtifactGenerator {
     const artifacts = await this.generate(repoMap, depGraph, enrichment);
 
     // Ensure output directory exists
-    await mkdir(this.options.outputDir, { recursive: true });
+    await mkdir(reassertWriteDir(this.options.outputDir), { recursive: true });
 
     // Write the SQLite graph store FIRST and let it fail loudly. It is no longer
     // an additive duplicate of what llm-context.json carries — it is the ONLY
     // home of the call graph, so a swallowed failure here would leave an analysis
     // whose graph tools all answer "no call graph" with nothing said about why.
     if (artifacts.llmContext.callGraph) {
-      const dbPath = join(this.options.outputDir, ARTIFACT_CALL_GRAPH_DB);
+      const dbPath = writeUnderApprovedDir(this.options.outputDir, ARTIFACT_CALL_GRAPH_DB);
       try {
         await writeEdgesToSQLite(artifacts.llmContext.callGraph, dbPath, this.options.rootDir, artifacts.llmContext.cfgs);
       } catch (err) {
@@ -416,19 +425,19 @@ export class AnalysisArtifactGenerator {
     // Save each artifact
     const saves: Promise<void>[] = [
       writeFile(
-        join(this.options.outputDir, ARTIFACT_REPO_STRUCTURE),
+        writeUnderApprovedDir(this.options.outputDir, ARTIFACT_REPO_STRUCTURE),
         stringifyArtifact(artifacts.repoStructure, ARTIFACT_REPO_STRUCTURE, { indent: 2 })
       ),
       writeFile(
-        join(this.options.outputDir, 'SUMMARY.md'),
+        writeUnderApprovedDir(this.options.outputDir, 'SUMMARY.md'),
         artifacts.summaryMarkdown
       ),
       writeFile(
-        join(this.options.outputDir, 'dependencies.mermaid'),
+        writeUnderApprovedDir(this.options.outputDir, 'dependencies.mermaid'),
         artifacts.dependencyDiagram
       ),
       writeFile(
-        join(this.options.outputDir, ARTIFACT_LLM_CONTEXT),
+        writeUnderApprovedDir(this.options.outputDir, ARTIFACT_LLM_CONTEXT),
         // Strip the CFG/def-use overlay AND the call graph before persisting: both
         // are DB-only and must never enter the resident llm-context.json or the hot
         // cache (specs: add-intraprocedural-cfg-dataflow-overlay; PDLC-156). The
@@ -449,21 +458,21 @@ export class AnalysisArtifactGenerator {
 
     if (enrichment?.schemas) {
       saves.push(writeFile(
-        join(this.options.outputDir, ARTIFACT_SCHEMA_INVENTORY),
+        writeUnderApprovedDir(this.options.outputDir, ARTIFACT_SCHEMA_INVENTORY),
         stringifyArtifact(enrichment.schemas, ARTIFACT_SCHEMA_INVENTORY, { indent: 2 })
       ));
     }
 
     if (enrichment?.uiComponents) {
       saves.push(writeFile(
-        join(this.options.outputDir, ARTIFACT_UI_INVENTORY),
+        writeUnderApprovedDir(this.options.outputDir, ARTIFACT_UI_INVENTORY),
         stringifyArtifact(enrichment.uiComponents, ARTIFACT_UI_INVENTORY, { indent: 2 })
       ));
     }
 
     if (enrichment?.routeInventory) {
       saves.push(writeFile(
-        join(this.options.outputDir, ARTIFACT_ROUTE_INVENTORY),
+        writeUnderApprovedDir(this.options.outputDir, ARTIFACT_ROUTE_INVENTORY),
         stringifyArtifact(enrichment.routeInventory, ARTIFACT_ROUTE_INVENTORY, { indent: 2 })
       ));
     }
@@ -471,7 +480,7 @@ export class AnalysisArtifactGenerator {
     if (enrichment?.middleware) {
       const { ARTIFACT_MIDDLEWARE_INVENTORY } = await import('../../constants.js');
       saves.push(writeFile(
-        join(this.options.outputDir, ARTIFACT_MIDDLEWARE_INVENTORY),
+        writeUnderApprovedDir(this.options.outputDir, ARTIFACT_MIDDLEWARE_INVENTORY),
         stringifyArtifact(enrichment.middleware, ARTIFACT_MIDDLEWARE_INVENTORY, { indent: 2 })
       ));
     }
@@ -479,7 +488,7 @@ export class AnalysisArtifactGenerator {
     if (enrichment?.envVars) {
       const { ARTIFACT_ENV_INVENTORY } = await import('../../constants.js');
       saves.push(writeFile(
-        join(this.options.outputDir, ARTIFACT_ENV_INVENTORY),
+        writeUnderApprovedDir(this.options.outputDir, ARTIFACT_ENV_INVENTORY),
         stringifyArtifact(enrichment.envVars, ARTIFACT_ENV_INVENTORY, { indent: 2 })
       ));
     }
@@ -1360,7 +1369,7 @@ export class AnalysisArtifactGenerator {
     // actionable message must not be swallowed by the write guard.
     const duplicatesJson = stringifyArtifact(duplicates, 'duplicates.json', { indent: 2 });
     try {
-      await writeFile(join(this.options.outputDir, 'duplicates.json'), duplicatesJson);
+      await writeFile(writeUnderApprovedDir(this.options.outputDir, 'duplicates.json'), duplicatesJson);
     } catch {
       // non-fatal if output dir doesn't exist yet
     }
@@ -1380,7 +1389,7 @@ export class AnalysisArtifactGenerator {
     // is fatal and loud, a failed write stays non-fatal.
     const refactorJson = stringifyArtifact(refactorReport, ARTIFACT_REFACTOR_PRIORITIES, { indent: 2 });
     try {
-      await writeFile(join(this.options.outputDir, ARTIFACT_REFACTOR_PRIORITIES), refactorJson);
+      await writeFile(writeUnderApprovedDir(this.options.outputDir, ARTIFACT_REFACTOR_PRIORITIES), refactorJson);
     } catch {
       // non-fatal
     }

@@ -37,7 +37,12 @@
 import { lstatSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { OPENLORE_DIR } from '../../constants.js';
-import { assertPathAllowed, canonicalPath, isPathAllowed } from './mcp-handlers/root-allowlist.js';
+import {
+  assertPathAllowed,
+  canonicalPath,
+  isPathAllowed,
+  isRootAllowlistConfigured,
+} from './mcp-handlers/root-allowlist.js';
 
 /**
  * Create `dir` and its missing ancestors WITHOUT following a symlink at any step,
@@ -53,9 +58,11 @@ import { assertPathAllowed, canonicalPath, isPathAllowed } from './mcp-handlers/
  * `analyze_codebase` run put 5.7 MB of artifacts outside the root. What this
  * function removes is the much wider window where the component did not exist at
  * approval time at all, and it makes the swap require deleting a real directory
- * first. Callers that write repeatedly over a long period (the analyzer, the
- * watcher) RE-DERIVE their target rather than trusting one approval for the whole
- * run — that is where the remaining exposure is actually bounded.
+ * first.
+ *
+ * That is ALL it removes. One approval does not survive a long run, and callers that
+ * write repeatedly over one must re-derive — see {@link reassertWriteDir} for the
+ * cheap re-derivation and for the honest statement of what is left after it.
  */
 /**
  * Approve a DIRECTORY for writing and create it, chain and all, out of real
@@ -72,6 +79,52 @@ export function ensureWriteDir(absDir: string, ...segments: string[]): string {
   const approved = writeTarget(absDir, ...segments);
   materializeUnderApprovedRoot(approved);
   return approved;
+}
+
+/**
+ * Re-derive an ALREADY-APPROVED directory, for a caller that will keep writing into
+ * it long after the approval was granted.
+ *
+ * WHY THIS EXISTS, precisely. `ensureWriteDir` is one decision at one instant. The
+ * analyzer then writes for minutes: `rm -rf <root>/.openlore && ln -s /outside
+ * <root>/.openlore` three seconds into the run sent 12 artifacts / 8.9 MB out of the
+ * root and the call still reported success. The approval had not been re-examined
+ * once. Two rounds of comments in this file and in `root-allowlist.ts` asserted that
+ * the analyzer re-derived; it did not, and the assertion is what kept anyone from
+ * looking. Call this before each write step, so an approval is worth one step and
+ * not one run.
+ *
+ * Three distinct escapes are refused here, which is why all three checks are made:
+ *   • the swapped link leads OUT of the write roots → `assertPathAllowed` refuses;
+ *   • it leads back INSIDE them → the canonical path differs from the approved one;
+ *   • the leaf itself became a link to a sibling inside the same root → the
+ *     symlink-component scan refuses.
+ *
+ * WHAT REMAINS, stated so nobody has to discover it a fourth time: a swap performed
+ * BETWEEN this check and the very next write still redirects that write. The window
+ * is one write step, not one run — narrowed, not abolished. Node has no `openat`,
+ * and nothing in this module can change that.
+ *
+ * A process with no perimeter (every CLI/library entry point — see the boundary note
+ * in `root-allowlist.ts`) is returned unchanged: `openlore analyze` on a layout whose
+ * `.openlore` is deliberately a symlink is a supported, ordinary use.
+ */
+export function reassertWriteDir(approvedDir: string): string {
+  if (!isRootAllowlistConfigured()) return approvedDir;
+  const again = assertPathAllowed(approvedDir, 'write');
+  assertNoSymlinkComponents(again);
+  if (again !== approvedDir) {
+    throw new Error(
+      `Root allowlist: "${approvedDir}" now resolves to "${again}"; the approved location changed ` +
+      'under an in-flight write. Refusing to continue writing there.',
+    );
+  }
+  return again;
+}
+
+/** {@link reassertWriteDir} for a path under an approved directory. */
+export function writeUnderApprovedDir(approvedDir: string, ...segments: string[]): string {
+  return join(reassertWriteDir(approvedDir), ...segments);
 }
 
 /**
@@ -94,11 +147,15 @@ function assertNoSymlinkComponents(target: string): void {
 }
 
 function materializeUnderApprovedRoot(target: string): void {
-  // Only the PARENT chain is created. `writeTarget` names both directories (the
-  // analysis dir) and FILES (`federation.json`), and it cannot tell them apart —
-  // materializing the leaf turned `federation.json` into a directory and broke every
-  // registry write with EISDIR. The leaf is left to its writer; what matters for the
-  // race is that everything ABOVE it is a real directory, verified here.
+  // The WHOLE chain is created, leaf included — `ensureWriteDir` is the "make me this
+  // DIRECTORY" caller, and its leaf is a directory. (The previous comment here said
+  // "only the PARENT chain is created … the leaf is left to its writer", which the
+  // loop below plainly does not do: it walks from `target` itself. The true statement
+  // is the one about the other function: `writeTarget` also names FILES, cannot tell
+  // them apart, and so materializes nothing — creating the leaf there turned
+  // `federation.json` into a directory and broke every registry write with EISDIR.)
+  // What matters for the race is that every component is a real directory that
+  // existed, or was created here, rather than a name resolved later by `mkdir -p`.
   const parts: string[] = [];
   for (let cur = target; ; cur = dirname(cur)) {
     let st;
@@ -129,15 +186,18 @@ function materializeUnderApprovedRoot(target: string): void {
 /**
  * Canonical, perimeter-approved path for a write under `absDir`.
  *
- * MATERIALIZES the directory chain before resolving it, and that is the point, not
- * a convenience. A path whose components do not exist yet cannot be canonicalized —
- * `canonicalPath` returns the lexical tail — so the approval is granted over names
- * that a later `mkdir -p` will resolve afresh. Creating the chain ourselves, one
- * component at a time and refusing any component that is a symlink, means the
- * approved path is made of directories that really existed at approval time.
+ * Resolves and judges ONLY — it creates nothing. An earlier version of this comment
+ * said the opposite ("MATERIALIZES the directory chain before resolving it, and that
+ * is the point"), which described {@link ensureWriteDir}; naming FILES is the whole
+ * reason the two are separate (materializing here turned `federation.json` into a
+ * directory). A caller that needs the chain to exist out of real directories asks
+ * for it by name.
  *
- * READ THE HONEST LIMIT in `assertNoSymlinkChain` below: this narrows the race, it
- * does not abolish it.
+ * Consequence worth stating: for a path whose components do not exist yet,
+ * `canonicalPath` can only canonicalize the existing prefix and keep the lexical
+ * tail, so approval covers names a later `mkdir -p` will resolve afresh.
+ * {@link ensureWriteDir} is what removes that; and neither abolishes the race —
+ * see {@link reassertWriteDir}.
  */
 export function writeTarget(absDir: string, ...segments: string[]): string {
   const target = join(absDir, ...segments);

@@ -305,11 +305,22 @@ function denialMessage(requested: string, mode: RootAccessMode, state: RootAllow
  * was, and that was false. Node has no `openat`, so a write still re-walks the path
  * by name; an attacker who swaps a component between this check and the syscall
  * redirects the syscall. Demonstrated, not theorised: swapping `.openlore` for a
- * symlink five seconds into an `analyze_codebase` run placed 5.7 MB of artifacts
- * outside the root. What narrows it: `writeTarget` materializes the chain out of
- * real, non-symlink directories, and the long-running writers (analyzer, watcher)
- * RE-DERIVE their target instead of trusting one approval for a whole run. The
- * residual window is a swap between the last resolution and the syscall.
+ * symlink a few seconds into an `analyze_codebase` run placed megabytes of artifacts
+ * outside the root.
+ *
+ * What narrows it, stated as what the code does rather than as what would be
+ * reassuring — the previous revision of this paragraph named the analyzer as a
+ * re-deriving writer while the analyzer took exactly one approval for a whole run,
+ * and a reader who trusted the sentence had no reason to check:
+ *
+ *   • `ensureWriteDir` materializes the chain out of real, non-symlink directories,
+ *     so a swap has to delete a real directory first;
+ *   • the long-running writers RE-DERIVE (`reassertWriteDir`) before each write step
+ *     — the watcher once per cycle, the analyzer before each artifact-writing step,
+ *     both verified by tests that perform the swap mid-run.
+ *
+ * The residual window is a swap between the last re-derivation and the next write,
+ * i.e. one write step. It is narrowed, not closed.
  *
  * A false reassurance in a comment is worse than the hole it describes: the next
  * reader stops checking.

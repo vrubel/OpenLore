@@ -10,8 +10,6 @@
  */
 
 import { writeFileSync, renameSync, readFileSync, existsSync, openSync, closeSync, unlinkSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { OPENLORE_DIR } from '../../../constants.js';
 import {
   PANIC_UP_THRESHOLD,
   PANIC_DOWN_THRESHOLD,
@@ -20,7 +18,7 @@ import {
   PANIC_SESSION_EXPIRY_MS,
   PANIC_SCORE_MAX,
 } from './panic-constants.js';
-import { tryOpenloreWriteTarget } from '../write-target.js';
+import { openloreReadTarget, openloreWriteTarget, tryOpenloreWriteTarget } from '../write-target.js';
 
 // ============================================================================
 // TYPES
@@ -125,7 +123,12 @@ function clampNum(v: unknown, min: number, max: number, fallback: number): numbe
  */
 export function readPanicState(directory: string): PanicState {
   try {
-    const path = join(directory, OPENLORE_DIR, PANIC_STATE_FILE);
+    // Perimeter on the read side as well: the write side has always gone through
+    // `tryOpenloreWriteTarget`, while this one followed a symlinked `.openlore` into
+    // a neighbour's state file. A refusal degrades to the default state, which is
+    // what every other failure here does — this reader must never throw into the
+    // hot path.
+    const path = openloreReadTarget(directory, PANIC_STATE_FILE);
     if (!existsSync(path)) return defaultPanicState();
 
     const raw = readFileSync(path, 'utf-8');
@@ -260,7 +263,9 @@ export function casWritePanicState(
   // Same form as F1: derive through the perimeter rather than lexically, even inside
   // a section the gate has already opened.
   return withPanicStateLock(directory, () => {
-    const path = join(directory, OPENLORE_DIR, PANIC_STATE_FILE);
+    // Same file the write below targets; derived through the perimeter so the
+    // revision is read from the location the write will actually reach.
+    const path = openloreWriteTarget(directory, PANIC_STATE_FILE);
     let currentRevision = 0;
     if (existsSync(path)) {
       try { currentRevision = (JSON.parse(readFileSync(path, 'utf-8')) as Partial<PanicState>).revision ?? 0; }

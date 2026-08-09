@@ -15,6 +15,7 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { OPENLORE_DIR } from '../../constants.js';
+import { openloreReadTarget } from '../services/write-target.js';
 
 /** Where a rule came from — an author's config file, or a recorded decision (spec-16). */
 export type RuleSource = 'config' | 'decision';
@@ -221,7 +222,10 @@ export async function loadArchitectureRules(
 
   // Config file (opt-in).
   try {
-    const raw = await readFile(join(absDir, OPENLORE_DIR, ARCHITECTURE_CONFIG_FILE), 'utf-8');
+    // Through the perimeter: a lexical join reads the architecture rules of whatever
+    // `<root>/.openlore` points at, and those rules decide what the server reports as
+    // a layer violation. Refusal lands in the catch below, like an absent config.
+    const raw = await readFile(openloreReadTarget(absDir, ARCHITECTURE_CONFIG_FILE), 'utf-8');
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);

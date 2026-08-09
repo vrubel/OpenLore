@@ -9,14 +9,13 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, resolve, basename } from 'node:path';
+import { dirname, isAbsolute, resolve, basename } from 'node:path';
 import {
   ARTIFACT_FINGERPRINT,
-  OPENLORE_ANALYSIS_REL_PATH,
-  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
 } from '../../constants.js';
 import { isRootAllowed } from '../services/mcp-handlers/root-allowlist.js';
-import { openloreWriteTarget } from '../services/write-target.js';
+import { openloreReadTarget, openloreWriteTarget } from '../services/write-target.js';
 import {
   FEDERATION_MANIFEST_FILENAME,
   FEDERATION_SCHEMA_VERSION,
@@ -26,9 +25,17 @@ import {
   type RepoIndexState,
 } from './types.js';
 
-/** Absolute path to the federation manifest inside a home repo's `.openlore/`. */
+/**
+ * Absolute path to the federation manifest inside a home repo's `.openlore/`.
+ *
+ * Through the perimeter on the read side too. The manifest is the file that hands
+ * out the addresses of every neighbouring repository, so a `<home>/.openlore`
+ * symlinked elsewhere is the one place where reading the wrong file widens the
+ * server's whole view of the world. A CLI process declares no perimeter and is
+ * unaffected.
+ */
 export function federationManifestPath(homeDir: string): string {
-  return join(resolve(homeDir), OPENLORE_DIR, FEDERATION_MANIFEST_FILENAME);
+  return openloreReadTarget(resolve(homeDir), FEDERATION_MANIFEST_FILENAME);
 }
 
 /**
@@ -51,7 +58,10 @@ function canonicalize(p: string): string {
 
 /** Absolute path to a repo's index fingerprint file. */
 function fingerprintPath(repoPath: string): string {
-  return join(resolve(repoPath), OPENLORE_ANALYSIS_REL_PATH, ARTIFACT_FINGERPRINT);
+  // Perimeter-derived: this reads INSIDE a registered neighbour, and the caller
+  // treats an unreadable fingerprint as "no index built", so a refusal degrades to
+  // the same answer instead of leaking whether the file is there.
+  return openloreReadTarget(resolve(repoPath), OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT);
 }
 
 /**
@@ -100,7 +110,9 @@ export function saveRegistry(homeDir: string, registry: FederationRegistry): voi
   // Perimeter-derived (a no-op in CLI processes, which declare no allowlist and
   // must keep working — `openlore federation add` is exactly that).
   const manifest = openloreWriteTarget(homeDir, FEDERATION_MANIFEST_FILENAME);
-  mkdirSync(join(resolve(homeDir), OPENLORE_DIR), { recursive: true });
+  // The APPROVED parent, not a second lexical derivation of the same directory: the
+  // two agreed today and would have diverged the moment `.openlore` became a link.
+  mkdirSync(dirname(manifest), { recursive: true });
   const tmp = `${manifest}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
   // rename is atomic on the same filesystem; avoids a torn manifest on crash.

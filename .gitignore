@@ -60,7 +60,13 @@ env/
 # --------------------
 # Node/JS Specific
 # --------------------
-node_modules/
+# No trailing slash, deliberately. With `node_modules/` git ignores the DIRECTORY and
+# nothing else — a `node_modules` SYMLINK is a file, so it was not covered, and one
+# pointing at /home/<someone>/Projects/openlore-review/node_modules was committed and
+# shipped in the v2.1.3-ru15 and -ru16 tags. A fresh clone self-heals on `npm ci`, but
+# on a machine where that absolute path exists the install walks into someone else's
+# tree. The pattern below matches the symlink too.
+node_modules
 .pnpm-store/
 /jspm_packages/
 /dist/
