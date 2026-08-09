@@ -59,6 +59,16 @@ export function serveSpawnArgs(directory: string): string[] {
  * host confined to loopback. This one JSON.parse'd and cast. Two readers of one
  * untrusted format, one of them careless, is how the careless one gets forgotten:
  * reuse the strict one.
+ *
+ * NOT A PERIMETER LAYER — do not count it as one. Under a configured allowlist this
+ * function is unreachable from the MCP server: `resolveDaemon` and
+ * `maybeStartWatcher` both refuse before reading any descriptor, and
+ * `applyRootAllowlist` runs unconditionally on both transports, so the guard above
+ * always fires first (confirmed with a canary: zero calls). What this hardening
+ * protects is the CLI path — `openlore serve --stop`, the Pi extension — where no
+ * allowlist exists. Describing it as defence for the MCP perimeter would be
+ * describing a decoration, and a decoration outlives the removal of whatever was
+ * actually holding the line.
  */
 async function readDescriptor(directory: string): Promise<ServeDescriptor | null> {
   const { readDescriptor: readValidated } = await import('../../cli/commands/serve.js');

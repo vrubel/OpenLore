@@ -160,7 +160,10 @@ const EXEMPT: Record<string, string> = {
     'reachable from a read-only or foreign root, and it derives no project path of its own.',
   'core/generator/spec-pipeline.ts': RECEIVES_APPROVED_DIR,
   'core/verifier/verification-engine.ts': 'Verifier output dir, supplied by the CLI command.',
-  'core/test-generator/test-writer.ts': 'generate_tests output; write-gated tool, own containment check.',
+  'core/test-generator/test-writer.ts':
+    'generate_tests output. Confines every write with safeJoin (canonical, symlink-aware) against the ' +
+    'root it was given, and generate_tests is itself a write-gated tool, so the root has already passed ' +
+    'the perimeter; this module derives no project path of its own.',
   'core/decisions/syncer.ts': 'Writes under openspecPath during sync_decisions (write-gated tool).',
   'core/decisions/atomic-store.ts':
     'Generic atomic-write mechanism. It writes wherever it is told; its callers ' +
@@ -205,6 +208,23 @@ const EXEMPT: Record<string, string> = {
   'api/generate.ts': CLI_NO_PERIMETER,
   'api/run.ts': CLI_NO_PERIMETER,
   'utils/shutdown.ts': 'Shutdown state file for the process that owns the directory.',
+};
+
+/**
+ * Handlers that join `.openlore` but never write — they locate an index and READ it
+ * (`VectorIndex.exists`, `readCachedContext`, a fingerprint). Listing them is not a
+ * judgement call: the test below re-derives "this module calls no write primitive"
+ * from the source and fails if that stops being true, so an entry here cannot
+ * quietly become a writer.
+ */
+const OPENLORE_JOIN_READERS: Record<string, string> = {
+  'core/services/mcp-handlers/architecture.ts': 'Reads the analysis artifacts for the overview.',
+  'core/services/mcp-handlers/claim-verification.ts': 'Locates the index to verify a claim against it.',
+  'core/services/mcp-handlers/confidence-boundary.ts': 'Reads fingerprint.json to judge staleness.',
+  'core/services/mcp-handlers/graph.ts': 'Locates the vector index for semantic expansion (read).',
+  'core/services/mcp-handlers/orient.ts': 'Reads analysis + vector index to orient.',
+  'core/services/mcp-handlers/reachability.ts': 'Reads the graph to compute reachability.',
+  'core/services/mcp-handlers/semantic.ts': 'Locates the vector index for search (read).',
 };
 
 /** Import specifiers that count as "this module consults the perimeter". */
@@ -303,6 +323,15 @@ describe('Write-Site Census Gate', () => {
     expect(bad, `exemption without a checkable reason:\n  ${bad.join('\n  ')}`).toEqual([]);
   });
 
+  it('no read-only-join entry has quietly become a writer', () => {
+    const nowWriting = Object.keys(OPENLORE_JOIN_READERS).filter(f => writers.has(f)).sort();
+    expect(
+      nowWriting,
+      'listed as joining .openlore only to READ, but now calls a write primitive — ' +
+      `route it through openloreWriteTarget: ${nowWriting.join(', ')}`,
+    ).toEqual([]);
+  });
+
   it('the exemption list has no stale entries (a module that no longer writes)', () => {
     // Only EXEMPT is checked: an exemption is a standing claim that THIS module
     // writes without a gate, and it must expire when that stops being true.
@@ -326,14 +355,28 @@ describe('Write-Site Census Gate', () => {
     // exemption ALSO switched off the one check built to catch that exact shape. An
     // exemption is a claim about a module's write TARGETS; it is not a licence to
     // stop looking.
+    // Walks EVERY handler file on disk, not `writers` — `writers` holds only modules
+    // that call a primitive themselves, so a handler that builds the path here and
+    // hands it to someone else to write would never have been looked at. The limit of
+    // this gate should be "you edited the gate", not "you split the write across two
+    // files".
+    const handlerFiles = files
+      .map(f => relative(SRC, f).split(sep).join('/'))
+      .filter(rel => rel.startsWith('core/services/mcp-handlers/'))
+      .sort();
+    expect(handlerFiles.length, 'handler sweep collected nothing — the scan is broken').toBeGreaterThan(20);
+
     const offenders: string[] = [];
-    for (const rel of writers.keys()) {
-      if (!rel.startsWith('core/services/mcp-handlers/')) continue;
+    for (const rel of handlerFiles) {
       const src = code(readFileSync(join(SRC, rel), 'utf-8'));
-      if (/join\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*(OPENLORE_DIR|['"]\.openlore['"])/.test(src)
-          && !importsGuard(src)) {
-        offenders.push(rel);
-      }
+      const joinsOpenlore = /join\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*(OPENLORE_DIR|['"]\.openlore['"])/.test(src);
+      if (!joinsOpenlore || importsGuard(src)) continue;
+      // A bare join is fine in a module that writes NOTHING — it is locating
+      // something to read. That claim is re-derived here from the source, not taken
+      // on trust: if such a module ever gains a write primitive, it drops out of
+      // this branch and is reported.
+      if (rel in OPENLORE_JOIN_READERS && !writers.has(rel)) continue;
+      offenders.push(rel);
     }
     expect(offenders, `bare join(dir, '.openlore', …) on a write path: ${offenders.join(', ')}`).toEqual([]);
   });
