@@ -3,6 +3,16 @@
  *
  * Compares current codebase state to the spec snapshot to report coverage gaps.
  * No LLM required.
+ *
+ * PERIMETER NOTE. This module was registered as unreachable from a perimeter-bearing
+ * server ("CLI/library entry point"), and that was simply false: the MCP handler
+ * `audit_spec_coverage` imports `openloreAudit` and called it with `save: true`
+ * hardcoded. The result was a tool published to clients as read-only, absent from
+ * `WRITING_TOOLS`, creating `audit-report.json` and `spec-snapshot.json` inside a
+ * repository the operator had granted on READ ONLY — found by sweeping all 52
+ * non-writing tools against a read-only root. Both derivations below now go through
+ * the perimeter (pass-through in a CLI process, which declares none), and saving is
+ * the caller's decision rather than a constant.
  */
 
 import { join } from 'node:path';
@@ -10,7 +20,6 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { readOpenLoreConfig } from '../core/services/config-manager.js';
 import { SpecSnapshotGenerator } from '../core/analyzer/spec-snapshot-generator.js';
 import {
-  OPENLORE_DIR,
   OPENLORE_ANALYSIS_SUBDIR,
   ARTIFACT_LLM_CONTEXT,
   ARTIFACT_MAPPING,
@@ -28,6 +37,7 @@ import type { LLMContext } from '../core/analyzer/artifact-generator.js';
 import type { MappingArtifact } from '../core/generator/mapping-generator.js';
 import type { SerializedCallGraph, FunctionNode } from '../core/analyzer/call-graph.js';
 import { attachCallGraphFromStore } from '../core/services/call-graph-loader.js';
+import { openloreReadTarget, openloreWriteTarget } from '../core/services/write-target.js';
 
 const DEFAULT_MAX_UNCOVERED = 50;
 const DEFAULT_HUB_THRESHOLD = 5;
@@ -73,13 +83,16 @@ export async function openloreAudit(options: AuditApiOptions = {}): Promise<Audi
   const maxUncovered = options.maxUncovered ?? DEFAULT_MAX_UNCOVERED;
   const hubThreshold = options.hubThreshold ?? DEFAULT_HUB_THRESHOLD;
   const shouldSave = options.save ?? true;
-  const analysisDir = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  // Read side through the perimeter: `<root>/.openlore` can be a symlink, and a
+  // lexical join reads the analysis artifacts of whatever it points at.
+  const analysisDir = openloreReadTarget(rootPath, OPENLORE_ANALYSIS_SUBDIR);
 
-  // Load (or refresh) snapshot
+  // Load (or refresh) snapshot. It persists only if this audit persists — the
+  // snapshot is a by-product of the report, not a separate grant.
   const openloreConfig = await readOpenLoreConfig(rootPath);
   const openspecRelPath = openloreConfig?.openspecPath ?? OPENSPEC_DIR;
   const snapshotGen = new SpecSnapshotGenerator(rootPath, openspecRelPath);
-  const snapshot = await snapshotGen.generate().catch(() => null);
+  const snapshot = await snapshotGen.generate({ save: shouldSave }).catch(() => null);
 
   // Load raw artifacts for deep analysis
   const [llmContextRaw, mappingRaw] = await Promise.all([
@@ -151,7 +164,10 @@ export async function openloreAudit(options: AuditApiOptions = {}): Promise<Audi
   };
 
   if (shouldSave) {
-    await writeFile(join(analysisDir, ARTIFACT_AUDIT_REPORT), JSON.stringify(report, null, 2));
+    await writeFile(
+      openloreWriteTarget(rootPath, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_AUDIT_REPORT),
+      JSON.stringify(report, null, 2),
+    );
   }
 
   return report;

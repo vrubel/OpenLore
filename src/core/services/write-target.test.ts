@@ -97,6 +97,15 @@ const PERIMETER_GATED = new Set([
   'core/services/mcp-handlers/analysis.ts',
   'core/services/mcp-watcher.ts',
   'core/services/call-graph-loader.ts',
+  // Moved out of EXEMPT: both now re-derive their target instead of trusting the one
+  // approval they were handed (see write-target.reassertWriteDir).
+  'core/analyzer/artifact-generator.ts',
+  'core/analyzer/spec-snapshot-generator.ts',
+  // Moved out of EXEMPT because the exemption's REASON was false, not because the
+  // module changed address: both are imported by mcp-handlers/analysis.ts and are
+  // therefore reachable from a perimeter-bearing server.
+  'api/audit.ts',
+  'cli/commands/analyze.ts',
   'core/decisions/store.ts',
   'core/decisions/memory-store.ts',
   'core/decisions/anchor-adapter.ts',
@@ -144,12 +153,10 @@ const EXEMPT: Record<string, string> = {
   // analyze_codebase / generate are classified writers, so the transport already
   // required write access to `directory`; and their output dir is the analysis dir
   // under it. These do not accept a second, independent path from the caller.
-  'core/analyzer/artifact-generator.ts': RECEIVES_APPROVED_DIR,
   'core/analyzer/architecture-writer.ts': RECEIVES_APPROVED_DIR,
   'core/analyzer/ai-config-generator.ts': RECEIVES_APPROVED_DIR,
   'core/analyzer/codebase-digest.ts': RECEIVES_APPROVED_DIR,
   'core/analyzer/repository-mapper.ts': RECEIVES_APPROVED_DIR,
-  'core/analyzer/spec-snapshot-generator.ts': RECEIVES_APPROVED_DIR,
   'core/analyzer/spec-vector-index.ts': RECEIVES_APPROVED_DIR,
   'core/analyzer/vector-index.ts': RECEIVES_APPROVED_DIR,
   'core/analyzer/vector-store.ts': RECEIVES_APPROVED_DIR,
@@ -182,7 +189,6 @@ const EXEMPT: Record<string, string> = {
   // ── Not the MCP server: CLI commands and installers ─────────────────────────
   // The documented boundary: a CLI process declares no allowlist, and must not.
   // `openlore federation add <path>` is PDLC registering a product's repo set.
-  'cli/commands/analyze.ts': CLI_NO_PERIMETER + ' Specifically: CLI command (no perimeter by design).',
   'cli/commands/blast-radius.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: installs a git hook.',
   'cli/commands/decisions.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: hooks and agent files.',
   'cli/commands/digest.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: writes the requested output file.',
@@ -194,7 +200,13 @@ const EXEMPT: Record<string, string> = {
   'cli/commands/refresh-stories.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: installs a git hook.',
   'cli/commands/reindex.ts': CLI_NO_PERIMETER,
   'cli/commands/run.ts': CLI_NO_PERIMETER,
-  'cli/commands/serve.ts': CLI_NO_PERIMETER + ' Specifically: Separate long-lived daemon command; MCP refuses to spawn or delegate to it under a perimeter.',
+  // NOT CLI_NO_PERIMETER: this module IS reachable — serve-client imports readDescriptor
+  // dynamically to reuse its strict parser. What is unreachable is its writing body.
+  'cli/commands/serve.ts':
+    'Separate long-lived daemon. Under a configured allowlist the MCP server refuses at startup to ' +
+    'spawn or delegate to a daemon (resolveDaemon and maybeStartWatcher both bail before reading a ' +
+    'descriptor), so the writes here run only in the `openlore serve` process, which declares no ' +
+    'perimeter. The one function reachable from the server, readDescriptor, writes nothing.',
   'cli/commands/setup.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: agent integration files.',
   'cli/commands/prove.ts': CLI_NO_PERIMETER + ' Specifically: CLI command: mkdtemp workdir.',
   'cli/export/scip.ts': CLI_NO_PERIMETER + ' Specifically: CLI export: writes the --out path the operator named.',
@@ -203,8 +215,11 @@ const EXEMPT: Record<string, string> = {
   'cli/install/adapters/continue.ts': CLI_NO_PERIMETER + ' Specifically: Installer.',
   'cli/install/adapters/cursor.ts': CLI_NO_PERIMETER + ' Specifically: Installer.',
   'cli/install/adapters/markdown-block.ts': CLI_NO_PERIMETER + ' Specifically: Installer.',
-  'api/analyze.ts': CLI_NO_PERIMETER + ' Specifically: Library/CLI entry point (no perimeter by design).',
-  'api/audit.ts': CLI_NO_PERIMETER,
+  // NOT CLI_NO_PERIMETER: reachable through live-data/analyze-repo.ts.
+  'api/analyze.ts':
+    'Library entry point. Reachable from the server only via the live-data harness, which points it ' +
+    'at openlore\'s OWN cached clones — never at a served repository — and its writes land in the ' +
+    'analysis directory of the root it is given. The CLI path (openlore analyze) declares no perimeter.',
   'api/generate.ts': CLI_NO_PERIMETER,
   'api/run.ts': CLI_NO_PERIMETER,
   'utils/shutdown.ts': 'Shutdown state file for the process that owns the directory.',
@@ -222,8 +237,11 @@ function importsGuard(src: string): boolean {
   // Comments stripped (a mention in prose is not an import) and `import type`
   // rejected (a type-only import is erased at build time and gates nothing).
   const bare = code(src);
+  // `[^;]*?` and not `[^;\n]*`: a multi-line `import { a, b } from './write-target.js'`
+  // is the same import, and the line-bound form reported `write-target.ts` itself as
+  // ungated the moment its own import list grew past one line.
   return GATE_IMPORTS.some(g =>
-    new RegExp(`(?:import|require)\\s+(?!type\\s)[^;\n]*['"][^'"]*${g}(?:\\.js)?['"]`).test(bare));
+    new RegExp(`(?:import|require)\\s+(?!type\\s)[^;]*?['"][^'"]*${g}(?:\\.js)?['"]`).test(bare));
 }
 
 function sourceFiles(dir: string): string[] {
@@ -244,6 +262,126 @@ function sourceFiles(dir: string): string[] {
 function code(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
+
+/** The one process that declares a perimeter — every reachability question starts here. */
+const MCP_ENTRY = 'cli/commands/mcp.ts';
+
+/**
+ * Every module the MCP server can reach by a static import, transitively.
+ *
+ * Deliberately CRUDE and deliberately WIDE: relative specifiers only, `.js` mapped
+ * back to `.ts`, dynamic `import('./x.js')` counted the same as a static one (the
+ * handlers use it constantly, and a hole reached lazily is still a hole). It will
+ * over-approximate — a module pulled in for one pure helper counts as reachable — and
+ * that is the safe direction: the cost of a false positive is one declared exception
+ * with a reason, the cost of a false negative is what `api/audit.ts` did.
+ *
+ * What it does NOT see: a module reached only through a bare specifier that resolves
+ * inside this package, and anything spawned as a separate process. Neither is a way of
+ * hiding a `.openlore` join from review, but both are reasons not to describe this as
+ * a proof of confinement.
+ */
+function mcpReachableModules(): Set<string> {
+  const all = new Map<string, string>();
+  for (const f of sourceFiles(SRC)) {
+    if (!statSync(f).isFile()) continue;
+    all.set(relative(SRC, f).split(sep).join('/'), readFileSync(f, 'utf-8'));
+  }
+  const resolveSpec = (from: string, spec: string): string | null => {
+    const dir = from.split('/').slice(0, -1);
+    const parts = [...dir, ...spec.split('/')];
+    const stack: string[] = [];
+    for (const part of parts) {
+      if (part === '.' || part === '') continue;
+      if (part === '..') stack.pop();
+      else stack.push(part);
+    }
+    const base = stack.join('/');
+    const candidates = base.endsWith('.js')
+      ? [base.slice(0, -3) + '.ts', base.slice(0, -3) + '.mts', base]
+      : [base, base + '.ts', base + '/index.ts'];
+    return candidates.find(c => all.has(c)) ?? null;
+  };
+  const seen = new Set<string>();
+  const stack = [MCP_ENTRY];
+  while (stack.length) {
+    const cur = stack.pop() as string;
+    if (seen.has(cur) || !all.has(cur)) continue;
+    seen.add(cur);
+    for (const m of code(all.get(cur) as string).matchAll(/(?:from|import)\s*\(?\s*['"](\.[^'"]+)['"]/g)) {
+      const next = resolveSpec(cur, m[1]);
+      if (next && !seen.has(next)) stack.push(next);
+    }
+  }
+  return seen;
+}
+
+/**
+ * Count lexical `.openlore` derivations. `join(o.rootPath, …)`, `resolve(dir,
+ * '.openlore')` and a template literal are all the same shape; matching only
+ * `join(<identifier>, OPENLORE_DIR` let each of the others through.
+ */
+function openloreDerivations(src: string): number {
+  // The two `*_REL_PATH` constants are `.openlore/...` under another name; leaving
+  // them out would have made the count honest-looking and wrong.
+  // The first argument may itself be a CALL — `join(this.rootDir(), '.openlore', …)`.
+  // The inherited `[^,)]+` could not cross a parenthesis, so that whole form was
+  // invisible; one nesting level covers what actually occurs.
+  const re = /(?:join|resolve)\s*\(\s*(?:[^,()]|\([^()]*\))+,\s*(?:OPENLORE_DIR|OPENLORE_ANALYSIS_REL_PATH|OPENLORE_CONFIG_REL_PATH|['"]\.openlore['"])|`[^`]*\$\{[^}]*\}\/\.openlore/g;
+  return [...src.matchAll(re)].length;
+}
+
+/**
+ * Lexical derivations that are allowed to stay, counted, with the reason each is
+ * sound. The COUNT is part of the claim: adding a second join to a module that
+ * legitimately has one fails this gate, which is the difference between a per-site
+ * exception and the module-wide switch this replaced.
+ */
+const CONFIG_PATH_IS_TEXT =
+  'A `configPath:` string stamped into an artifact header for a human to read. It is never opened, ' +
+  'stat-ed or written; the artifact it appears in is itself written to a perimeter-derived path.';
+
+const DERIVATION_EXCEPTIONS: Record<string, { sites: number; why: string }> = {
+  [MCP_ENTRY]: {
+    sites: 3,
+    why: 'The module that DECLARES the perimeter. Two joins build the `--watch` probe path passed ' +
+      'straight into isPathAllowed at startup (before and while the allowlist is being set up), and ' +
+      'the third is the argument of the isPathAllowed call that decides whether panic state may be ' +
+      'written. All three are inputs to the gate, not paths used behind its back.',
+  },
+  'cli/commands/serve.ts': {
+    sites: 4,
+    why: 'Reachable only as a MODULE: serve-client dynamically imports readDescriptor to reuse its ' +
+      'strict parser. The joins belong to the daemon body (descriptor file, analysis dir), which runs ' +
+      'in the `openlore serve` process — and an MCP server with a perimeter refuses at startup to ' +
+      'spawn or delegate to a daemon, so that body never executes behind this boundary.',
+  },
+  'core/services/mcp-watcher.ts': {
+    sites: 4,
+    why: 'One string COMPARISON (usesStandardLayout), not a path that is opened, plus three ' +
+      '`configPath:` strings stamped into artifact headers. The watcher derives its real target ' +
+      'through ensureWriteDir, once per cycle.',
+  },
+  'core/decisions/anchor-adapter.ts': {
+    sites: 1,
+    why: 'The joined path is handed directly to openEdgeStoreForPerimeter, which asks the perimeter ' +
+      'before opening and returns no store when refused; nothing else uses it.',
+  },
+  'core/services/mcp-handlers/epistemic-lease.ts': {
+    sites: 1,
+    why: 'Same single consumer: openEdgeStoreForPerimeter. Module tracking is advisory and returns [] ' +
+      'when the store cannot be opened, so a refusal degrades instead of throwing.',
+  },
+  'core/analyzer/artifact-generator.ts': { sites: 1, why: CONFIG_PATH_IS_TEXT },
+  'cli/commands/analyze.ts': { sites: 1, why: CONFIG_PATH_IS_TEXT },
+  'api/analyze.ts': { sites: 1, why: CONFIG_PATH_IS_TEXT },
+  'core/analyzer/repository-mapper.ts': {
+    sites: 1,
+    why: 'A DEFAULT for the outputDir option, used only by writeOutput — whose sole caller is the ' +
+      'mapRepository convenience helper, which nothing in the tree calls. Under the analyzer the ' +
+      'mapper is constructed with no outputDir and writes nothing.',
+  },
+};
 
 describe('Write-Site Census Gate', () => {
   const files = sourceFiles(SRC).filter(f => statSync(f).isFile());
@@ -327,7 +465,7 @@ describe('Write-Site Census Gate', () => {
     expect(stale, `registered as a writer but writes nothing any more — drop it: ${stale.join(', ')}`).toEqual([]);
   });
 
-  it('no MCP handler builds an .openlore path with a bare join — read or write', () => {
+  it('no module the MCP server can reach builds an .openlore path with a bare join', () => {
     // The exact shape every round of this review kept re-discovering. Handlers are
     // the MCP-reachable surface; they must go through the helper.
     //
@@ -351,31 +489,62 @@ describe('Write-Site Census Gate', () => {
     // hands it to someone else to write would never have been looked at. The limit of
     // this gate should be "you edited the gate", not "you split the write across two
     // files".
-    // Scope is no longer just `mcp-handlers/`: the watcher, the decision stores, the
-    // federation registry and the generators all derive `.openlore` paths too, and
-    // limiting the sweep to one directory was another way of not looking.
-    // `cli/commands/` is deliberately NOT swept: a CLI process declares no perimeter
-    // (the documented boundary), so a bare join there is correct, not a defect. Those
-    // modules are classified in EXEMPT above with that reason.
-    const SWEPT = ['core/services/', 'core/decisions/', 'core/federation/', 'core/generator/'];
-    const handlerFiles = files
-      .map(f => relative(SRC, f).split(sep).join('/'))
-      .filter(rel => SWEPT.some(d => rel.startsWith(d)))
-      .sort();
-    expect(handlerFiles.length, 'handler sweep collected nothing — the scan is broken').toBeGreaterThan(20);
+    // SCOPE IS REACHABILITY, NOT A LIST OF DIRECTORIES. The previous scope was four
+    // directory prefixes, and on the real tree it caught NOTHING: of the 40 modules
+    // that derive an `.openlore` path, 33 simply lived elsewhere — `api/`, `cli/`,
+    // `core/analyzer/`, `core/verifier/`, `core/test-generator/`, `utils/`. That is
+    // how `audit_spec_coverage` came to write into a read-only root through
+    // `api/audit.ts`: the module was outside the sweep and carried an exemption
+    // claiming it was unreachable from a server, while `mcp-handlers/analysis.ts`
+    // imported it directly. "Which directory is it in" was never the question; "can
+    // the MCP server get there" always was, and that is computable.
+    const reachable = mcpReachableModules();
+    expect(reachable.size, 'import-graph walk collected nothing — the scan is broken').toBeGreaterThan(50);
 
+    // AND THE VERDICT IS PER OCCURRENCE. The previous rule was
+    // `if (!joinsOpenlore || importsGuard(src)) continue` — one import of the guard
+    // anywhere in a module excused every bare join in it. All three read escapes
+    // (`graph.ts` → dependency-graph.json, `utils.ts` → mapping.json,
+    // `analysis.ts` → llm-context.json) were invisible for exactly that reason, in
+    // modules that DID import the guard and used it elsewhere. It is the same
+    // module-wide off switch that used to live in EXEMPT and let `analyze_codebase`
+    // through; it had only moved. So: count the derivations, and require the count to
+    // be declared site by site with a reason someone can check.
     const offenders: string[] = [];
-    for (const rel of handlerFiles) {
-      const src = code(readFileSync(join(SRC, rel), 'utf-8'));
-      // `join(o.rootPath, …)`, `resolve(dir, '.openlore')` and a template literal are
-      // all the same derivation; matching only `join(<identifier>, OPENLORE_DIR` let
-      // each of the others through.
-      const joinsOpenlore =
-        /(?:join|resolve)\s*\(\s*[^,)]+,\s*(?:OPENLORE_DIR|['"]\.openlore['"])/.test(src)
-        || /`[^`]*\$\{[^}]*\}\/\.openlore/.test(src);
-      if (!joinsOpenlore || importsGuard(src)) continue;
-      offenders.push(rel);
+    for (const rel of [...reachable].sort()) {
+      const found = openloreDerivations(code(readFileSync(join(SRC, rel), 'utf-8')));
+      if (found === 0) continue;
+      const allowed = DERIVATION_EXCEPTIONS[rel];
+      if (!allowed) { offenders.push(`${rel} (${found}×, not declared)`); continue; }
+      if (allowed.sites !== found) {
+        offenders.push(`${rel} (${found}× on disk, ${allowed.sites}× declared — a new derivation was added)`);
+      }
     }
-    expect(offenders, `bare join(dir, '.openlore', …) on a write path: ${offenders.join(', ')}`).toEqual([]);
+    expect(
+      offenders,
+      'A module the MCP server can reach derives `<dir>/.openlore/…` lexically. Route it through ' +
+      '`openloreReadTarget` / `openloreWriteTarget` (src/core/services/write-target.ts) — or, if the ' +
+      'derivation genuinely never reaches the disk under a perimeter, declare it in ' +
+      'DERIVATION_EXCEPTIONS with the reason:\n  ' + offenders.join('\n  '),
+    ).toEqual([]);
+  });
+
+  it('every exemption held to be unreachable from a perimeter really is unreachable', () => {
+    // The claim `CLI_NO_PERIMETER` is not decoration: it is what lets a module write
+    // wherever it likes. Two modules carried it while `mcp-handlers/analysis.ts`
+    // imported them by name — `api/audit.ts` (line 54) and `cli/commands/analyze.ts`
+    // (line 34) — and one of them was writing into read-only roots in production.
+    // Nobody had to lie for that: the claim was true when it was written and nothing
+    // re-checked it. This does.
+    const reachable = mcpReachableModules();
+    const lying = Object.entries(EXEMPT)
+      .filter(([f, why]) => why.startsWith(CLI_NO_PERIMETER) && reachable.has(f))
+      .map(([f]) => f)
+      .sort();
+    expect(
+      lying,
+      'exempt as "not reachable from a perimeter-bearing server", yet reachable by import from ' +
+      `${MCP_ENTRY}: ${lying.join(', ')}`,
+    ).toEqual([]);
   });
 });

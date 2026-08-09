@@ -8,8 +8,7 @@
 import { validateDirectory, readCachedContext } from './utils.js';
 import { resolveFederationScope, findCrossRepoConsumersBatch } from '../../federation/resolver.js';
 import type { CachedContext } from './utils.js';
-import { join } from 'node:path';
-import { RISK_SCORE_FAN_IN_WEIGHT, RISK_SCORE_FAN_OUT_WEIGHT, RISK_SCORE_HUB_BONUS, RISK_SCORE_BLAST_RADIUS_WEIGHT, RISK_SCORE_LOW_THRESHOLD, RISK_SCORE_MEDIUM_THRESHOLD, GOD_FUNCTION_FAN_OUT_THRESHOLD, REFACTOR_SRP_FAN_OUT_THRESHOLD, LOW_RISK_MAX_FAN_IN, LOW_RISK_MAX_FAN_OUT, CRITICAL_HUBS_DEFAULT_MIN_FAN_IN, SUBGRAPH_DEFAULT_MAX_DEPTH, SUBGRAPH_MAX_DEPTH_LIMIT, CRITICALITY_FAN_IN_WEIGHT, CRITICALITY_FAN_OUT_WEIGHT, CRITICALITY_VIOLATION_BONUS, STABILITY_SCORE_CAN_REFACTOR, STABILITY_SCORE_STABILISE_FIRST, LOW_RISK_REFACTOR_CANDIDATES_DEFAULT_LIMIT, LEAF_FUNCTIONS_DEFAULT_LIMIT, HUB_HIGH_FAN_IN_THRESHOLD, HUB_HIGH_FAN_OUT_THRESHOLD, OPENLORE_ANALYSIS_SUBDIR, TRACE_PATH_DEFAULT_MAX_DEPTH, TRACE_PATH_MAX_PATHS,  } from '../../../constants.js';
+import { RISK_SCORE_FAN_IN_WEIGHT, RISK_SCORE_FAN_OUT_WEIGHT, RISK_SCORE_HUB_BONUS, RISK_SCORE_BLAST_RADIUS_WEIGHT, RISK_SCORE_LOW_THRESHOLD, RISK_SCORE_MEDIUM_THRESHOLD, GOD_FUNCTION_FAN_OUT_THRESHOLD, REFACTOR_SRP_FAN_OUT_THRESHOLD, LOW_RISK_MAX_FAN_IN, LOW_RISK_MAX_FAN_OUT, CRITICAL_HUBS_DEFAULT_MIN_FAN_IN, SUBGRAPH_DEFAULT_MAX_DEPTH, SUBGRAPH_MAX_DEPTH_LIMIT, CRITICALITY_FAN_IN_WEIGHT, CRITICALITY_FAN_OUT_WEIGHT, CRITICALITY_VIOLATION_BONUS, STABILITY_SCORE_CAN_REFACTOR, STABILITY_SCORE_STABILISE_FIRST, LOW_RISK_REFACTOR_CANDIDATES_DEFAULT_LIMIT, LEAF_FUNCTIONS_DEFAULT_LIMIT, HUB_HIGH_FAN_IN_THRESHOLD, HUB_HIGH_FAN_OUT_THRESHOLD, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH, TRACE_PATH_DEFAULT_MAX_DEPTH, TRACE_PATH_MAX_PATHS,  } from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode } from '../../analyzer/call-graph.js';
 import { callDistance } from '../../analyzer/call-graph.js';
 import type { DecisionNode } from '../../decisions/project.js';
@@ -953,7 +952,12 @@ export async function handleGetFileDependencies(
   direction: 'imports' | 'importedBy' | 'both' = 'both',
 ): Promise<unknown> {
   const absDir = await validateDirectory(directory);
-  const depGraphPath = join(absDir, '.openlore', 'analysis', 'dependency-graph.json');
+  // Through the perimeter, not a lexical join: `<root>/.openlore` may be a symlink
+  // into a repository this server was never granted, and this handler then answered
+  // with that repository's import graph — file names and symbols included. Derived
+  // OUTSIDE the try below on purpose; inside it, the refusal would come back as the
+  // ordinary "no dependency graph found" and say nothing.
+  const depGraphPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH);
 
   interface DepEdge {
     source: string;

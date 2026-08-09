@@ -38,9 +38,8 @@ import { detectLanguage } from '../../analyzer/signature-extractor.js';
 import { AnchorContext } from '../../decisions/anchor-adapter.js';
 import { memoryFreshness } from '../../decisions/anchor.js';
 import { readOpenLoreConfig } from '../config-manager.js';
-import { OPENLORE_DIR } from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode, CallEdge } from '../../analyzer/call-graph.js';
-import { openloreWriteTarget } from '../write-target.js';
+import { openloreReadTarget, openloreWriteTarget } from '../write-target.js';
 import { isPerimeterRefusal } from './root-allowlist.js';
 import type {
   StructuralAnchor,
@@ -636,8 +635,15 @@ export function surfacesFromConfig(cfg: ImpactCertificateConfig | undefined): Co
 
 // ── certificate persistence + decay ─────────────────────────────────────────
 
+/**
+ * The certificate directory, resolved through the perimeter on the READ side too.
+ * It was a lexical join, and `recheckPersistedCertificates` — reached from the
+ * spec-store health check — then enumerated and parsed the certificates of whatever
+ * `<root>/.openlore` pointed at. The write side (`persistCertificate`) derives its
+ * own target and does not go through here.
+ */
 function certDir(absDir: string): string {
-  return join(absDir, OPENLORE_DIR, CERT_SUBDIR);
+  return openloreReadTarget(absDir, CERT_SUBDIR);
 }
 
 /** A safe filename for a change id (confined; no path separators leak through). */

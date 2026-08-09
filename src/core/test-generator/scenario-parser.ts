@@ -13,13 +13,13 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import {
-  OPENLORE_DIR,
   OPENLORE_ANALYSIS_SUBDIR,
   ARTIFACT_MAPPING,
   OPENSPEC_DIR,
   OPENSPEC_SPECS_SUBDIR,
 } from '../../constants.js';
 import { fileExists } from '../../utils/command-helpers.js';
+import { openloreReadTarget } from '../services/write-target.js';
 import type { ParsedScenario, FunctionRef } from '../../types/test-generator.js';
 
 // ============================================================================
@@ -143,12 +143,10 @@ async function loadMapping(
   rootPath: string
 ): Promise<Map<string, FunctionRef[]>> {
   const map = new Map<string, FunctionRef[]>();
-  const mappingPath = join(
-    rootPath,
-    OPENLORE_DIR,
-    OPENLORE_ANALYSIS_SUBDIR,
-    ARTIFACT_MAPPING
-  );
+  // Through the perimeter, not a lexical join: this index decides which functions
+  // the generated tests are written against, and a symlinked `<root>/.openlore`
+  // sourced it from a repository this server was never granted.
+  const mappingPath = openloreReadTarget(rootPath, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING);
 
   if (!(await fileExists(mappingPath))) return map;
 

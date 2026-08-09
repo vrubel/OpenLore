@@ -20,6 +20,7 @@ import {
   OPENLORE_ANALYSIS_REL_PATH,
   OPENSPEC_DIR,
   ARTIFACT_DEPENDENCY_GRAPH,
+  ARTIFACT_LLM_CONTEXT,
   ARTIFACT_MAPPING,
   ARTIFACT_REPO_STRUCTURE,
   ARTIFACT_ROUTE_INVENTORY,
@@ -54,7 +55,7 @@ import type { MappingArtifact } from '../../generator/mapping-generator.js';
 import { openloreAudit } from '../../../api/audit.js';
 import type { DriftResult } from '../../../types/index.js';
 import { ensureWriteDir } from '../write-target.js';
-import { openloreReadTarget } from '../write-target.js';
+import { openloreReadTarget, tryOpenloreWriteTarget } from '../write-target.js';
 
 // ============================================================================
 // HANDLERS
@@ -431,8 +432,12 @@ export async function handleGetFunctionBody(
     return { error: `File not found: ${filePath}` };
   }
 
-  // Try call graph first: exact byte-range slice, no ambiguity
-  const contextPath = join(absDir, '.openlore', 'analysis', 'llm-context.json');
+  // Try call graph first: exact byte-range slice, no ambiguity.
+  // Derived OUTSIDE the try: a lexical join here read whatever `<root>/.openlore`
+  // pointed at, so a symlink to a neighbour's tree answered `get_function_body` with
+  // the neighbour's call graph — and a refusal raised inside the try would have been
+  // swallowed by the "no cached context" fallback below, which is the same silence.
+  const contextPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT);
   try {
     const raw = await readFile(contextPath, 'utf-8');
     const ctx = JSON.parse(raw) as { callGraph?: { nodes: Array<{ name: string; filePath: string; startIndex: number; endIndex: number; language: string; className?: string }> } };
@@ -744,14 +749,34 @@ export async function handleAuditSpecCoverage(
   hubThreshold = 5,
 ): Promise<unknown> {
   const absDir = await validateDirectory(directory);
+  // `save: true` was hardcoded here. `audit_spec_coverage` is not in WRITING_TOOLS
+  // and is published to clients as read-only, so the transport asked only for READ
+  // on `directory` — and the audit then wrote `audit-report.json` and
+  // `spec-snapshot.json` into a repository granted on read alone. Sweeping the 52
+  // non-writing tools against a read-only root is what found it.
+  //
+  // The fix is not to reclassify the tool as a writer: a read-only server should
+  // still be able to REPORT coverage. Persisting is what needs the grant, so the
+  // grant is what decides — and when it is absent the answer says so, because a
+  // silently withheld capability is indistinguishable from a bug.
+  // Non-throwing on purpose, and it SAYS it withheld (once per target) on stderr.
+  const mayPersist = tryOpenloreWriteTarget(absDir, OPENLORE_ANALYSIS_SUBDIR) !== null;
   try {
     const report = await openloreAudit({
       rootPath: absDir,
       maxUncovered,
       hubThreshold,
-      save: true,
+      save: mayPersist,
     });
-    return report;
+    return mayPersist
+      ? report
+      : {
+          ...(report as unknown as Record<string, unknown>),
+          saved: false,
+          savedSkippedReason:
+            'This server holds the repository on READ only, so the report was returned but not ' +
+            'written to .openlore/analysis/. Nothing is missing from the answer above.',
+        };
   } catch (err) {
     return { error: `Audit failed: ${err instanceof Error ? err.message : String(err)}` };
   }
