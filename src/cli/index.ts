@@ -49,9 +49,13 @@ import { gryphWatchCommand } from './commands/gryph-watch.js';
 import { configureLogger } from '../utils/logger.js';
 import { setLocale } from '../utils/i18n.js';
 
-// Read version from package.json at runtime so it never drifts from the published version
+// Read version from package.json at runtime so it never drifts from the published version.
+// forkTag identifies THIS build: upstream and every ru-fork share the same X.Y.Z, so `--version` alone
+// could not tell whether an update actually landed — the difference was only visible in behaviour
+// (which flags the binary understands). Printed next to the version; absent in upstream builds.
 const require = createRequire(import.meta.url);
-const { version } = require('../../package.json') as { version: string };
+const { version, forkTag } = require('../../package.json') as { version: string; forkTag?: string };
+const versionLine = forkTag ? `${version} (${forkTag})` : version;
 
 const program = new Command();
 
@@ -89,7 +93,7 @@ program
       'Philosophy: "Archaeology over Creativity" — We extract the truth of what\n' +
       'code does, grounded in static analysis, not LLM hallucinations.'
   )
-  .version(version)
+  .version(versionLine)
   .option('-q, --quiet', 'Minimal output (errors only)', false)
   .option('-v, --verbose', 'Show debug information', false)
   .option('--no-color', 'Disable colored output (also enables timestamps)')
