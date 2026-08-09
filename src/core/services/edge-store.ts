@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { CallEdge, FunctionNode, ClassNode, InheritanceEdge, SerializedCallGraph } from '../analyzer/call-graph.js';
 import type { FunctionCfg } from '../analyzer/cfg.js';
@@ -64,8 +65,33 @@ export class EdgeStore {
   private _wasReset = false;
   get wasReset(): boolean { return this._wasReset; }
 
-  private constructor(private readonly db: DatabaseSync) {
-    this.initSchema();
+  /**
+   * True when this handle was opened READ-ONLY and the database is not usable that
+   * way — a stale SCHEMA_VERSION that only a writer could rebuild, or a schema we
+   * cannot even interrogate. Callers must withhold the store and SAY why, rather
+   * than serve an empty graph that reads as "no analysis here".
+   */
+  private _readOnlyUnusable = false;
+  get readOnlyUnusable(): boolean { return this._readOnlyUnusable; }
+
+  private constructor(private readonly db: DatabaseSync, readOnly = false) {
+    if (readOnly) this.checkSchemaReadOnly();
+    else this.initSchema();
+  }
+
+  /**
+   * Schema handling for a READ-ONLY handle. `initSchema` CREATEs, INSERTs and — on
+   * a version bump — DROPs every table: opening someone else's index for a mere
+   * read would rewrite it, and on a bump would destroy it. A read-only handle looks
+   * instead of repairing, and reports unusability upward.
+   */
+  private checkSchemaReadOnly(): void {
+    try {
+      const row = this.db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number } | undefined;
+      if (row === undefined || row.version !== SCHEMA_VERSION) this._readOnlyUnusable = true;
+    } catch {
+      this._readOnlyUnusable = true;
+    }
   }
 
   private initSchema(): void {
@@ -508,6 +534,20 @@ export class EdgeStore {
   countNodes(): number {
     const row = this.db.prepare('SELECT COUNT(*) as n FROM nodes WHERE is_external = 0 AND is_test = 0').get() as { n: number };
     return row.n;
+  }
+
+  /**
+   * Distinct production file paths — the input to source-root inference.
+   *
+   * Exposed as a method so its caller can reach the graph through the shared,
+   * perimeter-aware opener instead of running `new DatabaseSync(dbPath)` itself:
+   * that bare constructor opens for WRITING, which is how a purely read-shaped
+   * helper ended up modifying a repository this server may only read.
+   */
+  sourceRootRows(): Array<{ file_path: string }> {
+    return this.db
+      .prepare('SELECT DISTINCT file_path FROM nodes WHERE is_external = 0 AND is_test = 0')
+      .all() as unknown as Array<{ file_path: string }>;
   }
 
   // ── Node mutations ────────────────────────────────────────────────────────────
@@ -991,6 +1031,30 @@ export class EdgeStore {
 
   static open(dbPath: string): EdgeStore {
     return new EdgeStore(openDatabase(dbPath));
+  }
+
+  /**
+   * Open the index leaving NOTHING behind — for a repository this process may read
+   * but not write.
+   *
+   * `readOnly: true` alone is not enough, and the difference is the whole point.
+   * The index is a WAL database, and a WAL reader needs the shared-memory index: a
+   * plain read-only connection materializes `call-graph.db-shm` AND `call-graph.db-wal`
+   * inside the other repository and leaves them there. Measured, not assumed. The
+   * `immutable=1` URI tells SQLite the file cannot change underneath it, which is
+   * exactly the promise a non-writer can make, and skips the sidecars entirely —
+   * zero bytes written.
+   *
+   * The cost of that promise, stated plainly: if the owning repository runs its own
+   * `openlore analyze` concurrently, this reader may see the pre-commit state (or,
+   * in the worst case, an inconsistent one). That is the honest trade for consulting
+   * an index we do not own; the alternative is no cross-repo graph at all.
+   *
+   * Throws when the database cannot be served this way — the caller degrades and says so.
+   */
+  static openReadOnly(dbPath: string): EdgeStore {
+    const uri = `${pathToFileURL(dbPath).href}?immutable=1`;
+    return new EdgeStore(new DatabaseSync(uri, { readOnly: true }), true);
   }
 
   static exists(outputDir: string): boolean {

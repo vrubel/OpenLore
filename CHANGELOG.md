@@ -5,6 +5,61 @@ All notable changes to OpenLore are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **The MCP server now has a filesystem perimeter, closed by default — a behaviour
+  change for every existing `openlore mcp` user.** Previously a server started for
+  one repository answered, in full, about any absolute path on the machine: all 62
+  tools take a `directory`, and the only check it met was "does this resolve to an
+  existing directory". The perimeter was held by the agent not knowing the
+  neighbours' paths, and openlore itself hands those out through the federation
+  registry — so it was not held at all.
+
+  Roots are declared at start: `--root <path>` (readable, repeatable) and
+  `--write-root <path>` (writable, repeatable, must be inside a read root).
+  **Defaults: read = the working directory; write = the working directory when it
+  lies inside a read root, otherwise nothing.** A repository granted for reading
+  never becomes writable by implication, so serving neighbours with several
+  `--root` flags cannot silently make them writable. The perimeter is printed to
+  stderr at startup.
+
+  Enforcement stands where the disk is touched, not only where a request arrives:
+  in `validateDirectory`; on the transport before telemetry, daemon resolution,
+  panic state, watcher adoption or any `git` spawn; on paths taken from
+  `.openlore/config.json` (`specStore.path` is caller input — the config sits in a
+  root the caller can write); and at each write performed during a read. The
+  call-graph index is no longer opened for writing in a read-only repository
+  (opening it ran `PRAGMA journal_mode = WAL`, `CREATE TABLE`, and on a schema bump
+  `DROP TABLE` over someone else's index) — it is opened `immutable`, leaving no
+  `-wal`/`-shm` behind, and any withheld capability is reported rather than
+  silently degraded.
+
+  Refusals are uniform: a path outside the roots gets the same answer whether it
+  exists, is absent, or is a file, reached directly or through a symlink inside an
+  allowed root. Canonicalization fails closed, and the canonical path is what the
+  check returns and callers use, so a symlink swapped after the check cannot move
+  the target. Enumerating responses (`federation_status`, `spec_store_status`, and
+  every `federation: true` query) withhold members outside the read roots and
+  report how many were withheld.
+
+  **What may need adjusting.** A server that must serve more than its working
+  directory needs explicit `--root` flags — notably an isolated agent whose
+  `directory` is a scratch dir distinct from the analysis root, and cross-repo
+  federation over neighbouring repositories. `openlore mcp --daemon` is refused
+  while a perimeter is configured, and an already-running `openlore serve` daemon
+  is no longer delegated to: that daemon carries no allowlist and is discovered
+  through a file inside the perimeter. `--watch <dir>` now implies a root and must
+  lie inside the declared ones.
+
+  The allowlist applies to the MCP server only. CLI commands declare none, so
+  `openlore federation add <path>` and every other command are unchanged.
+
+- **`change_impact_certificate` is no longer annotated read-only.** It writes a
+  certificate file when `persist: true`. The mutator gate that trusted the
+  annotations listed eight tools while ten write; the list is now explicit and a
+  test keeps it and the annotations in agreement in both directions.
+
+
 ### Removed
 
 - **The unused `memfs` devDependency is gone, and with it the entire

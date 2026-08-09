@@ -13,15 +13,20 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileExists } from '../../utils/command-helpers.js';
 import {
-  OPENLORE_DIR,
   OPENLORE_MEMORY_SUBDIR,
   MEMORY_NOTES_FILE,
 } from '../../constants.js';
 import { atomicWriteFile, casUpdate, quarantineCorrupt } from './atomic-store.js';
+import { openloreReadTarget, openloreWriteTarget } from '../services/write-target.js';
 import type { MemoryStore, StructuralAnchor } from '../../types/index.js';
 
 export function memoryDir(rootPath: string): string {
-  return join(rootPath, OPENLORE_DIR, OPENLORE_MEMORY_SUBDIR);
+  return openloreReadTarget(rootPath, OPENLORE_MEMORY_SUBDIR);
+}
+
+/** Write-side twin of {@link memoryDir}: canonical and perimeter-approved. */
+export function memoryWriteDir(rootPath: string): string {
+  return openloreWriteTarget(rootPath, OPENLORE_MEMORY_SUBDIR);
 }
 
 function memoryPath(rootPath: string): string {
@@ -72,7 +77,9 @@ export async function saveMemoryStore(rootPath: string, store: MemoryStore): Pro
     updatedAt: new Date().toISOString(),
     sequence: (store.sequence ?? 0) + 1,
   };
-  await atomicWriteFile(memoryPath(rootPath), JSON.stringify(updated, null, 2) + '\n');
+  // Write path goes through the perimeter-derived directory (see memoryWriteDir):
+  // `join` would not follow a symlinked `.openlore` and would land outside the root.
+  await atomicWriteFile(join(memoryWriteDir(rootPath), MEMORY_NOTES_FILE), JSON.stringify(updated, null, 2) + '\n');
 }
 
 /**
@@ -86,7 +93,7 @@ export async function updateMemoryStore(
   mutate: (store: MemoryStore) => MemoryStore,
 ): Promise<MemoryStore> {
   return casUpdate<MemoryStore>({
-    storePath: memoryPath(rootPath),
+    storePath: join(memoryWriteDir(rootPath), MEMORY_NOTES_FILE),
     load: () => loadMemoryStore(rootPath),
     mutate: (current) => ({ ...mutate(current), updatedAt: new Date().toISOString() }),
     serialize: (next) => JSON.stringify(next, null, 2) + '\n',

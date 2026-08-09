@@ -40,6 +40,8 @@ import { memoryFreshness } from '../../decisions/anchor.js';
 import { readOpenLoreConfig } from '../config-manager.js';
 import { OPENLORE_DIR } from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode, CallEdge } from '../../analyzer/call-graph.js';
+import { openloreWriteTarget } from '../write-target.js';
+import { isPerimeterRefusal } from './root-allowlist.js';
 import type {
   StructuralAnchor,
   CoveringSurfaceConfig,
@@ -645,7 +647,9 @@ function certFileName(change: string): string {
 
 /** Persist a certificate under `.openlore/impact-certificates/` for later decay re-checks. */
 export function persistCertificate(absDir: string, cert: ImpactCertificate): void {
-  const dir = certDir(absDir);
+  // Perimeter-derived: `certDir` is a lexical join and would follow a symlinked
+  // `.openlore` straight out of the granted root.
+  const dir = openloreWriteTarget(absDir, CERT_SUBDIR);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, certFileName(cert.change)), JSON.stringify(cert, null, 2), 'utf-8');
 }
@@ -927,7 +931,23 @@ export async function computeImpactCertificate(
   cert.headline = renderHeadline(cert);
 
   if (input.persist && changedFiles.length > 0) {
-    try { persistCertificate(absDir, cert); } catch { /* persistence is best-effort; advisory never blocks */ }
+    try {
+      persistCertificate(absDir, cert);
+    } catch (err) {
+      // Persistence is best-effort and must never block an advisory certificate —
+      // but "best-effort" is not licence to swallow a PERIMETER refusal in silence.
+      // The rule this module has to obey is the one written at the top of
+      // write-target.ts: a withheld write obliges the caller to SAY it degraded.
+      if (isPerimeterRefusal(err)) {
+        caveats.push(
+          'This certificate was NOT persisted: its storage location is outside this server\'s write ' +
+          'perimeter, so the decay re-check on a later run will not find it. (The repository itself may ' +
+          'well be inside the perimeter — it is where `.openlore` actually leads that was refused.)'
+        );
+        cert.headline = renderHeadline(cert);
+      }
+      /* other persistence failures stay best-effort */
+    }
   }
   return cert;
 }

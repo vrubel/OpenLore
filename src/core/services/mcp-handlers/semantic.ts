@@ -3,25 +3,12 @@
  * search_code, suggest_insertion_points, search_specs.
  */
 
-import { join } from 'node:path';
-import {
-  INSERTION_SEMANTIC_WEIGHT,
-  INSERTION_STRUCTURAL_WEIGHT,
-  INSERTION_ROLE_BONUS_ENTRY_POINT,
-  INSERTION_ROLE_BONUS_ORCHESTRATOR,
-  INSERTION_ROLE_BONUS_HUB,
-  INSERTION_ROLE_BONUS_INTERNAL,
-  INSERTION_ROLE_BONUS_UTILITY,
-  INSERTION_ORCHESTRATOR_FAN_OUT_THRESHOLD,
-  OPENLORE_DIR,
-  OPENLORE_ANALYSIS_SUBDIR,
-  OPENSPEC_DIR,
-  OPENSPEC_SPECS_SUBDIR,
-} from '../../../constants.js';
+import { INSERTION_SEMANTIC_WEIGHT, INSERTION_STRUCTURAL_WEIGHT, INSERTION_ROLE_BONUS_ENTRY_POINT, INSERTION_ROLE_BONUS_ORCHESTRATOR, INSERTION_ROLE_BONUS_HUB, INSERTION_ROLE_BONUS_INTERNAL, INSERTION_ROLE_BONUS_UTILITY, INSERTION_ORCHESTRATOR_FAN_OUT_THRESHOLD, OPENLORE_ANALYSIS_SUBDIR, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR,  } from '../../../constants.js';
 import { fileExists } from '../../../utils/command-helpers.js';
 import { validateDirectory, safeJoin, loadMappingIndex, specsForFile, functionsForDomain, queryTooLongError } from './utils.js';
 import { expandHandle, applyTokenBudget, collapseExactDuplicates, omissionNote } from './progressive.js';
 import { readOpenLoreConfig } from '../config-manager.js';
+import { openloreReadTarget } from '../write-target.js';
 
 // ============================================================================
 // INSERTION POINT HELPERS
@@ -181,7 +168,7 @@ export async function handleSearchCode(
 ): Promise<unknown> {
   const tooLong = queryTooLongError(query); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
   const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
@@ -322,7 +309,7 @@ export async function handleSuggestInsertionPoints(
 ): Promise<unknown> {
   const tooLong = queryTooLongError(description, 'description'); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
   const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
@@ -530,7 +517,7 @@ export async function handleSearchSpecs(
 ): Promise<unknown> {
   const tooLong = queryTooLongError(query); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   const { SpecVectorIndex } = await import('../../analyzer/spec-vector-index.js');
   const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
@@ -598,7 +585,7 @@ export async function handleUnifiedSearch(
 ): Promise<unknown> {
   const tooLong = queryTooLongError(query); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   const { UnifiedSearch, unifiedSearchAvailable } =
     await import('../../analyzer/unified-search.js');

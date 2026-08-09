@@ -20,6 +20,7 @@ import {
   PANIC_SESSION_EXPIRY_MS,
   PANIC_SCORE_MAX,
 } from './panic-constants.js';
+import { tryOpenloreWriteTarget } from '../write-target.js';
 
 // ============================================================================
 // TYPES
@@ -185,7 +186,11 @@ function atomicWriteState(path: string, state: PanicState, revision: number): bo
  */
 export function writePanicState(directory: string, state: PanicState): number {
   const newRevision = (state.revision ?? 0) + 1;
-  const path = join(directory, OPENLORE_DIR, PANIC_STATE_FILE);
+  // Perimeter-derived: panic state is a WRITE performed on behalf of tools that
+  // only read, into a directory chosen by the target repo's own config. `join`
+  // would not follow a symlinked `.openlore`.
+  const path = tryOpenloreWriteTarget(directory, PANIC_STATE_FILE);
+  if (path === null) return state.revision ?? 0;
   return atomicWriteState(path, state, newRevision) ? newRevision : (state.revision ?? 0);
 }
 
@@ -212,7 +217,9 @@ function sleepSyncMs(ms: number): void {
  * the panic subsystem must never block or crash a tool call over a contended/failed write).
  */
 function withPanicStateLock<T>(directory: string, fn: () => T, fallback: T, maxAttempts = LOCK_MAX_ATTEMPTS): T {
-  const lockPath = `${join(directory, OPENLORE_DIR, PANIC_STATE_FILE)}.lock`;
+  const stateForLock = tryOpenloreWriteTarget(directory, PANIC_STATE_FILE);
+  if (stateForLock === null) return fallback;   // outside the write perimeter — do not lock, do not write
+  const lockPath = `${stateForLock}.lock`;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let fd: number;
     try {
@@ -250,6 +257,8 @@ export function casWritePanicState(
   state: PanicState,
   maxAttempts: number = LOCK_MAX_ATTEMPTS,
 ): boolean {
+  // Same form as F1: derive through the perimeter rather than lexically, even inside
+  // a section the gate has already opened.
   return withPanicStateLock(directory, () => {
     const path = join(directory, OPENLORE_DIR, PANIC_STATE_FILE);
     let currentRevision = 0;
@@ -303,6 +312,17 @@ export function mutatePanicStateLocked(
   directory: string,
   mutate: (fresh: PanicState) => PanicState,
 ): PanicState {
+  // PERIMETER FIRST, and at the TOP — not inside the lock helper.
+  //
+  // The lock helper's own refusal returns its `fallback`, and the last line of this
+  // function is `withPanicStateLock(...) ?? apply()`: a deliberate fail-open, so that
+  // an unobtainable lock degrades to an unlocked write rather than blocking the hot
+  // path. A perimeter refusal returned through that same channel is therefore not a
+  // refusal at all — it falls straight through to `apply()`, which runs the
+  // read-modify-write unlocked. The gate has to stand before the fail-open, or it is
+  // decoration. (Found by proving each layer live separately; the lock-level gate
+  // alone let the mutation run and was stopped only by the gate inside writePanicState.)
+  if (tryOpenloreWriteTarget(directory, PANIC_STATE_FILE) === null) return readPanicState(directory);
   const apply = (): PanicState => {
     const fresh = readPanicState(directory);
     // Seed revision from the freshest disk read so writePanicState bumps to fresh+1

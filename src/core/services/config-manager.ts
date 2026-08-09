@@ -9,15 +9,9 @@ import { join } from 'node:path';
 import YAML from 'yaml';
 import type { ProjectType, OpenLoreConfig } from '../../types/index.js';
 import { logger } from '../../utils/logger.js';
-import {
-  DEFAULT_MAX_FILES,
-  DEFAULT_ANTHROPIC_MODEL,
-  OPENLORE_DIR,
-  OPENLORE_CONFIG_FILENAME,
-  OPENLORE_CONFIG_REL_PATH,
-  OPENSPEC_CONFIG_FILENAME,
-} from '../../constants.js';
+import { DEFAULT_MAX_FILES, DEFAULT_ANTHROPIC_MODEL, OPENLORE_CONFIG_FILENAME, OPENLORE_CONFIG_REL_PATH, OPENSPEC_CONFIG_FILENAME } from '../../constants.js';
 import { fileExists } from '../../utils/command-helpers.js';
+import { openloreReadTarget, openloreWriteTarget } from './write-target.js';
 
 /**
  * OpenSpec config.yaml structure
@@ -75,7 +69,7 @@ export function getDefaultConfig(projectType: ProjectType, openspecPath: string)
  * Read openlore configuration from .openlore/config.json
  */
 export async function readOpenLoreConfig(rootPath: string): Promise<OpenLoreConfig | null> {
-  const configPath = join(rootPath, OPENLORE_DIR, OPENLORE_CONFIG_FILENAME);
+  const configPath = openloreReadTarget(rootPath, OPENLORE_CONFIG_FILENAME);
   let content: string;
   try {
     content = await readFile(configPath, 'utf-8');
@@ -98,7 +92,7 @@ export async function writeOpenLoreConfig(
   rootPath: string,
   config: OpenLoreConfig
 ): Promise<void> {
-  const configDir = join(rootPath, OPENLORE_DIR);
+  const configDir = openloreWriteTarget(rootPath);
   const configPath = join(configDir, OPENLORE_CONFIG_FILENAME);
 
   await ensureDir(configDir);
@@ -109,7 +103,7 @@ export async function writeOpenLoreConfig(
  * Check if openlore config already exists
  */
 export async function openloreConfigExists(rootPath: string): Promise<boolean> {
-  return fileExists(join(rootPath, OPENLORE_DIR, OPENLORE_CONFIG_FILENAME));
+  return fileExists(openloreReadTarget(rootPath, OPENLORE_CONFIG_FILENAME));
 }
 
 /**

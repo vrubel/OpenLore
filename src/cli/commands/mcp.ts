@@ -23,6 +23,7 @@ const _pkgVersion = (_require('../../../package.json') as { version: string }).v
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { join, resolve as nodeResolve } from 'node:path';
 
 import { Command } from 'commander';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -46,6 +47,19 @@ import {
 } from '../../core/services/mcp-handlers/tool-guard.js';
 
 import { sanitizeMcpError, validateDirectory } from '../../core/services/mcp-handlers/utils.js';
+import {
+  configureRootAllowlist,
+  assertRootAllowed,
+  getRootAllowlist,
+  isPathAllowed,
+  isPathWithinRoots,
+  isPerimeterRefusal,
+  isRootAllowlistConfigured,
+  toolAccessMode,
+} from '../../core/services/mcp-handlers/root-allowlist.js';
+
+/** Directories already reported as "panic-response wanted, but not writable here". */
+const _panicSkipNoted = new Set<string>();
 import { createTracker, updateTracker, updatePanic, resetPanicOnOrient, getFreshnessSignal, trackerToPanicState } from '../../core/services/mcp-handlers/epistemic-lease.js';
 import type { EpistemicTracker } from '../../core/services/mcp-handlers/epistemic-lease.js';
 import type { PanicResponseMode } from '../../types/index.js';
@@ -1718,7 +1732,11 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW> = 
   detect_changes: _RO, get_health_map: _RO, get_surprising_connections: _RO, record_decision: _RW, list_decisions: _RO,
   approve_decision: _RWI, reject_decision: _RWI, sync_decisions: _RWI,
   remember: _RW, recall: _RO, verify_claim: _RO,
-  spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RO,
+  // change_impact_certificate writes a certificate file when `persist: true` — it
+  // shipped as _RO, which made the annotation table (and the mutator gate that
+  // trusts it) wrong about a tool that touches disk. _RWI: it writes, and writing
+  // the same certificate twice is the same certificate.
+  spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RWI,
 };
 
 // Tools that touch external entities (LLM / network) → openWorldHint: true.
@@ -1817,6 +1835,103 @@ interface McpServerOptions {
   port?: string;        // порт (default 7787; '0' — эфемерный)
   token?: string;       // опц. Bearer-токен (если задан — auth обязателен; для изолированного контура)
   sseKeepAliveMs?: number;  // интервал SSE-heartbeat для GET-стрима (default 25000; тест задаёт малый)
+  // --- Корневой allowlist (периметр ФС сервера) ---
+  root?: string[];      // корни, разрешённые на ЧТЕНИЕ (повторяемый --root); default [process.cwd()]
+  writeRoot?: string[]; // корни, разрешённые на ЗАПИСЬ (повторяемый --write-root); default: [cwd], если cwd внутри корня чтения, иначе ПУСТО
+}
+
+/**
+ * Объявить периметр файловой системы этого сервера — ОДИН раз, до первого запроса.
+ *
+ * Чтение закрыто по умолчанию: без флагов единственный корень — рабочий каталог
+ * процесса. Именно так openlore и запускают: PDLC ставит `cwd` = каталог с
+ * `.openlore/analysis`, редакторные интеграции — корень открытого проекта.
+ * Расширение периметра — ЯВНЫЙ акт оператора, а не то, что достаётся молча.
+ *
+ * ЗАПИСЬ ПО УМОЛЧАНИЮ — РОВНО СВОЙ РЕПОЗИТОРИЙ, НИКОГДА НЕ СОСЕДИ: `[cwd]`, если
+ * `cwd` лежит внутри какого-то корня чтения, иначе ПУСТОЙ список (сервер только на
+ * чтение). Это не мелочь настройки, а само требование: пишущие инструменты по чужому
+ * `directory` (`analyze_codebase` перепишет `.openlore` соседа) закрываются НЕЗАВИСИМО
+ * от allowlist — даже разрешённый на ЧТЕНИЕ репозиторий не может быть изменён из
+ * прогона по другому репозиторию.
+ *
+ * Почему не «write = все корни чтения»: типовой запуск federation-стадии —
+ * `--root <свой> --root <сосед1> --root <сосед2>` (соседи нужны на чтение, писать в них
+ * незачем). При таком дефолте каждый сосед оказался бы записываемым, и периметр записи
+ * держался бы на том, что вызывающий не забудет `--write-root`. Это тихий fail-open —
+ * ровно тот класс, который здесь и чинится.
+ *
+ * Почему не буквальный `[cwd]` всегда: тогда `--root /a` при `cwd` вне `/a` падал бы
+ * на стартовой проверке «корень записи вне корней чтения» — отказ, которого оператор
+ * не заслужил, и read-only сервер стал бы невыразим. Пустая запись выражает его честно.
+ */
+/**
+ * `--watch-auto` (дефолт ВКЛ) усыновляет каталог из ПЕРВОГО tool-вызова и поднимает
+ * на нём вотчер, который ПИШЕТ `<dir>/.openlore/analysis`. Это концептуальный
+ * антипод allowlist: агент выбирает, где сервер начнёт писать, — и выбирал успешно,
+ * баннер печатал «запись НИКУДА», а один read-вызов по соседу делал его
+ * записываемым. Под периметром усыновление глушится (в HTTP так было и раньше);
+ * ЯВНЫЙ `--watch <dir>` не трогаем — там каталог назван оператором и введён в корни.
+ */
+function withWatchAutoOffUnderPerimeter(options: McpServerOptions): McpServerOptions {
+  if (!isRootAllowlistConfigured() || options.watchAuto === false) return options;
+  process.stderr.write(
+    'openlore MCP: --watch-auto выключен периметром (усыновление каталога из вызова агента ' +
+    'сделало бы его записываемым). Нужен вотчер — назовите каталог явно: --watch <dir>.\n'
+  );
+  return { ...options, watchAuto: false };
+}
+
+function applyRootAllowlist(options: McpServerOptions): void {
+  const cwd = process.cwd();
+  // `--watch <dir>` is an instruction to WRITE: the watcher re-indexes into
+  // `<dir>/.openlore/analysis`. Left out of the perimeter it produced a command at
+  // war with itself — the watcher writing where tool calls were refused. So the
+  // watched directory joins the roots when they are implicit, and must be inside
+  // them when they were given explicitly (an operator who names both and means two
+  // different places has made a mistake worth hearing about at startup).
+  const watchDir = options.watch ? nodeResolve(options.watch) : null;
+  const explicitRead = options.root && options.root.length > 0 ? options.root : null;
+  if (explicitRead && watchDir && !isPathWithinRoots(watchDir, explicitRead)) {
+    throw new Error(
+      `openlore mcp --watch ${watchDir}: наблюдаемый каталог обязан лежать внутри корней чтения ` +
+      `(${explicitRead.join(', ')}) — вотчер пишет в него индекс. Добавьте его в --root или уберите --watch.`
+    );
+  }
+  const readRoots = explicitRead ?? (watchDir && !isPathWithinRoots(watchDir, [cwd]) ? [cwd, watchDir] : [cwd]);
+  // Write default: own repository, never neighbours (see above). The watched
+  // directory is added because watching IS an explicit instruction to write there —
+  // that is stated intent, not writability by implication.
+  const implicitWrite = [
+    ...(isPathWithinRoots(cwd, readRoots) ? [cwd] : []),
+    ...(watchDir && isPathWithinRoots(watchDir, readRoots) ? [watchDir] : []),
+  ];
+  const writeRoots = options.writeRoot && options.writeRoot.length > 0 ? options.writeRoot : implicitWrite;
+  configureRootAllowlist({ readRoots, writeRoots });
+  // A shared `openlore serve` daemon has no perimeter of its own and is discovered
+  // through a file the agent can write (see `resolveDaemon`). Spawning one from a
+  // perimeter-bearing server would export the whole tool surface past the boundary,
+  // so say so at startup instead of quietly ignoring the flag.
+  if (options.daemon) {
+    throw new Error(
+      'openlore mcp --daemon: делегирование общему `openlore serve`-демону несовместимо с корневым ' +
+      'периметром — демон поднимается БЕЗ токена и БЕЗ allowlist, а находят его через ' +
+      '<repo>/.openlore/serve.json, файл внутри доступного агенту корня. Уберите --daemon (сервер ' +
+      'отработает в своём процессе) либо запускайте `openlore serve` отдельно и осознанно.'
+    );
+  }
+  // Периметр печатаем на stderr при СТАРТЕ: оператор, у которого агент вдруг стал
+  // получать отказы, должен видеть границу в логе запуска, а не выяснять её из
+  // текста отказа. stderr, а не stdout — в stdio-режиме stdout принадлежит протоколу.
+  const st = getRootAllowlist();
+  if (st) {
+    // Пустой список записи — законная и ВАЖНАЯ конфигурация (сервер только на чтение),
+    // поэтому она пишется словами, а не пустыми скобками, которые читаются как «не знаю».
+    const w = st.writeRoots.length > 0
+      ? `запись [${st.writeRoots.join(', ')}]`
+      : 'запись НИКУДА (сервер только на чтение)';
+    process.stderr.write(`openlore MCP: периметр — чтение [${st.readRoots.join(', ')}], ${w}\n`);
+  }
 }
 
 /**
@@ -1859,6 +1974,15 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
   const daemonPending = new Map<string, Promise<ServeEndpoint | null>>();
   function resolveDaemon(dir: string): Promise<ServeEndpoint | null> {
     if (!dir) return Promise.resolve(null);
+    // A perimeter and a shared daemon are mutually exclusive, and discovery is the
+    // reason. `openlore serve` knows nothing about root allowlists: it dispatches
+    // the same 62 tools with no perimeter at all, and it is found by reading
+    // `<repo>/.openlore/serve.json` — a file inside a root the agent can write, at
+    // whose host:port an unauthenticated endpoint answers. Delegating there hands
+    // the whole tool surface to a process outside this boundary, and lets the agent
+    // choose which process that is. Running in-process is always available and
+    // costs only warm caches, so refuse the delegation rather than the work.
+    if (isRootAllowlistConfigured()) return Promise.resolve(null);
     if (daemonByDir.has(dir)) return Promise.resolve(daemonByDir.get(dir) ?? null);
     // Dedup concurrent calls for the same dir — without this, two parallel tool
     // calls both miss the cache and each call ensureServeDaemon, potentially
@@ -1897,6 +2021,58 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
 
+    const _dir = (args as Record<string, unknown>).directory;
+    const directory = typeof _dir === 'string' ? _dir : '';
+    const _t0 = Date.now();
+
+    // ── Периметр ФС — ПЕРВЫМ, до любого касания диска ─────────────────────────
+    //
+    // Второе место внедрения, и одного мало. `validateDirectory` в хендлере — это
+    // ГЛУБОКО: до него транспорт успевает поработать с сырым `args.directory`:
+    //   • emit() создаёт <dir>/.openlore/telemetry и дописывает туда — включая
+    //     ветку INVALID_ARGS ниже (PDLC поднимает openlore с OPENLORE_TELEMETRY=1);
+    //   • resolveDaemon() читает <dir>/.openlore/serve.json и МОЖЕТ делегировать
+    //     вызов чужому живому демону — мимо наших хендлеров вообще;
+    //   • createTracker() спавнит git с cwd=<dir>, mutatePanicStateLocked пишет
+    //     panic-state.json;
+    //   • --watch-auto (выше) усыновляет каталог из ПЕРВОГО вызова и поднимает на
+    //     нём вотчер — концептуальный антипод allowlist.
+    // Всё это происходило бы по пути, в котором хендлер через миг откажет.
+    //
+    // Отказ — результат инструмента с isError, а не -32602: это не протокольная
+    // ошибка запроса, а решение сервера, и текст обязан дойти до агента целиком.
+    if (directory) {
+      try {
+        assertRootAllowed(directory, toolAccessMode(name));
+      } catch (err) {
+        // Попытка выйти за периметр записывается ВСЕГДА — на stderr, канал оператора,
+        // который есть в любом режиме (в stdio stdout занят протоколом, stderr нет).
+        //
+        // Раньше журнал шёл только через `emit`, а тот выходит сразу без
+        // OPENLORE_TELEMETRY=1, и ветка stderr срабатывала лишь когда корней записи
+        // нет вовсе. То есть рассуждение было перевёрнуто: защищён редкий случай
+        // (read-only сервер), а самый частый — обычный `openlore mcp` без телеметрии —
+        // оставался немым. Побеги должны быть видны в конфигурации по умолчанию.
+        process.stderr.write(
+          `openlore MCP: отказ периметра — инструмент "${name}" (${toolAccessMode(name)}) ` +
+          `на "${directory}", агент "${agentName}"\n`
+        );
+        // Плюс машинный след в телеметрию СВОЕГО периметра (не по запрошенному пути),
+        // когда она включена и есть куда писать.
+        const auditRoot = getRootAllowlist()?.writeRoots[0] ?? '';
+        if (auditRoot) {
+          emit(auditRoot, 'mcp', {
+            event: 'tool_denied', tool: name, reason: 'root_allowlist',
+            mode: toolAccessMode(name), requested: directory, agent: agentName,
+          });
+        }
+        return {
+          content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
+          isError: true,
+        };
+      }
+    }
+
     if (options.watchAuto && !autoWatcher) {
       const dir = (args as Record<string, unknown>).directory;
       if (typeof dir === 'string') {
@@ -1921,10 +2097,6 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
         }
       }
     }
-
-    const _dir = (args as Record<string, unknown>).directory;
-    const directory = typeof _dir === 'string' ? _dir : '';
-    const _t0 = Date.now();
 
     // Input validation (spec-10) against the tool's own declared inputSchema, before
     // dispatch. Invalid args become a JSON-RPC -32602 error (spec-12), not an
@@ -1956,7 +2128,23 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
         const isOrient = name === 'orient';
         updateTracker(tracker, name, directory, typeof filePath === 'string' ? filePath : undefined);
 
-        if (panicPolicy !== 'off') {
+        // Panic response WRITES: `<directory>/.openlore/panic-state.json` plus a
+        // `.lock` and a `.tmp` beside it. The tool that triggers it is usually a
+        // READ tool, so the transport's write gate (keyed on the tool name) never
+        // asks — and whether it runs at all is decided by `panicResponse.mode` in
+        // the TARGET repository's own config, i.e. by the neighbour. Decide by the
+        // file about to be written, in write mode; degrade audibly, once per
+        // directory, rather than skipping in silence.
+        const panicFile = join(directory, '.openlore', 'panic-state.json');
+        const panicWritable = panicPolicy === 'off' || isPathAllowed(panicFile, 'write');
+        if (panicPolicy !== 'off' && !panicWritable && !_panicSkipNoted.has(trackerDir)) {
+          _panicSkipNoted.add(trackerDir);
+          process.stderr.write(
+            `openlore MCP: panic-response is enabled by the config in ${directory}, but that repository is ` +
+            `outside this server's write perimeter — panic state is NOT tracked there.\n`
+          );
+        }
+        if (panicPolicy !== 'off' && panicWritable) {
           // Read disk state to preserve hook-written fields (lastHookInterventionAt, gryphWindowStart)
           // that panic-check (separate process) may have set since the last MCP write.
           const diskState = readPanicState(directory);
@@ -2062,6 +2250,20 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
       // the agent's context. capStructuredResult truncates at the STRUCTURED level so a
       // JSON result stays valid+parseable (naive byte-truncation of serialized JSON cuts
       // mid-string-literal — e.g. get_spec on a >256 KB spec — and is unusable).
+      // A perimeter refusal raised DEEP in a handler comes back as the handler's
+      // ordinary `{ error }` value, and without this the call is reported to the
+      // client as a SUCCESS carrying an error field. MCP clients decide "did this
+      // fail" from `isError`; an agent told the call succeeded has been told the
+      // boundary is a data quirk rather than a boundary. Door-level refusals were
+      // already flagged — this makes the deep ones agree with them.
+      if (isPerimeterRefusal(result)) {
+        const msg = (result as { error?: string }).error ?? String(result);
+        process.stderr.write(
+          `openlore MCP: отказ периметра (глубокий) — инструмент "${name}" на "${directory}", агент "${agentName}"\n`
+        );
+        return { content: [{ type: 'text', text: msg }], isError: true };
+      }
+
       const { text, truncated } = capStructuredResult(result, MCP_TOOL_MAX_BYTES);
 
       emit(directory, 'mcp', {
@@ -2134,13 +2336,35 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
 /** Запустить watcher для явного --watch <dir> (общий для stdio/http). watch-auto живёт в самом сервере. */
 async function maybeStartWatcher(options: McpServerOptions): Promise<void> {
   if (!options.watch) return;
+  // The watcher's constructor derives its output dir through the perimeter and
+  // THROWS when it cannot. Unhandled, that killed the server: on stdio a raw stack
+  // and exit 1, on HTTP the same but AFTER listen() — a client saw an open port
+  // answering `initialize`, then a dead transport. A refusal has to read as an
+  // instruction to the operator, not as a crash.
+  const watchProbe = nodeResolve(options.watch);
+  if (!isPathAllowed(join(watchProbe, '.openlore'), 'write')) {
+    throw new Error(
+      `openlore mcp --watch ${watchProbe}: вотчер пишет индекс в ${join(watchProbe, '.openlore', 'analysis')}, ` +
+      'а этот путь вне корней ЗАПИСИ сервера. Обычная причина — раскладка, где `.openlore` внутри ' +
+      'наблюдаемого каталога является симлинком на другой репозиторий: тогда в периметр нужно ввести и ' +
+      'цель ссылки, например `--root <куда указывает .openlore> --write-root <туда же>`. ' +
+      'Либо уберите --watch.'
+    );
+  }
   const { resolve } = await import('node:path');
   const watchDir = resolve(options.watch);
   // Don't start a second watcher when a daemon is already watching this
-  // directory — that's exactly the invariant this PR establishes.
-  // Check discover-only (spawn:false): --watch is an explicit opt-in; if the
-  // user also started a daemon, they want delegation, not two watchers racing.
-  const existingDaemon = await ensureServeDaemon(watchDir, { spawn: false });
+  // directory. Check discover-only (spawn:false): --watch is an explicit opt-in;
+  // if the user also started a daemon, they want delegation, not two watchers.
+  //
+  // …but NOT while a perimeter is configured. Discovery reads
+  // `<dir>/.openlore/serve.json` — a file inside a root the agent can write — and
+  // then fetches the host:port it names. `resolveDaemon` was already guarded; this
+  // second call site was not, so the outbound request survived the guard it was
+  // supposed to be behind. Under a perimeter we simply own the watcher ourselves.
+  const existingDaemon = isRootAllowlistConfigured()
+    ? null
+    : await ensureServeDaemon(watchDir, { spawn: false });
   if (existingDaemon) return;
   const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
   const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
@@ -2164,6 +2388,8 @@ async function maybeStartWatcher(options: McpServerOptions): Promise<void> {
  * SDK StdioServerTransport пишет фреймы через process.stdout.write напрямую — он не затронут.
  */
 async function startStdioMcpServer(options: McpServerOptions = {}): Promise<void> {
+  applyRootAllowlist(options);   // периметр объявляем ДО того, как сервер начнёт принимать вызовы
+  options = withWatchAutoOffUnderPerimeter(options);
   const toStderr = (...args: unknown[]): void => {
     process.stderr.write(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
   };
@@ -2200,6 +2426,7 @@ function bearerOk(authHeader: string | undefined, token: string): boolean {
 export interface HttpMcpHandle { port: number; close: () => Promise<void>; }
 
 export async function startHttpMcpServer(options: McpServerOptions = {}): Promise<HttpMcpHandle> {
+  applyRootAllowlist(options);   // периметр объявляем ДО listen — плохие корни валят запуск, а не первый вызов
   const host = options.host ?? '127.0.0.1';
   const port = parseInt(options.port ?? '7787', 10);
   const token = options.token;                         // опц.: задан → auth обязателен
@@ -2216,6 +2443,7 @@ export async function startHttpMcpServer(options: McpServerOptions = {}): Promis
   // watch-auto — editor/stdio-фича (инкрементальный реиндекс при правках в редакторе). У REMOTE-агента
   // свежесть анализа держит ИСПОЛНИТЕЛЬ (пере-запуск analyze), а per-session-вотчеры бы текли — отключаем.
   const httpOptions: McpServerOptions = { ...options, watchAuto: false };
+  void withWatchAutoOffUnderPerimeter;   // HTTP уже гасит watch-auto безусловно (строка выше)
 
   // fail-loud: привязка к НЕ-loopback интерфейсу БЕЗ токена открыла бы анализ кода всем в сети.
   const isLoopback = host === '127.0.0.1' || host === '::1' || host === 'localhost';
@@ -2345,6 +2573,9 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
 // COMMAND EXPORT
 // ============================================================================
 
+/** commander collector for a repeatable path option (`--root a --root b`). */
+const collectPath = (value: string, previous?: string[]): string[] => [...(previous ?? []), value];
+
 export const mcpCommand = new Command('mcp')
   .description('Start openlore as an MCP server (stdio by default, or --http for remote/isolated agents)')
   .option('--watch <directory>', 'Watch a project directory and incrementally re-index signatures on file changes')
@@ -2359,4 +2590,6 @@ export const mcpCommand = new Command('mcp')
   .option('--host <host>', 'HTTP bind interface (default: 127.0.0.1)')
   .option('--port <port>', 'HTTP port (default: 7787; "0" = ephemeral)')
   .option('--token <token>', 'Optional Bearer token for HTTP transport — when set, every request must carry "Authorization: Bearer <token>" (closed-contour isolation)')
+  .option('--root <path>', 'Repository root this server may READ. Repeatable. Every tool call is confined to these roots (symlink-resolved), and nothing outside them is read, listed or disclosed. Default: the working directory — a server is always raised FOR something, so the perimeter is closed unless you widen it.', collectPath)
+  .option('--write-root <path>', 'Repository root this server may WRITE (analyze, decisions, generated tests, telemetry). Repeatable, and must be inside a --root. Default: the working directory when it lies inside a read root, otherwise NOTHING is writable — a repository you granted for reading is never writable by implication, so serving neighbours with several --root flags cannot silently make them writable.', collectPath)
   .action((options: McpServerOptions) => startMcpServer(options));

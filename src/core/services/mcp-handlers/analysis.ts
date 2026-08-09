@@ -53,6 +53,8 @@ import type { SerializedCallGraph } from '../../analyzer/call-graph.js';
 import type { MappingArtifact } from '../../generator/mapping-generator.js';
 import { openloreAudit } from '../../../api/audit.js';
 import type { DriftResult } from '../../../types/index.js';
+import { ensureWriteDir } from '../write-target.js';
+import { openloreReadTarget } from '../write-target.js';
 
 // ============================================================================
 // HANDLERS
@@ -66,7 +68,13 @@ export async function handleAnalyzeCodebase(
   force: boolean
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const outputPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  // The analysis output dir is a WRITE target, and the biggest one there is: a full
+  // pass drops the call graph, llm-context, SUMMARY, fingerprint and ten inventories
+  // here. Derived by a bare `join` it followed a symlinked `.openlore` clean out of
+  // the granted root — with the startup banner still truthfully reporting the root as
+  // the write perimeter. That is the ordinary PDLC isolated layout
+  // (`scratch/.openlore -> ws/.openlore`), not a contrived escape.
+  const outputPath = ensureWriteDir(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
 
   if (!force && await isCacheFresh(absDir)) {
     const ctx = await readCachedContext(absDir);
@@ -148,7 +156,7 @@ export async function handleGetArchitectureOverview(directory: string): Promise<
 
   let depGraph: import('../../analyzer/dependency-graph.js').DependencyGraphResult | null = null;
   try {
-    const raw = await readFile(join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH), 'utf-8');
+    const raw = await readFile(openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH), 'utf-8');
     depGraph = JSON.parse(raw) as import('../../analyzer/dependency-graph.js').DependencyGraphResult;
   } catch { /* ignore */ }
 
@@ -185,7 +193,7 @@ export async function handleGetRefactorReport(directory: string): Promise<unknow
  */
 export async function handleGetDuplicateReport(directory: string): Promise<unknown> {
   const absDir = await validateDirectory(directory);
-  const cachePath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, 'duplicates.json');
+  const cachePath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, 'duplicates.json');
 
   let raw: string;
   try {
@@ -240,7 +248,7 @@ export async function handleGetMapping(
   const absDir = await validateDirectory(directory);
   let raw: string;
   try {
-    raw = await readFile(join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING), 'utf-8');
+    raw = await readFile(openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING), 'utf-8');
   } catch {
     return { error: 'No mapping found. Run openlore generate first.' };
   }
@@ -330,7 +338,7 @@ export async function handleCheckSpecDrift(
     gitResult.files = gitResult.files.slice(0, maxFiles);
   }
 
-  const repoStructurePath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
+  const repoStructurePath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
   let hasRepoStructure = false;
   try {
     await stat(repoStructurePath);
@@ -497,7 +505,7 @@ export async function handleGetRouteInventory(
   directory: string
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const artifactPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_ROUTE_INVENTORY);
+  const artifactPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_ROUTE_INVENTORY);
 
   // Try reading cached artifact first
   try {
@@ -544,7 +552,7 @@ export async function handleGetMiddlewareInventory(
   directory: string
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const artifactPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MIDDLEWARE_INVENTORY);
+  const artifactPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MIDDLEWARE_INVENTORY);
 
   // Try reading cached artifact first
   try {
@@ -586,7 +594,7 @@ export async function handleGetSchemaInventory(
   directory: string
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const artifactPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_SCHEMA_INVENTORY);
+  const artifactPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_SCHEMA_INVENTORY);
 
   try {
     const raw = await readFile(artifactPath, 'utf-8');
@@ -627,7 +635,7 @@ export async function handleGetUIComponents(
   directory: string
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const artifactPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_UI_INVENTORY);
+  const artifactPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_UI_INVENTORY);
 
   try {
     const raw = await readFile(artifactPath, 'utf-8');
@@ -668,7 +676,7 @@ export async function handleGetEnvVars(
   directory: string
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const artifactPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_ENV_INVENTORY);
+  const artifactPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_ENV_INVENTORY);
 
   try {
     const raw = await readFile(artifactPath, 'utf-8');
@@ -710,7 +718,7 @@ export async function handleGetExternalPackages(
   directory: string,
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const artifactPath = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_EXTERNAL_PACKAGES);
+  const artifactPath = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_EXTERNAL_PACKAGES);
 
   try {
     const raw = await readFile(artifactPath, 'utf-8');

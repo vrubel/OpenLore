@@ -8,20 +8,11 @@
  */
 
 import { writeFile, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import {
-  SIMILARITY_CONTAINMENT_SCORE,
-  SIMILARITY_TOKEN_OVERLAP_WEIGHT,
-  HEURISTIC_MATCH_MIN_SCORE,
-  MAX_HEURISTIC_MATCHES_PER_OP,
-  OPENLORE_DIR,
-  OPENLORE_ANALYSIS_SUBDIR,
-  OPENSPEC_DIR,
-  ARTIFACT_MAPPING,
-} from '../../constants.js';
+import { SIMILARITY_CONTAINMENT_SCORE, SIMILARITY_TOKEN_OVERLAP_WEIGHT, HEURISTIC_MATCH_MIN_SCORE, MAX_HEURISTIC_MATCHES_PER_OP, OPENLORE_ANALYSIS_SUBDIR, OPENSPEC_DIR, ARTIFACT_MAPPING } from '../../constants.js';
 import type { PipelineResult } from './spec-pipeline.js';
 import type { DependencyGraphResult } from '../analyzer/dependency-graph.js';
 import type { SearchResult } from '../analyzer/vector-index.js';
+import { openloreReadTarget, openloreWriteTarget } from '../services/write-target.js';
 
 // ============================================================================
 // TYPES
@@ -315,7 +306,7 @@ export class MappingGenerator {
   }
 
   private async write(artifact: MappingArtifact): Promise<void> {
-    const outPath = join(this.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING);
+    const outPath = openloreWriteTarget(this.rootPath, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING);
     await writeFile(outPath, JSON.stringify(artifact, null, 2), 'utf-8');
   }
 
@@ -323,7 +314,7 @@ export class MappingGenerator {
   static async load(rootPath: string): Promise<MappingArtifact | null> {
     try {
       const content = await readFile(
-        join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING),
+        openloreReadTarget(rootPath, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_MAPPING),
         'utf-8'
       );
       return JSON.parse(content) as MappingArtifact;

@@ -30,7 +30,6 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { validateDirectory, readCachedContext } from './utils.js';
 import { buildAdjacency } from './graph.js';
 import { deadCodeIds } from './reachability.js';
@@ -45,9 +44,10 @@ import {
   type KnownUnknowableCrossing,
 } from './confidence-boundary.js';
 import { AnchorContext } from '../../decisions/anchor-adapter.js';
-import { ARTIFACT_FINGERPRINT, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR } from '../../../constants.js';
+import { ARTIFACT_FINGERPRINT, OPENLORE_ANALYSIS_SUBDIR } from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode } from '../../analyzer/call-graph.js';
 import type { GroundingCertificate, StructuralAnchor } from '../../../types/index.js';
+import { openloreReadTarget } from '../write-target.js';
 
 export type ClaimKind = 'calls' | 'reaches' | 'dead' | 'impacts' | 'safe-to-change';
 const CLAIM_KINDS: ReadonlySet<string> = new Set<ClaimKind>([
@@ -127,7 +127,7 @@ function resolveSymbol(cg: SerializedCallGraph, name: string): Resolution {
 /** Read the build commit the index was analyzed at, if it was captured. */
 async function readIndexCommit(absDir: string): Promise<string | null> {
   try {
-    const raw = await readFile(join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT), 'utf-8');
+    const raw = await readFile(openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT), 'utf-8');
     const fp = JSON.parse(raw) as { commit?: string | null };
     return fp.commit ?? null;
   } catch {

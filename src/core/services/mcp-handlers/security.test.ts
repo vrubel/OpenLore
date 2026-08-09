@@ -6,7 +6,7 @@
  * tests for the argument-injection guards. Kept in a plain .test.ts so CI runs it.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { readFileSync, readdirSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync, existsSync, statSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,13 +18,34 @@ import {
   readCachedContext,
   loadMappingIndex,
   queryTooLongError,
+  validateDirectory,
   _resetContextCacheForTesting,
   clearMappingCache,
 } from './utils.js';
+import {
+  configureRootAllowlist,
+  assertRootAllowed,
+  WRITING_TOOLS,
+  _resetRootAllowlistForTesting,
+} from './root-allowlist.js';
+import { handleFederationStatus } from './federation.js';
+import { handleWorkingSetContext } from './working-set.js';
+import { handleRecordDecision } from './decisions.js';
+import { handleRemember, handleRecall } from './memory.js';
+import { mutatePanicStateLocked } from './panic-response.js';
+import { writeTestFiles } from '../../test-generator/test-writer.js';
+import { ensureWriteDir } from '../write-target.js';
+import { loadMemoryStore } from '../../decisions/memory-store.js';
+import { loadDecisionStore } from '../../decisions/store.js';
+import { handleSpecStoreStatus } from './spec-store.js';
+import { EdgeStore } from '../edge-store.js';
+import { DatabaseSync } from 'node:sqlite';
+import { resolveFederationScope } from '../../federation/resolver.js';
+import { emit } from '../telemetry.js';
 import { redactSecrets, redactSecretString } from '../secret-redaction.js';
 import { TOOL_DEFINITIONS, toolAnnotations } from '../../../cli/commands/mcp.js';
 import { handleAnnotateStory } from './change.js';
-import { handleGetFunctionBody, handleGetMiddlewareInventory, handleGetRouteInventory } from './analysis.js';
+import { handleGetFunctionBody, handleGetMiddlewareInventory, handleGetRouteInventory, handleAnalyzeCodebase } from './analysis.js';
 import { handleSearchCode } from './semantic.js';
 import { handleOrient } from './orient.js';
 import { REPO_CONTENT_PROVENANCE, MAX_QUERY_LENGTH } from '../../../constants.js';
@@ -380,7 +401,12 @@ describe('Path-Parameter Coverage Gate (mcp-security)', () => {
   // confinement category we have verified for it. A path-like field that is not
   // in this registry fails the gate below — so a newly added path argument cannot
   // silently bypass confinement. Categories:
-  //   'root'     → the project root, confined by validateDirectory()
+  //   'root'     → the project root. Confined TWICE: by the MCP root allowlist
+  //                (assertRootAllowed — the perimeter, checked BEFORE the filesystem
+  //                is touched at all) and then by validateDirectory() (must be an
+  //                existing directory). "Confined by validateDirectory()" alone was
+  //                the old, false claim: existence is not confinement, and a server
+  //                raised for one repo answered about every path on the machine.
   //   'disk'     → joined to the root and read/written; MUST route through safeJoin()
   //   'lookup'   → matched against already-analyzed in-memory data; never hits the fs
   //   'metadata' → stored/echoed as data; never used to access the fs
@@ -575,16 +601,31 @@ describe('Write Confinement for Mutating Tools (mcp-security)', () => {
   // Every tool that writes to disk or mutates persistent state must be annotated
   // non-read-only (mcp-quality Tool Behavior Annotations). Keeps the annotation
   // table honest as new mutators are added.
-  const MUTATORS = [
-    'record_decision', 'sync_decisions', 'annotate_story', 'generate_change_proposal',
-    'generate_tests', 'remember', 'approve_decision', 'reject_decision',
-  ];
+  //
+  // The list had gone stale in exactly the way it exists to prevent: it named
+  // eight tools while ten write. `analyze_codebase` rewrites the whole .openlore
+  // index, and `change_impact_certificate` persists a certificate file whenever
+  // `persist: true` — and shipped annotated read-only. Both are here now, and the
+  // gate below is BIDIRECTIONAL so neither list can drift from the other again.
+  const MUTATORS = [...WRITING_TOOLS].sort();
 
   it('all mutating tools are annotated readOnlyHint:false', () => {
     for (const name of MUTATORS) {
       const ann = toolAnnotations(name);
       expect(ann.readOnlyHint, `${name} must be readOnlyHint:false`).toBe(false);
     }
+  });
+
+  it('the perimeter\'s writer list and the annotation table agree in BOTH directions', () => {
+    // The allowlist decides read-vs-write access from WRITING_TOOLS, not from the
+    // annotations — annotations are a client-facing hint and have been wrong. This
+    // test is what keeps the hint honest: any tool annotated as a writer must be in
+    // the perimeter's list, and vice versa.
+    const annotatedWriters = TOOL_DEFINITIONS
+      .map(t => t.name)
+      .filter(n => toolAnnotations(n).readOnlyHint === false)
+      .sort();
+    expect(annotatedWriters).toEqual(MUTATORS);
   });
 
   it('read-only graph tools are annotated readOnlyHint:true (negative control)', () => {
@@ -701,5 +742,847 @@ describe('Bounded Computation — free-text query length (mcp-security)', () => 
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// ── Root Allowlist: the MCP server's filesystem perimeter ─────────────────────
+
+describe('Root Allowlist (MCP filesystem perimeter)', () => {
+  let home: string;      // the repo this server was raised for
+  let neighbour: string; // another repo on the same machine — off limits
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-perim-home-')));
+    neighbour = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-perim-nb-')));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(neighbour, { recursive: true, force: true });
+  });
+
+  it('validateDirectory refuses a foreign absolute path once a perimeter is declared', async () => {
+    // Before this gate existed the very same call SUCCEEDED and returned the path:
+    // a server raised for `home` answered, in full, about `neighbour`.
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    await expect(validateDirectory(neighbour)).rejects.toThrow(/Root allowlist/);
+  });
+
+  it('the perimeter is checked BEFORE the filesystem, so refusals do not leak existence', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    // Two foreign paths, one real and one not. If `stat` ran first, the messages
+    // would differ ("Directory not found" vs. a successful read) and the agent
+    // could map the machine by reading the difference. They must be identical.
+    const real = await validateDirectory(neighbour).catch((e: Error) => e.message);
+    const ghost = await validateDirectory(join(neighbour, 'no-such-dir')).catch((e: Error) => e.message);
+    expect(real).toMatch(/Root allowlist/);
+    expect(ghost).toMatch(/Root allowlist/);
+    expect(String(ghost)).not.toMatch(/not found|Not a directory/i);
+  });
+
+  it('refuses an in-root symlink that points at a foreign repo (realpath, not lexical)', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const link = join(home, 'sneaky');
+    symlinkSync(neighbour, link);
+    await expect(validateDirectory(link)).rejects.toThrow(/Root allowlist/);
+  });
+
+  it('a readable-but-not-writable root refuses write-mode access', () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+    expect(() => assertRootAllowed(neighbour, 'read')).not.toThrow();
+    expect(() => assertRootAllowed(neighbour, 'write')).toThrow(/readable but not writable/);
+  });
+
+  it('no regression: the declared roots still validate exactly as before', async () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home, neighbour] });
+    await expect(validateDirectory(home)).resolves.toBe(home);
+    await expect(validateDirectory(neighbour)).resolves.toBe(neighbour);
+    mkdirSync(join(home, 'pkg', 'src'), { recursive: true });
+    await expect(validateDirectory(join(home, 'pkg', 'src'))).resolves.toBe(join(home, 'pkg', 'src'));
+    // …and a genuinely absent directory INSIDE the perimeter still fails for the
+    // honest reason, not the perimeter one.
+    await expect(validateDirectory(join(home, 'ghost'))).rejects.toThrow(/Directory not found/);
+  });
+
+  it('with no perimeter declared (a CLI process) nothing is confined', async () => {
+    // `openlore federation add /elsewhere/repo` is PDLC registering a product's
+    // repository set: the boundary is the MCP server, not the handler library.
+    await expect(validateDirectory(neighbour)).resolves.toBe(neighbour);
+  });
+
+  it('federation_status withholds repos outside the perimeter instead of advertising them', async () => {
+    // The home repo's registry knows a neighbour by absolute path. Refusing the
+    // CALL is only half a perimeter: an agent that can read the address will just
+    // probe it. The listing must not carry it at all.
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    writeFileSync(
+      join(home, '.openlore', 'federation.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        repos: [
+          { name: 'neighbour', path: neighbour, fingerprint: '', schemaVersion: 1, lastBuilt: '2026-01-01T00:00:00.000Z' },
+        ],
+      }, null, 2),
+      'utf-8',
+    );
+
+    // Without a perimeter the address is served (today's behaviour, still right for the CLI).
+    const open = await handleFederationStatus(home) as { registered: number; repos: Array<{ path: string }> };
+    expect(open.registered).toBe(1);
+    expect(open.repos[0].path).toBe(neighbour);
+
+    // With one, it is withheld — and the withholding is AUDIBLE, not silent.
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const closed = await handleFederationStatus(home) as {
+      registered: number; repos: Array<{ path: string }>; withheld?: number; note: string;
+    };
+    expect(closed.repos).toEqual([]);
+    expect(closed.registered).toBe(0);
+    expect(closed.withheld).toBe(1);
+    expect(closed.note).toMatch(/allowlist|perimeter|root/i);
+    expect(JSON.stringify(closed)).not.toContain(neighbour);
+  });
+
+  it('federation scope resolution does not READ repos outside the perimeter', async () => {
+    // resolveFederationScope is the choke point every `federation: true` query goes
+    // through — analyze_impact, select_tests, find_path, recall. It must not hand a
+    // foreign repo to the resolver, or the listing gate above would be cosmetic.
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    writeFileSync(
+      join(home, '.openlore', 'federation.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        repos: [
+          { name: 'neighbour', path: neighbour, fingerprint: '', schemaVersion: 1, lastBuilt: '2026-01-01T00:00:00.000Z' },
+        ],
+      }, null, 2),
+      'utf-8',
+    );
+    expect(resolveFederationScope(home, { federation: true }).repos).toHaveLength(1);
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    expect(resolveFederationScope(home, { federation: true }).repos).toEqual([]);
+  });
+
+  it('telemetry never writes outside the write roots', () => {
+    // emit() creates <directory>/.openlore/telemetry and appends to it — telemetry
+    // IS a write, and it runs on the transport path before any handler validates
+    // anything. PDLC enables it explicitly (OPENLORE_TELEMETRY=1), so this is a live
+    // write primitive pointed at a caller-supplied path.
+    const prev = process.env['OPENLORE_TELEMETRY'];
+    process.env['OPENLORE_TELEMETRY'] = '1';
+    try {
+      configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+      emit(neighbour, 'mcp', { event: 'tool_call', tool: 'orient' });
+      expect(existsSync(join(neighbour, '.openlore')), 'telemetry escaped the write roots').toBe(false);
+      // Positive control: inside a write root it still records.
+      emit(home, 'mcp', { event: 'tool_call', tool: 'orient' });
+      expect(existsSync(join(home, '.openlore', 'telemetry', 'mcp.jsonl'))).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env['OPENLORE_TELEMETRY'];
+      else process.env['OPENLORE_TELEMETRY'] = prev;
+    }
+  });
+});
+
+// ── Root Allowlist: the perimeter stands where the DISK is touched ────────────
+//
+// The first cut of the allowlist guarded the two places a request COMES IN (the
+// transport, and `validateDirectory` inside each handler). That is not where the
+// filesystem is actually touched. A path can arrive from a config file the agent
+// writes; a write can happen in the middle of a read; a background writer can fire
+// on a tool nobody classified as a writer. Each test below reproduces the actual
+// exploitation, not the helper that fixes it.
+
+describe('Root Allowlist — config-supplied paths (specStore.path)', () => {
+  let home: string;
+  let secret: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-cfg-home-')));
+    secret = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-cfg-secret-')));
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    // The store binding points at an ABSOLUTE path outside the served repo. This
+    // file lives inside `home` — a root the agent may write — so the value is agent
+    // input that simply took the scenic route.
+    writeFileSync(
+      join(home, '.openlore', 'config.json'),
+      JSON.stringify({
+        projectType: 'typescript', openspecPath: 'openspec',
+        specStore: { name: 'store', path: secret, targets: [] },
+      }, null, 2),
+      'utf-8',
+    );
+    // Content the perimeter refused to serve one line earlier, via `directory`.
+    mkdirSync(join(secret, 'openspec', 'changes', 'leak'), { recursive: true });
+    writeFileSync(
+      join(secret, 'openspec', 'changes', 'leak', 'proposal.md'),
+      '# Exfiltrated\n\n## Why\nTOP SECRET PAYLOAD\n',
+      'utf-8',
+    );
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(secret, { recursive: true, force: true });
+  });
+
+  it('working_set_context does not return the CONTENT of a store outside the perimeter', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleWorkingSetContext(home, 'leak') as {
+      change?: { intent?: string }; findings: Array<{ code: string }>;
+    };
+    const serialized = JSON.stringify(res);
+    expect(serialized, 'the proposal body crossed the perimeter').not.toContain('TOP SECRET PAYLOAD');
+    expect(res.findings.map(f => f.code)).toContain('store-out-of-perimeter');
+    // (The binding itself is echoed back, path and all. That is the caller's own
+    // config value coming home — not a disclosure. What must never come back is
+    // anything READ from behind it.)
+  });
+
+  it('spec_store_status does not answer "does this absolute path exist?" for a store outside the perimeter', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const present = await handleSpecStoreStatus(home);
+    // Same binding, but now pointing at a path that does NOT exist. If the perimeter
+    // let existsSync run, the two answers would differ — that difference IS the oracle.
+    writeFileSync(
+      join(home, '.openlore', 'config.json'),
+      JSON.stringify({
+        projectType: 'typescript', openspecPath: 'openspec',
+        specStore: { name: 'store', path: join(secret, 'no-such-thing'), targets: [] },
+      }, null, 2),
+      'utf-8',
+    );
+    const absent = await handleSpecStoreStatus(home);
+
+    const codes = (r: typeof present): string[] => r.findings.map(f => f.code).sort();
+    expect(codes(present)).toEqual(codes(absent));
+    expect(codes(present)).toContain('store-out-of-perimeter');
+    expect(codes(present)).not.toContain('store-path-missing');
+  });
+
+  it('a store INSIDE the perimeter still works exactly as before (no regression)', async () => {
+    const inside = join(home, 'store');
+    mkdirSync(join(inside, 'openspec', 'changes', 'ok'), { recursive: true });
+    writeFileSync(
+      join(inside, 'openspec', 'changes', 'ok', 'proposal.md'),
+      '# Fine\n\n## Why\nLEGITIMATE CONTENT\n',
+      'utf-8',
+    );
+    writeFileSync(
+      join(home, '.openlore', 'config.json'),
+      JSON.stringify({
+        projectType: 'typescript', openspecPath: 'openspec',
+        specStore: { name: 'store', path: inside, targets: [] },
+      }, null, 2),
+      'utf-8',
+    );
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleWorkingSetContext(home, 'ok') as {
+      change?: { intent?: string }; findings: Array<{ code: string }>;
+    };
+    expect(res.findings.map(f => f.code)).not.toContain('store-out-of-perimeter');
+    expect(String(res.change?.intent ?? '')).toContain('LEGITIMATE CONTENT');
+  });
+});
+
+describe('Root Allowlist — a read must not write (call-graph index)', () => {
+  let home: string;
+  let neighbour: string;
+  let analysisDir: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-ro-home-')));
+    neighbour = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-ro-nb-')));
+    analysisDir = join(neighbour, '.openlore', 'analysis');
+    mkdirSync(analysisDir, { recursive: true });
+    writeFileSync(join(analysisDir, 'llm-context.json'), JSON.stringify({ signatures: [] }), 'utf-8');
+    // A real index, written and closed by a legitimate writer.
+    dbPath = EdgeStore.dbPath(analysisDir);
+    EdgeStore.open(dbPath).close();
+    _resetContextCacheForTesting();
+  });
+  afterEach(() => {
+    _resetContextCacheForTesting();
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(neighbour, { recursive: true, force: true });
+  });
+
+  it('reading a read-only neighbour leaves its index byte-for-byte alone', async () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+    const before = statSync(dbPath).mtimeMs;
+    const sizeBefore = statSync(dbPath).size;
+
+    // The plain read path every read-only tool takes — and the one the federation
+    // resolver takes once per neighbouring repo.
+    await readCachedContext(neighbour);
+
+    // `EdgeStore.open` would have run PRAGMA journal_mode=WAL (rewriting the header
+    // and leaving -wal/-shm beside the file) and CREATE TABLE, and on a schema bump
+    // DROPped every table.
+    expect(existsSync(`${dbPath}-wal`), 'a read created a WAL sidecar in a read-only repo').toBe(false);
+    expect(existsSync(`${dbPath}-shm`), 'a read created a SHM sidecar in a read-only repo').toBe(false);
+    expect(statSync(dbPath).mtimeMs, 'a read modified the index of a read-only repo').toBe(before);
+    expect(statSync(dbPath).size).toBe(sizeBefore);
+  });
+
+  it('a writable root is still opened for writing (no regression)', async () => {
+    const ownAnalysis = join(home, '.openlore', 'analysis');
+    mkdirSync(ownAnalysis, { recursive: true });
+    writeFileSync(join(ownAnalysis, 'llm-context.json'), JSON.stringify({ signatures: [] }), 'utf-8');
+    EdgeStore.open(EdgeStore.dbPath(ownAnalysis)).close();
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const ctx = await readCachedContext(home);
+    expect(ctx).not.toBeNull();
+    expect(ctx?.edgeStore, 'the own repo lost its index').toBeTruthy();
+  });
+});
+
+// ── Root Allowlist: a symlinked .openlore must not move the write outside ─────
+//
+// This is not a contrived escape. `scratch/.openlore -> ws/.openlore` is the
+// ORDINARY PDLC isolated layout — the agent works in a scratch dir whose
+// `.openlore` is a link onto the workspace. So `join(dir, '.openlore', …)` on a
+// write path routinely lands somewhere other than `dir`, and every writer that
+// built its path that way was writing outside whatever was granted.
+
+describe('Root Allowlist — a symlinked .openlore does not carry writes out', () => {
+  let home: string;
+  let elsewhere: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-link-home-')));
+    elsewhere = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-link-out-')));
+    // The whole `.openlore` tree of `home` actually lives in `elsewhere`.
+    symlinkSync(elsewhere, join(home, '.openlore'));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(elsewhere, { recursive: true, force: true });
+  });
+
+  /** Everything the writers would have created, had they followed the link. */
+  const strayFiles = (): string[] =>
+    readdirSync(elsewhere, { recursive: true, encoding: 'utf-8' }).filter(f => !f.startsWith('.'));
+
+  it('record_decision does not write through the link', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleRecordDecision(home, 'Title', 'Rationale') as Record<string, unknown>;
+    expect(String(res.error ?? ''), 'the write should be refused, not silently succeed').toMatch(/allowlist|perimeter/i);
+    expect(strayFiles(), 'decision written outside the granted root').toEqual([]);
+  });
+
+  it('remember does not write through the link', async () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    const res = await handleRemember(home, 'a memory worth keeping') as Record<string, unknown>;
+    expect(String(res.error ?? '')).toMatch(/allowlist|perimeter/i);
+    expect(strayFiles(), 'memory written outside the granted root').toEqual([]);
+  });
+
+  it('the same writes succeed when the link target IS granted (no false lockout)', async () => {
+    // Granting `elsewhere` too is the honest configuration for the PDLC layout:
+    // `--root scratch --root ws`. The writes must then work exactly as before.
+    configureRootAllowlist({ readRoots: [home, elsewhere], writeRoots: [home, elsewhere] });
+    const res = await handleRecordDecision(home, 'Title', 'Rationale') as Record<string, unknown>;
+    expect(String(res.error ?? '')).not.toMatch(/allowlist|perimeter/i);
+    expect(strayFiles().length, 'the decision should have been written into the granted target').toBeGreaterThan(0);
+  });
+});
+
+// ── Root Allowlist: the SECOND door onto the index (AnchorContext) ────────────
+//
+// The first attempt gated `readCachedContext` and declared "a read never writes".
+// It was false at a door nobody had listed: `AnchorContext.open` called the
+// read-WRITE `EdgeStore.open` directly, and `recall` / `verify_claim` /
+// `record_decision` / the impact certificate all arrive through it. Measured
+// consequence on a neighbour whose index predated a SCHEMA_VERSION bump: reading
+// it ran DROP TABLE over every table and the analysis was gone.
+
+describe('Root Allowlist — reading through AnchorContext does not rebuild a neighbour\'s index', () => {
+  let home: string;
+  let neighbour: string;
+  let dbPath: string;
+
+  /** Force the on-disk schema to a stale version — the case that triggers the wipe. */
+  const makeStaleIndex = (analysisDir: string): void => {
+    mkdirSync(analysisDir, { recursive: true });
+    writeFileSync(join(analysisDir, 'llm-context.json'), JSON.stringify({ signatures: [] }), 'utf-8');
+    EdgeStore.open(EdgeStore.dbPath(analysisDir)).close();
+    const db = new DatabaseSync(EdgeStore.dbPath(analysisDir));
+    db.exec('UPDATE schema_version SET version = 1');
+    db.close();
+  };
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-anchor-home-')));
+    neighbour = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-anchor-nb-')));
+    const analysisDir = join(neighbour, '.openlore', 'analysis');
+    makeStaleIndex(analysisDir);
+    dbPath = EdgeStore.dbPath(analysisDir);
+    _resetContextCacheForTesting();
+  });
+  afterEach(() => {
+    _resetContextCacheForTesting();
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(neighbour, { recursive: true, force: true });
+  });
+
+  const schemaVersion = (): number => {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return (db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number }).version;
+    } finally {
+      db.close();
+    }
+  };
+
+  it('recall on a read-only neighbour leaves its stale index exactly as it found it', async () => {
+    configureRootAllowlist({ readRoots: [home, neighbour], writeRoots: [home] });
+    const analysisDir = join(neighbour, '.openlore', 'analysis');
+    const listing = (): string[] => readdirSync(analysisDir).sort();
+    const before = {
+      v: schemaVersion(), mtime: statSync(dbPath).mtimeMs,
+      size: statSync(dbPath).size, files: listing(),
+    };
+    expect(before.v).toBe(1);
+
+    await handleRecall(neighbour, 'anything at all');
+
+    expect(schemaVersion(), 'the neighbour\'s index was rebuilt by a read').toBe(1);
+    expect(statSync(dbPath).mtimeMs, 'the neighbour\'s index was modified by a read').toBe(before.mtime);
+    expect(statSync(dbPath).size).toBe(before.size);
+    // Nothing NEW appeared beside it either — a plain read-only SQLite connection
+    // would have materialized -wal/-shm here (measured), which is why the shared
+    // opener uses an immutable URI.
+    expect(listing(), 'a read created files in a repository it may only read').toEqual(before.files);
+  });
+
+  it('the SAME call on a writable root still repairs the schema (no regression)', async () => {
+    const ownAnalysis = join(home, '.openlore', 'analysis');
+    makeStaleIndex(ownAnalysis);
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    await handleRecall(home, 'anything at all');
+    const db = new DatabaseSync(EdgeStore.dbPath(ownAnalysis), { readOnly: true });
+    const v = (db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number }).version;
+    db.close();
+    expect(v, 'a writable repo must still get its index rebuilt').not.toBe(1);
+  });
+});
+
+// ── Both panic layers must stay ALIVE, not merely present ────────────────────
+//
+// panic state is guarded twice: a door gate on the transport (skip the whole panic
+// block when the directory is not writable) and a gate at the write point
+// (`tryOpenloreWriteTarget` inside panic-response). In normal operation the door
+// short-circuits first, so the inner gate is never REACHED — which means a test that
+// only drives the transport cannot tell "two live layers" from "one live layer and
+// one decorative". Measured with instrumentation, both are live; this test pins the
+// INNER one directly, bypassing the transport, so it cannot rot into decoration.
+describe('Root Allowlist — the panic write-point gate is live on its own', () => {
+  let home: string;
+  let readOnly: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-panic-home-')));
+    readOnly = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-panic-ro-')));
+    mkdirSync(join(readOnly, '.openlore'), { recursive: true });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(readOnly, { recursive: true, force: true });
+  });
+
+  it('refuses a panic write into a read-only root even when called directly', () => {
+    configureRootAllowlist({ readRoots: [home, readOnly], writeRoots: [home] });
+    // Straight at the store, with no transport in front of it.
+    let mutatorCalls = 0;
+    mutatePanicStateLocked(readOnly, (fresh) => { mutatorCalls++; return { ...fresh, panicScore: 99, panicLevel: 3 }; });
+
+    expect(existsSync(join(readOnly, '.openlore', 'panic-state.json')),
+      'panic state written into a root that is read-only').toBe(false);
+    // The LOCK gate has its own line, and its effect is otherwise invisible: the
+    // lock file is transient, so "no .lock on disk afterwards" holds either way.
+    // What it really guarantees is that the locked section is never ENTERED — no
+    // create-exclusive lock file, no read-modify-write — so observe that instead.
+    expect(mutatorCalls, 'the locked read-modify-write section ran inside a read-only root').toBe(0);
+    expect(existsSync(join(readOnly, '.openlore', 'panic-state.json.lock'))).toBe(false);
+  });
+
+  it('still writes panic state into a writable root (the gate is not a blanket off-switch)', () => {
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    mutatePanicStateLocked(home, (fresh) => ({ ...fresh, panicScore: 42, panicLevel: 2 }));
+    expect(existsSync(join(home, '.openlore', 'panic-state.json'))).toBe(true);
+  });
+});
+
+// ── analyze_codebase is the biggest writer of all ─────────────────────────────
+//
+// Reported repro, reproduced here: `--root scratch --write-root scratch` with
+// `scratch/.openlore -> outside/.openlore`, then `analyze_codebase{force:true}`
+// put 14 artifacts (call-graph.db, llm-context.json, SUMMARY.md, fingerprint.json
+// and ten inventories) into `outside/.openlore/analysis/` — while the startup
+// banner truthfully reported the write perimeter as `scratch`.
+//
+// Two things had to be wrong at once, and the second is the worse one: the output
+// dir was derived by a bare `join`, AND the census exempted this module with a
+// reason ("writes only into an os.tmpdir() mkdtemp") that was simply untrue of
+// that line — and the exemption ALSO switched off the bare-join check built to
+// catch exactly this.
+describe('Root Allowlist — analyze_codebase does not write through a symlinked .openlore', () => {
+  let scratch: string;
+  let outside: string;
+
+  beforeEach(() => {
+    scratch = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-an-scratch-')));
+    outside = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-an-ws-')));
+    mkdirSync(join(outside, '.openlore'), { recursive: true });
+    symlinkSync(join(outside, '.openlore'), join(scratch, '.openlore'));
+    writeFileSync(join(scratch, 'a.ts'), 'export function a(): number { return 1; }\n', 'utf-8');
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(scratch, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('refuses instead of dropping the analysis outside the granted root', async () => {
+    configureRootAllowlist({ readRoots: [scratch], writeRoots: [scratch] });
+    const res = await handleAnalyzeCodebase(scratch, true).catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(res)).toMatch(/Root allowlist|perimeter/i);
+    expect(
+      readdirSync(join(outside, '.openlore')),
+      'analysis artifacts landed outside the write perimeter',
+    ).toEqual([]);
+  }, 120_000);
+
+  it('writes normally when the link target IS granted (--root scratch --root ws)', async () => {
+    configureRootAllowlist({ readRoots: [scratch, outside], writeRoots: [scratch, outside] });
+    await handleAnalyzeCodebase(scratch, true);
+    expect(
+      readdirSync(join(outside, '.openlore')).length,
+      'the honest configuration must still produce an analysis',
+    ).toBeGreaterThan(0);
+  }, 120_000);
+});
+
+// ── safeJoin and a DANGLING symlink (generate_tests) ─────────────────────────
+//
+// `root-allowlist.canonicalPath` was hardened to follow a symlink even when its
+// target does not exist, and its header called that hole closed. `safeJoin` two
+// modules away kept its own copy — `realPathOrNearestExisting` — which on ENOENT
+// fell back to the nearest EXISTING ancestor, i.e. judged a dangling link by the
+// directory holding it instead of by where it points. A live link to a dir or a
+// file was refused; a DANGLING one walked through.
+//
+// Reachable: `generate_tests` is write-gated, but it publishes the filenames it
+// intends to write under `dryRun: true`. Learn a name, drop a dangling symlink
+// there, repeat with `dryRun: false`.
+describe('safeJoin — a dangling symlink is followed, not shrugged off', () => {
+  let root: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-dangle-root-')));
+    outside = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-dangle-out-')));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('refuses a dangling in-root link the same way it refuses a live one', () => {
+    const live = join(root, 'live');
+    symlinkSync(outside, live);                                   // live → dir
+    const deadTarget = join(outside, 'not-created-yet.ts');
+    const dead = join(root, 'dead.ts');
+    symlinkSync(deadTarget, dead);                                // DANGLING → file that does not exist
+
+    expect(() => safeJoin(root, 'live/x.ts')).toThrow(/escape|traversal/i);
+    expect(() => safeJoin(root, 'dead.ts'), 'dangling link walked through the guard').toThrow(/escape|traversal/i);
+  });
+
+  it('generate_tests does not write through a dangling symlink', async () => {
+    // The two-step the agent would run: learn the name, plant the link, write.
+    const outPath = 'tests/generated.spec.ts';
+    mkdirSync(join(root, 'tests'), { recursive: true });
+    const planted = join(outside, 'stolen.spec.ts');
+    symlinkSync(planted, join(root, outPath));                    // dangling: target absent
+
+    const res = await writeTestFiles({
+      files: [{ outputPath: outPath, content: 'PROBE-CONTENT', framework: 'vitest' }],
+      rootPath: root,
+      dryRun: false,
+      merge: false,
+    } as Parameters<typeof writeTestFiles>[0]);
+
+    expect(existsSync(planted), 'generate_tests wrote outside the root through a dangling link').toBe(false);
+    expect(res.written, 'the escaping write must be skipped, not performed').toBe(0);
+  });
+
+  it('an ordinary in-root path still gets written (no false lockout)', async () => {
+    mkdirSync(join(root, 'tests'), { recursive: true });
+    const res = await writeTestFiles({
+      files: [{ outputPath: 'tests/ok.spec.ts', content: 'FINE', framework: 'vitest' }],
+      rootPath: root,
+      dryRun: false,
+      merge: false,
+    } as Parameters<typeof writeTestFiles>[0]);
+    expect(res.written).toBe(1);
+    expect(readFileSync(join(root, 'tests', 'ok.spec.ts'), 'utf-8')).toContain('FINE');
+  });
+});
+
+// ── TOCTOU: swapping a component AFTER approval ──────────────────────────────
+//
+// The approval is one moment; the writes are many, and Node has no `openat`, so
+// each one re-walks the path by name. Demonstrated against the previous version:
+// replacing `.openlore` with a symlink five seconds into an `analyze_codebase` run
+// put 5.7 MB of artifacts (13 files) into a honeypot, and the call returned
+// success. The watcher was worse — approval happened once per PROCESS, so a swap
+// 30 seconds in redirected every later re-index for the lifetime of the server.
+//
+// What is asserted here is what is actually claimed: the approved path is built out
+// of REAL, non-symlink directories, and a component that turns into a symlink after
+// approval is REFUSED at the next derivation rather than followed. The residual
+// window — a swap between the final resolution and the syscall — is stated in
+// write-target.ts and is not claimed to be closed.
+describe('Root Allowlist — a component swapped after approval is refused, not followed', () => {
+  let root: string;
+  let honeypot: string;
+
+  beforeEach(() => {
+    root = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-toctou-root-')));
+    honeypot = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-toctou-pot-')));
+    configureRootAllowlist({ readRoots: [root], writeRoots: [root] });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(honeypot, { recursive: true, force: true });
+  });
+
+  it('ensureWriteDir builds the chain out of real directories, not mere names', () => {
+    // `writeTarget` stays PURE — deriving a path must not create anything (it also
+    // names files, and materializing there turned federation.json into a directory).
+    // The stronger form is opt-in, for callers that write into a directory over a
+    // long run: the analyzer and the watcher.
+    const target = ensureWriteDir(root, '.openlore', 'analysis');
+    for (const p of [join(root, '.openlore'), target]) {
+      expect(existsSync(p), `${p} was not materialized`).toBe(true);
+      expect(lstatSync(p).isSymbolicLink(), `${p} must be a real directory`).toBe(false);
+      expect(lstatSync(p).isDirectory()).toBe(true);
+    }
+  });
+
+  it('refuses re-derivation once a component has been swapped for a symlink', () => {
+    ensureWriteDir(root, '.openlore', 'analysis');      // approve + materialize
+    // …the swap the exploit performs mid-run.
+    rmSync(join(root, '.openlore'), { recursive: true, force: true });
+    symlinkSync(honeypot, join(root, '.openlore'));
+
+    expect(() => ensureWriteDir(root, '.openlore', 'analysis'),
+      're-derivation followed a swapped component instead of refusing').toThrow(/Root allowlist/);
+    expect(readdirSync(honeypot), 'the honeypot received a write').toEqual([]);
+  });
+
+  it('analyze_codebase re-derives, so a mid-run swap does not silently redirect it', async () => {
+    writeFileSync(join(root, 'a.ts'), 'export const a = 1;\n', 'utf-8');
+    await handleAnalyzeCodebase(root, true);            // first run: legitimate
+
+    rmSync(join(root, '.openlore'), { recursive: true, force: true });
+    symlinkSync(honeypot, join(root, '.openlore'));
+
+    const res = await handleAnalyzeCodebase(root, true).catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(res)).toMatch(/Root allowlist/);
+    expect(readdirSync(honeypot), 'analysis artifacts landed in the honeypot').toEqual([]);
+  }, 120_000);
+});
+
+// ── Repair-on-read: `orient` renamed a file on a READ-ONLY root ──────────────
+//
+// The chain writes through a helper two modules away, and only on a CORRUPT input:
+//   orient → loadMemoryStore → (invalid JSON) → quarantineCorrupt → link()+unlink()
+// so `notes.json` became `notes.json.corrupt-0` on a root granted for reading only,
+// with no refusal, no isError and nothing in stderr.
+//
+// Two lessons are baked into this test. First, the write is reached through a
+// helper, which is exactly the shape the census cannot see. Second — and this is why
+// an earlier sweep of all 20 tools reported "no writes" — it only happens when the
+// store is INVALID: a negative result over healthy fixtures proves nothing here.
+describe('Root Allowlist — repairing a corrupt store is a WRITE, and needs the write perimeter', () => {
+  let readOnly: string;
+  let writable: string;
+
+  const plantCorruptStores = (root: string): { notes: string; decisions: string } => {
+    const mem = join(root, '.openlore', 'memory');
+    const dec = join(root, '.openlore', 'decisions');
+    mkdirSync(mem, { recursive: true });
+    mkdirSync(dec, { recursive: true });
+    const notes = join(mem, 'notes.json');
+    const decisions = join(dec, 'pending.json');
+    writeFileSync(notes, '{ this is not valid json', 'utf-8');
+    writeFileSync(decisions, '{ neither is this', 'utf-8');
+    return { notes, decisions };
+  };
+
+  beforeEach(() => {
+    readOnly = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-quar-ro-')));
+    writable = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-quar-rw-')));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(readOnly, { recursive: true, force: true });
+    rmSync(writable, { recursive: true, force: true });
+  });
+
+  it('loading a corrupt store on a read-only root renames nothing', async () => {
+    const { notes, decisions } = plantCorruptStores(readOnly);
+    configureRootAllowlist({ readRoots: [readOnly, writable], writeRoots: [writable] });
+
+    // Straight at the loaders. `orient` is one CALLER of these (orient.ts:491), but
+    // it returns early on a repository with no analysis, so driving the exploit
+    // through orient alone makes the test pass for the wrong reason — it did, until
+    // the mutation check caught the vacuity.
+    await loadMemoryStore(readOnly);
+    await loadDecisionStore(readOnly);
+    await handleOrient(readOnly, 'anything');
+
+    expect(existsSync(notes), 'notes.json was renamed on a read-only root').toBe(true);
+    expect(existsSync(decisions), 'pending.json was renamed on a read-only root').toBe(true);
+    expect(
+      readdirSync(join(readOnly, '.openlore', 'memory')).filter(f => f.includes('corrupt')),
+      'a .corrupt-N file was created on a read-only root',
+    ).toEqual([]);
+    expect(
+      readdirSync(join(readOnly, '.openlore', 'decisions')).filter(f => f.includes('corrupt')),
+    ).toEqual([]);
+  }, 60_000);
+
+  it('quarantine still happens on a WRITABLE root (the repair is not simply disabled)', async () => {
+    const { notes } = plantCorruptStores(writable);
+    configureRootAllowlist({ readRoots: [writable], writeRoots: [writable] });
+
+    await loadMemoryStore(writable);
+
+    expect(existsSync(notes), 'the corrupt file should have been moved aside').toBe(false);
+    expect(
+      readdirSync(join(writable, '.openlore', 'memory')).filter(f => f.includes('corrupt')).length,
+    ).toBeGreaterThan(0);
+  }, 60_000);
+});
+
+// ── Read is granted, write is NOT — the layout that separates the two gates ───
+//
+// A mutation matrix showed that removing the WRITE-side gate on the decision store
+// and on the analysis output no longer failed anything: the read-side gating added
+// later short-circuits first, so the old tests refused for the wrong reason and
+// stayed green either way. Coverage had silently regressed under a fix.
+//
+// This layout separates them. `.openlore` points at a directory that IS inside the
+// read roots and is NOT inside the write roots — the honest shape of
+// `--root scratch --root ws --write-root scratch`. Reads therefore succeed all the
+// way down, and only a write-side gate can stop what follows.
+describe('Root Allowlist — write-side gates, with reads deliberately permitted', () => {
+  let home: string;
+  let ws: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-rw-home-')));
+    ws = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-rw-ws-')));
+    mkdirSync(join(ws, '.openlore'), { recursive: true });
+    symlinkSync(join(ws, '.openlore'), join(home, '.openlore'));
+    // read BOTH, write only `home` — so every read below resolves fine.
+    configureRootAllowlist({ readRoots: [home, ws], writeRoots: [home] });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    _resetContextCacheForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  const strays = (): string[] => readdirSync(join(ws, '.openlore'), { recursive: true, encoding: 'utf-8' });
+
+  it('analyze_codebase: the output dir is a WRITE, refused even though reads are allowed', async () => {
+    writeFileSync(join(home, 'a.ts'), 'export const a = 1;\n', 'utf-8');
+    const res = await handleAnalyzeCodebase(home, true).catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(res)).toMatch(/Root allowlist/);
+    expect(strays(), 'the analysis was written into a read-only location').toEqual([]);
+  }, 120_000);
+
+  it('record_decision: the store path is a WRITE, refused even though reads are allowed', async () => {
+    const res = await handleRecordDecision(home, 'T', 'R') as Record<string, unknown>;
+    expect(String(res.error ?? '')).toMatch(/Root allowlist/);
+    expect(strays(), 'the decision was written into a read-only location').toEqual([]);
+  });
+});
+
+// ── The store derivations gate READS too ─────────────────────────────────────
+describe('Root Allowlist — memoryDir/decisionsDir confine the READ as well', () => {
+  let home: string;
+  let outside: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-sr-home-')));
+    outside = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-sr-out-')));
+    // `.openlore` leads OUT of the perimeter entirely this time.
+    mkdirSync(join(outside, 'memory'), { recursive: true });
+    writeFileSync(
+      join(outside, 'memory', 'notes.json'),
+      JSON.stringify({ schemaVersion: 1, memories: [{ id: 'm1', content: 'SECRET-FROM-OUTSIDE', anchors: [] }] }),
+      'utf-8',
+    );
+    symlinkSync(outside, join(home, '.openlore'));
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('the store loader refuses rather than returning memories from outside the perimeter', async () => {
+    // Asserted on the LOADER, not on `recall`: recall summarises and never echoes raw
+    // content, so watching its output passes whether the gate exists or not — it did,
+    // until the mutation check said so. This is the function that hands foreign bytes
+    // back, so this is where the refusal has to be visible.
+    await expect(loadMemoryStore(home)).rejects.toThrow(/Root allowlist/);
+
+    const viaTool = await handleRecall(home, 'anything').catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(viaTool), 'content from outside the perimeter reached the agent')
+      .not.toContain('SECRET-FROM-OUTSIDE');
+  }, 60_000);
+});
+
+// ── The materialization refuses a symlink component ──────────────────────────
+describe('ensureWriteDir — refuses to build through a symlink component', () => {
+  let root: string;
+  let elsewhere: string;
+
+  beforeEach(() => {
+    root = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-mat-root-')));
+    elsewhere = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-mat-else-')));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(elsewhere, { recursive: true, force: true });
+  });
+
+  it('refuses when a component of the path it is asked to build is a link', () => {
+    // Deliberately with NO perimeter configured, and that is worth stating: with one,
+    // `assertPathAllowed` hands back an already-canonical path, so no symlink
+    // component survives to be found here and this guard is the backstop for the
+    // race (a component swapped after canonicalization). Unconfigured — the CLI
+    // shape — the approved path is lexical, so the check is reachable directly.
+    symlinkSync(elsewhere, join(root, '.openlore'));
+    expect(() => ensureWriteDir(root, '.openlore', 'analysis'),
+      'built the chain straight through a symlink').toThrow(/symbolic link|Root allowlist/);
+    expect(readdirSync(elsewhere), 'directories were created behind the link').toEqual([]);
   });
 });

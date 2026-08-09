@@ -8,17 +8,7 @@
 import { readFile, writeFile, mkdir, copyFile, readdir, rm } from 'node:fs/promises';
 import { join, dirname, relative } from 'node:path';
 import logger from '../../utils/logger.js';
-import {
-  OPENLORE_DIR,
-  OPENLORE_ANALYSIS_SUBDIR,
-  OPENLORE_BACKUPS_SUBDIR,
-  OPENLORE_OUTPUTS_SUBDIR,
-  OPENLORE_LOGS_SUBDIR,
-  OPENSPEC_DIR,
-  OPENSPEC_SPECS_SUBDIR,
-  OPENSPEC_DECISIONS_SUBDIR,
-  ARTIFACT_GENERATION_REPORT,
-} from '../../constants.js';
+import { OPENLORE_ANALYSIS_SUBDIR, OPENLORE_BACKUPS_SUBDIR, OPENLORE_OUTPUTS_SUBDIR, OPENLORE_LOGS_SUBDIR, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, OPENSPEC_DECISIONS_SUBDIR, ARTIFACT_GENERATION_REPORT } from '../../constants.js';
 import { fileExists } from '../../utils/command-helpers.js';
 import {
   OpenSpecConfigManager,
@@ -29,6 +19,7 @@ import {
 } from './openspec-compat.js';
 import type { GeneratedSpec } from './openspec-format-generator.js';
 import type { ProjectSurveyResult } from './spec-pipeline.js';
+import { openloreWriteTarget } from '../services/write-target.js';
 
 // ============================================================================
 // TYPES
@@ -105,7 +96,7 @@ export class OpenSpecWriter {
   constructor(options: OpenSpecWriterOptions) {
     this.rootPath = options.rootPath;
     this.openspecRoot = join(options.rootPath, OPENSPEC_DIR);
-    this.openloreRoot = join(options.rootPath, OPENLORE_DIR);
+    this.openloreRoot = openloreWriteTarget(options.rootPath);
     this.options = {
       rootPath: options.rootPath,
       writeMode: options.writeMode ?? 'replace',

@@ -6,16 +6,28 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
-  OPENLORE_DIR,
   OPENLORE_DECISIONS_SUBDIR,
   DECISIONS_PENDING_FILE,
 } from '../../constants.js';
 import { fileExists } from '../../utils/command-helpers.js';
 import { atomicWriteFile, casUpdate, quarantineCorrupt } from './atomic-store.js';
+import { openloreReadTarget, openloreWriteTarget } from '../services/write-target.js';
 import type { PendingDecision, DecisionStore, DecisionStatus } from '../../types/index.js';
 
+/**
+ * The decisions tree. Derived through the perimeter, not by a bare `join`: every
+ * write beneath it (the pending store, its lock, its atomic temp files,
+ * quarantined copies — 18 primitives in two modules) inherits this one decision,
+ * and `<root>/.openlore` being a symlink would otherwise put all of them outside
+ * the granted root. Reads keep the lexical path: they are gated at the door.
+ */
 export function decisionsDir(rootPath: string): string {
-  return join(rootPath, OPENLORE_DIR, OPENLORE_DECISIONS_SUBDIR);
+  return openloreReadTarget(rootPath, OPENLORE_DECISIONS_SUBDIR);
+}
+
+/** Write-side twin of {@link decisionsDir}: canonical and perimeter-approved. */
+export function decisionsWriteDir(rootPath: string): string {
+  return openloreWriteTarget(rootPath, OPENLORE_DECISIONS_SUBDIR);
 }
 
 function decisionsPath(rootPath: string): string {
@@ -64,7 +76,8 @@ export async function saveDecisionStore(rootPath: string, store: DecisionStore):
     updatedAt: new Date().toISOString(),
     sequence: (store.sequence ?? 0) + 1,
   };
-  await atomicWriteFile(decisionsPath(rootPath), JSON.stringify(updated, null, 2) + '\n');
+  // Perimeter-derived write path — see decisionsWriteDir.
+  await atomicWriteFile(join(decisionsWriteDir(rootPath), DECISIONS_PENDING_FILE), JSON.stringify(updated, null, 2) + '\n');
 }
 
 /**
@@ -79,7 +92,7 @@ export async function updateDecisionStore(
   mutate: (store: DecisionStore) => DecisionStore,
 ): Promise<DecisionStore> {
   return casUpdate<DecisionStore>({
-    storePath: decisionsPath(rootPath),
+    storePath: join(decisionsWriteDir(rootPath), DECISIONS_PENDING_FILE),   // perimeter-derived (see decisionsWriteDir)
     load: () => loadDecisionStore(rootPath),
     mutate: (current) => ({ ...mutate(current), updatedAt: new Date().toISOString() }),
     serialize: (next) => JSON.stringify(next, null, 2) + '\n',

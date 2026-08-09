@@ -4,15 +4,20 @@
 
 import { createHash } from 'node:crypto';
 import { readFile, readdir, stat } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
-import { dirname, extname, join, relative, resolve, sep } from 'node:path';
+import { extname, join, relative, resolve, sep } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
 import { MAX_STRING_LENGTH } from '../../analyzer/artifact-json.js';
 import { EdgeStore } from '../edge-store.js';
-import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR, OPENSPEC_DIR } from '../../../constants.js';
+import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENSPEC_DIR } from '../../../constants.js';
 
 /** LLMContext with optional SQLite edge store attached (present when call-graph.db exists). */
-export type CachedContext = LLMContext & { edgeStore?: EdgeStore };
+export type CachedContext = LLMContext & {
+  edgeStore?: EdgeStore;
+  /** Set when the call-graph index EXISTS but the perimeter would not let us open
+   * it. Handlers surface this to the agent; without it, "no call graph" is
+   * indistinguishable from "this repository was never analyzed". */
+  indexWithheld?: { reason: string; detail: string };
+};
 
 /**
  * Attach the call graph to a context read from disk (PDLC-156).
@@ -65,31 +70,46 @@ export function attachCallGraph(ctx: CachedContext, store: EdgeStore | undefined
 import { logger } from '../../../utils/logger.js';
 import { emit } from '../telemetry.js';
 import { redactSecretString } from '../secret-redaction.js';
+import { assertRootAllowed, canonicalPath } from './root-allowlist.js';
+import { openEdgeStoreForPerimeter } from '../edge-store-access.js';
+import { openloreReadTarget } from '../write-target.js';
 
 /**
- * Resolve and validate a user-supplied directory path.
+ * Resolve and validate a caller-supplied project root.
  *
- * Ensures the path resolves to an existing directory, which prevents path
- * traversal attacks where a client supplies `"../../../../etc"` or a plain
- * file path instead of a project directory.
+ * TWO separate questions, in this order:
+ *
+ *   1. MAY this server touch that root at all? — the MCP root allowlist
+ *      (see root-allowlist.ts). A server raised for one repository must not
+ *      serve another, and until this check existed it served every path on the
+ *      machine that happened to be a directory.
+ *   2. IS it a usable project root? — it must exist and be a directory.
+ *
+ * The order is not cosmetic. `stat` first turned the second question into an
+ * oracle for the first: "Directory not found" / "Not a directory" / a real
+ * answer are three distinguishable replies, so a caller could map the filesystem
+ * by watching which one came back. The perimeter answers first, identically,
+ * for everything outside it.
+ *
+ * NOTE on the comment this replaces ("prevents path traversal attacks where a
+ * client supplies `../../../../etc`"): that was never true of THIS function.
+ * `resolve()` happily produces `/etc`, and an existence check then approved it.
+ * Traversal confinement is `safeJoin`'s job, and it applies to path fields
+ * joined UNDER a root — not to the root itself.
  */
-export async function validateDirectory(directory: string, maxDepth?: number): Promise<string> {
+export async function validateDirectory(directory: string): Promise<string> {
   logger.debug(`Validating directory: ${directory}`);
-  return validateDirectoryImpl(directory, maxDepth);
+  return validateDirectoryImpl(directory);
 }
 
-export async function validateDirectoryImpl(directory: string, maxDepth?: number): Promise<string> {
+export async function validateDirectoryImpl(directory: string): Promise<string> {
   if (!directory || typeof directory !== 'string') {
     logger.warning('Directory validation failed: directory parameter is required and must be a string');
     throw new Error('directory parameter is required and must be a string');
   }
-  const absDir = resolve(directory);
+  // Perimeter FIRST — before the filesystem is touched at all.
+  const absDir = assertRootAllowed(directory, 'read');
   logger.debug(`Resolved directory path: ${absDir}`);
-
-  // Validate directory traversal depth if maxDepth is specified
-  if (maxDepth !== undefined) {
-    validateDirectoryDepth(absDir, maxDepth);
-  }
 
   let s: Awaited<ReturnType<typeof stat>>;
   try {
@@ -104,20 +124,6 @@ export async function validateDirectoryImpl(directory: string, maxDepth?: number
   }
   logger.success(`Successfully validated directory: ${absDir}`);
   return absDir;
-}
-
-function calculateDirectoryDepth(path: string): number {
-  const normalizedPath = path.replace(/^\\|\\$/g, '');
-  const segments = normalizedPath.split(/[\\/]/);
-  return segments.length;
-}
-
-export function validateDirectoryDepth(absDir: string, maxDepth: number): void {
-  const depth = calculateDirectoryDepth(absDir);
-  if (depth > maxDepth) {
-    logger.error(`Directory validation failed: Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
-    throw new Error(`Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
-  }
 }
 
 /**
@@ -143,24 +149,13 @@ export function sanitizeMcpError(err: unknown, format: 'string' | 'json' = 'stri
   return sanitized;
 }
 
-/**
- * The canonical (symlink-resolved) path of `p`, or — when `p` does not exist (a
- * write target) — the canonical path of its nearest existing ancestor. Used to
- * confine on the REAL filesystem location rather than the lexical path.
- */
-function realPathOrNearestExisting(p: string): string {
-  let cur = p;
-  for (;;) {
-    try {
-      return realpathSync(cur);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-      const parent = dirname(cur);
-      if (parent === cur) return cur; // reached filesystem root
-      cur = parent;
-    }
-  }
-}
+// `realPathOrNearestExisting` used to live here: on ENOENT it fell back to the
+// nearest EXISTING ancestor, so a DANGLING symlink was judged by the directory that
+// contains it rather than by where it points. `root-allowlist.canonicalPath` had
+// already been hardened against exactly that (it follows the link even when the
+// target does not exist) and its header called the hole closed — while this copy,
+// two modules away, still had it. Two canonicalizers, one hardened, one not, is how
+// the unhardened one gets forgotten: there is now one.
 
 /**
  * Resolve a user-supplied relative file path against a validated project root and
@@ -176,18 +171,25 @@ export function safeJoin(absDir: string, filePath: string): string {
   if (!resolved.startsWith(absDir + sep) && resolved !== absDir) {
     throw new Error(`Path traversal blocked: "${filePath}" resolves outside project directory`);
   }
-  // Canonical (symlink-aware) confinement. realpath the root (it exists — it was
-  // validated) and the target's real location; reject if the real target escapes.
+  // Canonical (symlink-aware) confinement, including DANGLING links: `generate_tests`
+  // is a write-gated tool that publishes its filenames under `dryRun: true`, so an
+  // agent can learn a name, drop a dangling symlink there, and repeat with
+  // `dryRun: false` — the target does not exist at check time, which is precisely
+  // the case the old fallback waved through.
+  let realRoot: string;
+  let realTarget: string;
   try {
-    const realRoot = realpathSync(absDir);
-    const realTarget = realPathOrNearestExisting(resolved);
-    if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) {
-      throw new Error(`Path escape blocked: "${filePath}" canonicalizes outside the project directory`);
-    }
+    realRoot = canonicalPath(absDir);
+    realTarget = canonicalPath(resolved);
   } catch (err) {
-    // A "Path escape blocked" error must propagate; only swallow realpath I/O errors
-    // on the root itself (which would be unexpected for a validated root).
-    if (err instanceof Error && err.message.startsWith('Path escape blocked')) throw err;
+    // Fail CLOSED: a path we cannot canonicalize is one we cannot vouch for.
+    throw new Error(
+      `Path escape blocked: "${filePath}" could not be canonicalized ` +
+      `(${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) {
+    throw new Error(`Path escape blocked: "${filePath}" canonicalizes outside the project directory`);
   }
   return resolved;
 }
@@ -277,7 +279,7 @@ export function _resetContextCacheForTesting(): void {
  *     differs from this entry → next read MISSes and re-reads disk → correct.
  */
 export async function primeContextCache(directory: string, ctx: CachedContext): Promise<void> {
-  const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const analysisDir = openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR);
   const filePath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
   let mtime: number;
   try {
@@ -294,7 +296,7 @@ export async function primeContextCache(directory: string, ctx: CachedContext): 
 }
 
 export async function readCachedContext(directory: string, timeout?: number): Promise<CachedContext | null> {
-  const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const analysisDir = openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR);
   const filePath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
 
   async function load(): Promise<CachedContext | null> {
@@ -365,8 +367,14 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
       // "There is an analysis here at all" — used to tell a fresh, empty project
       // apart from an analysis whose graph went missing.
       const hasAnalysis = (ctx.signatures?.length ?? 0) > 0 || (ctx.phase1_survey?.files?.length ?? 0) > 0;
-      if (EdgeStore.exists(analysisDir)) {
-        const es = EdgeStore.open(EdgeStore.dbPath(analysisDir));
+      const opened = openEdgeStoreForPerimeter(analysisDir);
+      const es = opened.store;
+      // The perimeter withheld the index (not "there is no index"). Record it on the
+      // context so the HANDLER can say so in its answer: a logger.warning goes to the
+      // server's log, and the agent sees only "no call graph" — indistinguishable
+      // from a repository nobody ever analyzed.
+      if (opened.withheld) ctx.indexWithheld = { reason: opened.withheld, detail: opened.reason ?? '' };
+      if (es) {
         // Schema-bump guard, for an analysis taken BEFORE the graph moved into the
         // store: opening a DB whose SCHEMA_VERSION is stale wipes it, and serving
         // the empty store next to a JSON that still has production nodes would give
@@ -395,7 +403,7 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
             );
           }
         }
-      } else if (hasAnalysis && jsonProdNodes === 0) {
+      } else if (hasAnalysis && jsonProdNodes === 0 && !EdgeStore.exists(analysisDir)) {
         logger.warning(
           `The analysis in ${analysisDir} has no call graph: ${EdgeStore.dbPath(analysisDir)} is missing, ` +
           `and llm-context.json does not carry one (the graph lives in that database). ` +
@@ -543,7 +551,7 @@ export async function computeProjectFingerprint(rootDir: string): Promise<string
  * Uses content-hash fingerprint when available; falls back to TTL check.
  */
 export async function isCacheFresh(directory: string): Promise<boolean> {
-  const fingerprintPath = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT);
+  const fingerprintPath = openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT);
   try {
     const stored = JSON.parse(await readFile(fingerprintPath, 'utf-8')) as { hash: string };
     const current = await computeProjectFingerprint(directory);
@@ -551,7 +559,7 @@ export async function isCacheFresh(directory: string): Promise<boolean> {
   } catch {
     // No fingerprint yet — fall back to TTL
     try {
-      const s = await stat(join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT));
+      const s = await stat(openloreReadTarget(directory, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT));
       return Date.now() - s.mtimeMs < ANALYSIS_STALE_THRESHOLD_MS;
     } catch {
       return false;

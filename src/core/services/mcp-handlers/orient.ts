@@ -39,6 +39,7 @@ import type { MemoryFreshness } from '../../../types/index.js';
 import { type Reversal, collectReversals, fileScope, supersededDecisionIds } from './reversals.js';
 import { getSourceRoots, moduleFromPath } from './epistemic-lease.js';
 import { readHotspotArtifact, hotspotsForModules } from './behavioral-hotspots.js';
+import { openloreReadTarget } from '../write-target.js';
 
 // ============================================================================
 // MANIFEST CACHE
@@ -172,7 +173,7 @@ export async function handleOrient(
 ): Promise<unknown> {
   const tooLong = queryTooLongError(task, 'task'); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, '.openlore', 'analysis');
+  const outputDir = openloreReadTarget(absDir, 'analysis');
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
   const { EmbeddingService } = await import('../../analyzer/embedding-service.js');

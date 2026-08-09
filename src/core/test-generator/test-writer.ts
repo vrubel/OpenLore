@@ -11,9 +11,10 @@
  */
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
 import type { GeneratedTestFile } from '../../types/test-generator.js';
+import { safeJoin } from '../services/mcp-handlers/utils.js';
 
 // ============================================================================
 // TYPES
@@ -110,14 +111,21 @@ export async function writeTestFiles(opts: {
   }
 
   for (const file of files) {
-    const absPath = resolve(rootPath, file.outputPath);
     // Write confinement (mcp-security): outputPath is derived from spec domain /
-    // requirement names — repo content. Most case-converters strip separators,
-    // but the junit path (toPascalCase) does not, so a crafted requirement title
-    // ("../../etc/x") could otherwise escape the root on write. Refuse any path
-    // that resolves outside the project root.
-    if (absPath !== rootPath && !absPath.startsWith(rootPath + sep)) {
-      result.skipped++;
+    // requirement names — repo content. Most case-converters strip separators, but
+    // the junit path (toPascalCase) does not, so a crafted requirement title
+    // ("../../etc/x") could otherwise escape the root on write.
+    //
+    // This used to be `resolve` + `startsWith`: LEXICAL only, while `safeJoin` two
+    // modules over has been symlink-aware for exactly this reason. A `tests/`
+    // directory that is a symlink would have carried the write out of the root with
+    // the prefix check still satisfied. Use the shared, canonicalizing helper so
+    // this containment means what the neighbouring one means.
+    let absPath: string;
+    try {
+      absPath = safeJoin(rootPath, file.outputPath);
+    } catch {
+      result.skipped++;   // escapes the root (lexically or through a link) — refuse
       continue;
     }
     const exists = await fileExists(absPath);

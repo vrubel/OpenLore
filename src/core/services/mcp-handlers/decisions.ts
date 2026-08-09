@@ -45,6 +45,11 @@ function spawnConsolidateBackground(rootPath: string): void {
       detached: true,
       stdio: 'ignore',
     });
+    // `cmd` is often the bare `openlore` from PATH, which is frequently absent (a
+    // test run, a build tree, a container with no global install). A spawn error
+    // with no listener is an UNHANDLED rejection — a process-level failure raised by
+    // a fire-and-forget consolidation that is explicitly allowed to not happen.
+    child.on('error', () => { /* best-effort background consolidation */ });
     child.unref();
   }).catch(() => { /* ignore */ });
 }

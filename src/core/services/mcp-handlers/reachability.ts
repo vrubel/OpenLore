@@ -30,14 +30,14 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { validateDirectory, readCachedContext } from './utils.js';
 import { resolveFederationScope, findCrossRepoConsumersBatch } from '../../federation/resolver.js';
 import { buildAdjacency } from './graph.js';
 import { assembleBoundary, computeStaleness, edgeBasisWithinSet } from './confidence-boundary.js';
 import { isIacLanguage } from '../../analyzer/iac/types.js';
-import { OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH } from '../../../constants.js';
+import { OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH } from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode } from '../../analyzer/call-graph.js';
+import { openloreReadTarget } from '../write-target.js';
 
 export interface FindDeadCodeInput {
   directory: string;
@@ -111,7 +111,7 @@ interface DepSignals {
 /** Load the cross-file import signals from the dependency graph. */
 async function loadDepSignals(absDir: string): Promise<DepSignals | null> {
   try {
-    const raw = await readFile(join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH), 'utf-8');
+    const raw = await readFile(openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH), 'utf-8');
     const g = JSON.parse(raw) as {
       nodes?: Array<{ id: string; file?: { path?: string } }>;
       edges?: Array<{ target?: string; importedNames?: string[] }>;

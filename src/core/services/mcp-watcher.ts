@@ -48,6 +48,7 @@ import {
 } from '../../constants.js';
 import { stringifyArtifact } from '../analyzer/artifact-json.js';
 import { attachCallGraphFromStore } from './call-graph-loader.js';
+import { ensureWriteDir } from './write-target.js';
 
 // Languages the watcher incrementally re-graphs on edit. MUST include every
 // graphable language whose extension is in SOURCE_EXTENSIONS, otherwise editing
@@ -186,8 +187,25 @@ export function isIgnoredRelPath(relPath: string): boolean {
 
 export class McpWatcher {
   private readonly rootPath: string;
-  private readonly outputPath: string;
+  private outputPath: string;
+  /** True when the caller pinned an explicit outputPath — then we do not re-derive. */
+  private readonly pinnedOutputPath: boolean;
   private readonly contextPath: string;
+
+  /**
+   * Re-derive the output directory through the perimeter before a write cycle.
+   *
+   * The constructor's approval is a seed, not a licence for the process lifetime: a
+   * watcher runs for hours, and swapping `.openlore` for a symlink 30 seconds in used
+   * to send every subsequent re-index outside the root while the real index stopped
+   * moving. Re-deriving per cycle bounds the exposure to a single cycle, and any swap
+   * is refused loudly rather than followed.
+   */
+  private resolveOutputPath(): string {
+    if (this.pinnedOutputPath) return this.outputPath;
+    this.outputPath = ensureWriteDir(this.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    return this.outputPath;
+  }
   private readonly debounceMs: number;
   private readonly maxBatchMs: number;
   private readonly bulkThreshold: number;
@@ -218,8 +236,14 @@ export class McpWatcher {
 
   constructor(options: McpWatcherOptions) {
     this.rootPath   = options.rootPath;
+    // Perimeter-derived. NOTE the constructor only seeds it: `resolveOutputPath()`
+    // re-derives before every re-index. Checking once per PROCESS was the worse half
+    // of the TOCTOU finding — a watcher lives for hours, so one approval at startup
+    // licensed every write until shutdown, and a swap 30 seconds in sent the entire
+    // subsequent stream of re-indexing outside the root.
     this.outputPath = options.outputPath
-      ?? join(options.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+      ?? ensureWriteDir(options.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    this.pinnedOutputPath = options.outputPath !== undefined;
     this.contextPath = join(this.outputPath, ARTIFACT_LLM_CONTEXT);
     this.debounceMs  = options.debounceMs ?? WATCH_DEBOUNCE_MS;
     this.maxBatchMs  = options.maxBatchMs ?? WATCH_MAX_BATCH_MS;
@@ -443,6 +467,18 @@ export class McpWatcher {
    *   • ONE vector update (inline when syncFlush, else on the embed lane).
    */
   private async handleBatch(absPaths: string[], opts: { syncFlush?: boolean } = {}): Promise<void> {
+    // Re-derive through the perimeter at the head of every write cycle — see
+    // resolveOutputPath(). A refusal here must stop the cycle, not crash the watcher.
+    try {
+      this.resolveOutputPath();
+    } catch (err) {
+      process.stderr.write(
+        `Watcher: re-indexing of ${this.rootPath} stopped — its analysis directory is no longer inside ` +
+        `this server's write perimeter (${err instanceof Error ? err.message : String(err)}).
+`,
+      );
+      return;
+    }
     const t0 = Date.now();
     const consumedVcsBulk = this.vcsBulkFlag;
     this.vcsBulkFlag = false;
@@ -605,7 +641,7 @@ export class McpWatcher {
     try {
       const child = spawn(
         process.execPath,
-        [cli, 'analyze', '--force', '--no-embed', '--output', this.outputPath],
+        [cli, 'analyze', '--force', '--no-embed', '--output', this.resolveOutputPath()],
         { cwd: this.rootPath, stdio: 'ignore', detached: true }
       );
       child.on('error', (err) => {
@@ -669,6 +705,7 @@ export class McpWatcher {
   }
 
   private async persistContext(context: CachedContext): Promise<void> {
+    this.resolveOutputPath();   // perimeter re-check immediately before the write
     // Strip the runtime-only EdgeStore handle and the DB-only CFG overlay before
     // serializing. Copy-then-delete rather than destructuring: the call graph is a
     // lazy getter over call-graph.db (PDLC-156), and naming it in a destructuring
