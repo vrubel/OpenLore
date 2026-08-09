@@ -1475,3 +1475,114 @@ describe('Root Allowlist — repairing a corrupt store is a WRITE, and needs the
     ).toBeGreaterThan(0);
   }, 60_000);
 });
+
+// ── Read is granted, write is NOT — the layout that separates the two gates ───
+//
+// A mutation matrix showed that removing the WRITE-side gate on the decision store
+// and on the analysis output no longer failed anything: the read-side gating added
+// later short-circuits first, so the old tests refused for the wrong reason and
+// stayed green either way. Coverage had silently regressed under a fix.
+//
+// This layout separates them. `.openlore` points at a directory that IS inside the
+// read roots and is NOT inside the write roots — the honest shape of
+// `--root scratch --root ws --write-root scratch`. Reads therefore succeed all the
+// way down, and only a write-side gate can stop what follows.
+describe('Root Allowlist — write-side gates, with reads deliberately permitted', () => {
+  let home: string;
+  let ws: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-rw-home-')));
+    ws = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-rw-ws-')));
+    mkdirSync(join(ws, '.openlore'), { recursive: true });
+    symlinkSync(join(ws, '.openlore'), join(home, '.openlore'));
+    // read BOTH, write only `home` — so every read below resolves fine.
+    configureRootAllowlist({ readRoots: [home, ws], writeRoots: [home] });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    _resetContextCacheForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  const strays = (): string[] => readdirSync(join(ws, '.openlore'), { recursive: true, encoding: 'utf-8' });
+
+  it('analyze_codebase: the output dir is a WRITE, refused even though reads are allowed', async () => {
+    writeFileSync(join(home, 'a.ts'), 'export const a = 1;\n', 'utf-8');
+    const res = await handleAnalyzeCodebase(home, true).catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(res)).toMatch(/Root allowlist/);
+    expect(strays(), 'the analysis was written into a read-only location').toEqual([]);
+  }, 120_000);
+
+  it('record_decision: the store path is a WRITE, refused even though reads are allowed', async () => {
+    const res = await handleRecordDecision(home, 'T', 'R') as Record<string, unknown>;
+    expect(String(res.error ?? '')).toMatch(/Root allowlist/);
+    expect(strays(), 'the decision was written into a read-only location').toEqual([]);
+  });
+});
+
+// ── The store derivations gate READS too ─────────────────────────────────────
+describe('Root Allowlist — memoryDir/decisionsDir confine the READ as well', () => {
+  let home: string;
+  let outside: string;
+
+  beforeEach(() => {
+    home = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-sr-home-')));
+    outside = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-sr-out-')));
+    // `.openlore` leads OUT of the perimeter entirely this time.
+    mkdirSync(join(outside, 'memory'), { recursive: true });
+    writeFileSync(
+      join(outside, 'memory', 'notes.json'),
+      JSON.stringify({ schemaVersion: 1, memories: [{ id: 'm1', content: 'SECRET-FROM-OUTSIDE', anchors: [] }] }),
+      'utf-8',
+    );
+    symlinkSync(outside, join(home, '.openlore'));
+    configureRootAllowlist({ readRoots: [home], writeRoots: [home] });
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('the store loader refuses rather than returning memories from outside the perimeter', async () => {
+    // Asserted on the LOADER, not on `recall`: recall summarises and never echoes raw
+    // content, so watching its output passes whether the gate exists or not — it did,
+    // until the mutation check said so. This is the function that hands foreign bytes
+    // back, so this is where the refusal has to be visible.
+    await expect(loadMemoryStore(home)).rejects.toThrow(/Root allowlist/);
+
+    const viaTool = await handleRecall(home, 'anything').catch((e: Error) => ({ error: e.message }));
+    expect(JSON.stringify(viaTool), 'content from outside the perimeter reached the agent')
+      .not.toContain('SECRET-FROM-OUTSIDE');
+  }, 60_000);
+});
+
+// ── The materialization refuses a symlink component ──────────────────────────
+describe('ensureWriteDir — refuses to build through a symlink component', () => {
+  let root: string;
+  let elsewhere: string;
+
+  beforeEach(() => {
+    root = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-mat-root-')));
+    elsewhere = realpathRoot(mkdtempSync(join(tmpdir(), 'ol-mat-else-')));
+  });
+  afterEach(() => {
+    _resetRootAllowlistForTesting();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(elsewhere, { recursive: true, force: true });
+  });
+
+  it('refuses when a component of the path it is asked to build is a link', () => {
+    // Deliberately with NO perimeter configured, and that is worth stating: with one,
+    // `assertPathAllowed` hands back an already-canonical path, so no symlink
+    // component survives to be found here and this guard is the backstop for the
+    // race (a component swapped after canonicalization). Unconfigured — the CLI
+    // shape — the approved path is lexical, so the check is reachable directly.
+    symlinkSync(elsewhere, join(root, '.openlore'));
+    expect(() => ensureWriteDir(root, '.openlore', 'analysis'),
+      'built the chain straight through a symlink').toThrow(/symbolic link|Root allowlist/);
+    expect(readdirSync(elsewhere), 'directories were created behind the link').toEqual([]);
+  });
+});

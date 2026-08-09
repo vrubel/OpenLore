@@ -15,6 +15,7 @@ import type { LLMContext } from '../analyzer/artifact-generator.js';
 import { McpWatcher } from './mcp-watcher.js';
 import * as utils from './mcp-handlers/utils.js';
 import { readCachedContext, _resetContextCacheForTesting } from './mcp-handlers/utils.js';
+import { configureRootAllowlist, _resetRootAllowlistForTesting } from './mcp-handlers/root-allowlist.js';
 
 // ── Timing ────────────────────────────────────────────────────────────────────
 //   stabilityThreshold 100ms  +  debounce 100ms  +  processing slack 200ms
@@ -392,4 +393,77 @@ describe('McpWatcher — real fs watcher', () => {
     const after = await readFile(contextPath, 'utf-8');
     expect(after).toBe(before);
   }, 10_000);
+});
+
+// ── The watcher re-derives its target every cycle, not once per process ──────
+//
+// This was the worse half of the TOCTOU finding: approval happened in the
+// constructor, so one check at startup licensed every write for the lifetime of a
+// server that runs for hours. Swapping `.openlore` for a symlink thirty seconds in
+// sent the whole subsequent stream of re-indexing outside the root, while the real
+// index stopped moving — and nothing complained.
+//
+// A mutation matrix then showed the fix had no lock on it at all: the existing
+// watcher tests all pass an explicit `outputPath`, which pins it and skips
+// re-derivation entirely, so removing the re-derivation broke nothing.
+describe('McpWatcher — a mid-session symlink swap does not redirect the index', () => {
+  const wait = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
+  let root = '';
+  let honeypot = '';
+
+  afterEach(async () => {
+    _resetRootAllowlistForTesting();
+    _resetContextCacheForTesting();
+    for (const d of [root, honeypot]) if (d) await rm(d, { recursive: true, force: true });
+    root = honeypot = '';
+  });
+
+  it('keeps writing nowhere rather than into the swapped-in target', async () => {
+    const { realpathSync, symlinkSync, rmSync, cpSync, statSync, existsSync } = await import('node:fs');
+    root = realpathSync(await mkdtemp(join(tmpdir(), 'ol-wswap-root-')));
+    honeypot = realpathSync(await mkdtemp(join(tmpdir(), 'ol-wswap-pot-')));
+    // Seed an index the way setupProject does: the watcher UPDATES an analysis, it
+    // does not create one from nothing — without this the first cycle writes nothing
+    // and the non-vacuity guard below (correctly) refuses to let the test proceed.
+    await mkdir(join(root, '.openlore', 'analysis'), { recursive: true });
+    await writeFile(join(root, '.openlore', 'analysis', 'llm-context.json'),
+      JSON.stringify(makeContext(), null, 2), 'utf-8');
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'a.ts'), 'export function a(): number { return 1; }\n', 'utf-8');
+
+    configureRootAllowlist({ readRoots: [root], writeRoots: [root] });
+
+    // NOTE: no explicit outputPath — pinning it skips the re-derivation this test exists to pin.
+    const seededAt = statSync(join(root, '.openlore', 'analysis', 'llm-context.json')).mtimeMs;
+    await wait(20);
+    const watcher = new McpWatcher({ rootPath: root, debounceMs: DEBOUNCE_MS, embed: false });
+    await watcher.start();
+    try {
+      await writeFile(join(root, 'src', 'a.ts'), 'export function a(): number { return 2; }\n', 'utf-8');
+      await wait(WAIT_MS * 4);
+      const realCtx = join(root, '.openlore', 'analysis', 'llm-context.json');
+      // Non-vacuity: a cycle really ran and really WROTE (mtime moved), not merely
+      // that the seeded file exists.
+      expect(existsSync(realCtx)).toBe(true);
+      expect(statSync(realCtx).mtimeMs,
+        'the watcher never updated the index — the test would be vacuous').toBeGreaterThan(seededAt);
+
+      // The swap, mid-session. The honeypot is SEEDED with the current index, so the
+      // watcher can keep working after the swap — otherwise the cycle dies for want of
+      // a context and the test passes for the wrong reason.
+      cpSync(join(root, '.openlore'), join(honeypot, '.openlore'), { recursive: true });
+      rmSync(join(root, '.openlore'), { recursive: true, force: true });
+      symlinkSync(join(honeypot, '.openlore'), join(root, '.openlore'));
+      const potCtx = join(honeypot, '.openlore', 'analysis', 'llm-context.json');
+      const before = statSync(potCtx).mtimeMs;
+
+      await writeFile(join(root, 'src', 'a.ts'), 'export function a(): number { return 3; }\n', 'utf-8');
+      await wait(WAIT_MS * 6);
+
+      expect(statSync(potCtx).mtimeMs,
+        'the watcher followed the swapped link and re-indexed into the honeypot').toBe(before);
+    } finally {
+      await watcher.stop();
+    }
+  }, 120_000);
 });

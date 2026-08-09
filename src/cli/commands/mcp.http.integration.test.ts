@@ -359,6 +359,24 @@ describe('openlore mcp --http: корневой allowlist на транспор�
     }
   });
 
+  // M8: проверка --watch живёт в applyRootAllowlist, то есть ДО listen(). Позже
+  // добавился второй отказ в maybeStartWatcher (F6) — он ловит тот же случай, но
+  // уже ПОСЛЕ того, как порт открыт. Тест, смотревший только «упало ли», перестал
+  // различать эти два слоя и зеленел со снятой стартовой проверкой. Различаем по
+  // тексту: стартовый отказ говорит про «корни чтения», поздний — про «пишет индекс».
+  it('--watch отбивается СТАРТОВОЙ проверкой (до listen), а не поздней', async () => {
+    const served = mk('w8-served');
+    const watched = mk('w8-watched');
+    try {
+      await expect(startHttpMcpServer({
+        http: true, port: '0', watchAuto: false, root: [served], watch: watched,
+      })).rejects.toThrow(/обязан лежать внутри корней чтения/);
+    } finally {
+      rmSync(served, { recursive: true, force: true });
+      rmSync(watched, { recursive: true, force: true });
+    }
+  });
+
   it('--watch вне явных корней чтения — громкий отказ запуска (вотчер пишет туда индекс)', async () => {
     const served = mk('w-served');
     const watched = mk('w-watched');
@@ -412,24 +430,37 @@ describe('openlore mcp --http: корневой allowlist на транспор�
   // error. Клиент MCP решает «упало или нет» по isError; агент, которому сказали
   // «успех», понял, что граница — это особенность данных, а не граница. Дверные
   // отказы помечались правильно, глубокие — нет.
-  it('глубокий отказ (симлинк .openlore наружу) приходит агенту как isError, а не как успех', async () => {
-    const home = mk('deep');
-    const elsewhere = mk('deep-out');
+  // Раскладка ЧТЕНИЕ-ДА / ЗАПИСЬ-НЕТ, и это принципиально. Если `.openlore` ведёт
+  // наружу совсем, отказ прилетает раньше — на чтении config.json — и транспорт
+  // помечает его isError своим общим catch'ем. Тест тогда зеленеет и со снятой
+  // пометкой: он проверяет чужой слой. Здесь чтения проходят до конца, отказ
+  // рождается ГЛУБОКО и возвращается значением {error}, а не броском — то есть
+  // ровно тот случай, ради которого пометка и добавлена.
+  it('глубокий отказ приходит агенту как isError, а не как успешный вызов с полем error', async () => {
+    const home = mk('deep-home');
+    const ws = mk('deep-ws');
     const prevCwd = process.cwd();
     try {
-      symlinkSync(elsewhere, join(home, '.openlore'));
+      mkdirSync(join(ws, '.openlore'), { recursive: true });
+      symlinkSync(join(ws, '.openlore'), join(home, '.openlore'));
       process.chdir(home);
-      handle = await startHttpMcpServer({ http: true, port: '0', watchAuto: false, root: [home] });
+      handle = await startHttpMcpServer({
+        http: true, port: '0', watchAuto: false, root: [home, ws], writeRoot: [home],
+      });
       const res = await callTool(handle.port, 'record_decision', {
         directory: home, title: 'T', rationale: 'R',
       });
-      expect(res.isError, 'граница пришла агенту как успешный вызов').toBe(true);
+      expect(res.isError, 'граница пришла агенту как успешный вызов с полем error').toBe(true);
       expect(res.text).toMatch(/Root allowlist/);
-      expect(readdirSync(elsewhere), 'запись просочилась за периметр').toEqual([]);
+      // И это НЕ общий catch транспорта: тот оформляет бросок как «Tool error [CODE]».
+      expect(res.text, 'отказ пришёл броском, а не значением — тест смотрит не на тот слой')
+        .not.toMatch(/^Tool error \[/);
+      expect(readdirSync(join(ws, '.openlore'), { recursive: true, encoding: 'utf-8' }),
+        'запись просочилась в корень только для чтения').toEqual([]);
     } finally {
       process.chdir(prevCwd);
       rmSync(home, { recursive: true, force: true });
-      rmSync(elsewhere, { recursive: true, force: true });
+      rmSync(ws, { recursive: true, force: true });
     }
   });
 
