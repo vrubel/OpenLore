@@ -17,6 +17,8 @@ import { join } from 'node:path';
 import type { EmbeddingService } from './embedding-service.js';
 import type { SearchResult as CodeSearchResult } from './vector-index.js';
 import type { SpecSearchResult } from './spec-vector-index.js';
+import { searchWithStatus, type IndexCapability } from './index-capabilities.js';
+import type { IndexTable } from './vector-store.js';
 
 // ============================================================================
 // TYPES
@@ -246,6 +248,7 @@ export class UnifiedSearch {
       domain?: string;
       section?: string;
       config?: Partial<CrossScoringConfig>;
+      status?: (table: IndexTable, capability: IndexCapability) => void;
     } = {}
   ): Promise<UnifiedSearchResult[]> {
     const { limit = 10, language, domain, section, config = {} } = opts;
@@ -270,14 +273,17 @@ export class UnifiedSearch {
       // Non-fatal - proceed without cross-scoring
     }
 
-    // Execute parallel searches
     const svc = embedSvc ?? null;
-    const [codeResults, specResults] = await Promise.all([
-      VectorIndex.search(outputDir, query, svc, { limit: limit * 3, language }).catch(() => []),
+    const [code, specs] = await Promise.all([
+      searchWithStatus(status => VectorIndex.search(outputDir, query, svc, { limit: limit * 3, language, status })),
       svc
-        ? SpecVectorIndex.search(outputDir, query, svc, { limit: limit * 3, domain, section }).catch(() => [])
-        : Promise.resolve([]),
+        ? searchWithStatus(status => SpecVectorIndex.search(outputDir, query, svc, { limit: limit * 3, domain, section, status }))
+        : null,
     ]);
+    if (code.index) opts.status?.('functions', code.index);
+    if (specs?.index) opts.status?.('specs', specs.index);
+    const codeResults = code.results;
+    const specResults = specs?.results ?? [];
 
     // Combine and score results
     const allResults: Array<{

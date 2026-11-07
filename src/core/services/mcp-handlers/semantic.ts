@@ -7,7 +7,8 @@ import { INSERTION_SEMANTIC_WEIGHT, INSERTION_STRUCTURAL_WEIGHT, INSERTION_ROLE_
 import { fileExists } from '../../../utils/command-helpers.js';
 import { validateDirectory, safeJoin, loadMappingIndex, specsForFile, functionsForDomain, queryTooLongError } from './utils.js';
 import { expandHandle, applyTokenBudget, collapseExactDuplicates, omissionNote } from './progressive.js';
-import { readOpenLoreConfig } from '../config-manager.js';
+import { configuredEmbedder, searchWithStatus, unavailableIndex, type IndexCapability } from '../../analyzer/index-capabilities.js';
+import type { IndexTable } from '../../analyzer/vector-store.js';
 import { openloreReadTarget } from '../write-target.js';
 
 // ============================================================================
@@ -133,11 +134,6 @@ async function searchTextLines(
   searchMode: 'text' | 'text_fallback',
 ): Promise<unknown | null> {
   const { TextLineIndex } = await import('../../analyzer/text-line-index.js');
-  if (!TextLineIndex.exists(outputDir)) {
-    return searchMode === 'text'
-      ? { query, searchMode, count: 0, results: [], note: 'No text line index found. Run "openlore analyze".' }
-      : null;
-  }
   const hits = await TextLineIndex.searchText(outputDir, query, { limit: Math.max(1, Math.min(limit, 100)) });
   if (hits.length === 0 && searchMode === 'text_fallback') return null;
   return {
@@ -171,55 +167,35 @@ export async function handleSearchCode(
   const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
 
-  // Forced literal-text mode: query the separate line index directly, bypassing
-  // symbol search. Use when hunting a literal string (UI copy, error text).
+  // Forced literal-text mode bypasses symbol search.
   if (mode === 'text') {
-    return searchTextLines(outputDir, query, limit, 'text');
-  }
-
-  if (!VectorIndex.exists(outputDir)) {
-    return {
-      error: 'No search index found. Run "openlore analyze" first.',
-      hint: 'Plain "openlore analyze" builds a keyword (BM25) index; add EMBED_BASE_URL/EMBED_MODEL for semantic search.',
-    };
-  }
-
-  // Resolve embedding service — fall back to BM25-only search if unavailable
-  let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
-  let searchMode = 'hybrid';
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readOpenLoreConfig(absDir);
-    const svcFromConfig = cfg ? EmbeddingService.fromConfig(cfg) : null;
-    if (svcFromConfig) {
-      embedSvc = svcFromConfig;
-    } else {
-      searchMode = 'bm25_fallback';
+    try {
+      return await searchTextLines(outputDir, query, limit, 'text');
+    } catch (error) {
+      const index = unavailableIndex(error);
+      return { query, error: index.reason!.message, index };
     }
   }
 
+  const embedSvc = await configuredEmbedder(absDir);
   limit = Math.max(1, Math.min(limit, 100));
   const { readCachedContext } = await import('./utils.js');
-  const [results, mappingIdx, llmCtx] = await Promise.all([
-    VectorIndex.search(outputDir, query, embedSvc, { limit, language, minFanIn }),
+  const [code, mappingIdx, llmCtx] = await Promise.all([
+    searchWithStatus(status => VectorIndex.search(outputDir, query, embedSvc, { limit, language, minFanIn, status })),
     loadMappingIndex(absDir),
     readCachedContext(absDir),
   ]);
+  const { results, index } = code;
+  if (index?.mode === 'unavailable') return { query, error: index.reason!.message, index };
 
-  // Zero symbol hits: the string may live in static markup/text that extracts
-  // no symbols (UI copy, error messages). Fall back to the literal-text line
-  // index rather than returning a dead end. This is an optional enrichment —
-  // its failure must never turn a valid empty symbol result into a tool error,
-  // so a throw degrades silently to the normal empty response below.
+  let textIndex: IndexCapability | undefined;
   if (results.length === 0) {
     try {
       const textFallback = await searchTextLines(outputDir, query, limit, 'text_fallback');
-      if (textFallback) return textFallback;
-    } catch {
-      /* text index unavailable/corrupt — fall through to the empty symbol response */
+      if (textFallback) return { ...(textFallback as Record<string, unknown>), indexDiagnostics: { functions: index } };
+    } catch (error) {
+      textIndex = unavailableIndex(error);
     }
   }
 
@@ -283,12 +259,10 @@ export async function handleSearchCode(
 
   return {
     query,
-    searchMode,
-    ...(searchMode === 'bm25_fallback'
-      ? {
-          note: 'Embedding server unavailable — results based on keyword matching only. Configure EMBED_BASE_URL + EMBED_MODEL for semantic search.',
-        }
-      : {}),
+    searchMode: index?.mode === 'semantic' ? 'hybrid' : 'bm25_fallback',
+    index,
+    ...(index?.mode === 'text' ? { note: index.reason?.message ?? 'This index uses keyword matching (BM25).' } : {}),
+    ...(textIndex ? { indexDiagnostics: { text_lines: textIndex } } : {}),
     count: budgeted.kept.length,
     results: budgeted.kept,
     ...(budgeted.omitted > 0
@@ -312,30 +286,15 @@ export async function handleSuggestInsertionPoints(
   const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
-
-  if (!VectorIndex.exists(outputDir)) {
-    return {
-      error: 'No search index found. Run "openlore analyze" first.',
-      hint: 'Plain "openlore analyze" builds a keyword (BM25) index; add EMBED_BASE_URL/EMBED_MODEL for semantic search.',
-    };
-  }
-
-  // Resolve embedding service — null triggers BM25 fallback in VectorIndex.search().
-  let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readOpenLoreConfig(absDir);
-    embedSvc = cfg ? EmbeddingService.fromConfig(cfg) : null;
-  }
-
+  const embedSvc = await configuredEmbedder(absDir);
   limit = Math.max(1, Math.min(limit, 20));
   const { readCachedContext } = await import('./utils.js');
-  const [rawResults, llmCtx] = await Promise.all([
-    VectorIndex.search(outputDir, description, embedSvc, { limit: limit * 4, language }),
+  const [code, llmCtx] = await Promise.all([
+    searchWithStatus(status => VectorIndex.search(outputDir, description, embedSvc, { limit: limit * 4, language, status })),
     readCachedContext(absDir),
   ]);
+  const { results: rawResults, index } = code;
+  if (index?.mode === 'unavailable') return { description, error: index.reason!.message, index };
 
   // Normalise search scores to [0, 1] for compositeScore (scores are RRF/BM25: higher = better)
   const maxScore = rawResults.length > 0 ? Math.max(...rawResults.map((r) => r.score)) : 1;
@@ -419,6 +378,7 @@ export async function handleSuggestInsertionPoints(
 
   return {
     description,
+    index,
     count: top.length,
     candidates: top,
     nextSteps:
@@ -520,44 +480,20 @@ export async function handleSearchSpecs(
   const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
   const { SpecVectorIndex } = await import('../../analyzer/spec-vector-index.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
-
-  if (!SpecVectorIndex.exists(outputDir)) {
-    return {
-      error: 'No spec index found. Run "openlore analyze" first.',
-      hint: 'Plain "openlore analyze" builds a keyword (BM25) spec index; configure EMBED_* for semantic spec search.',
-    };
-  }
-
-  // Resolve embedding service — null triggers BM25 fallback in SpecVectorIndex.search().
-  let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
-  let searchMode = 'hybrid';
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readOpenLoreConfig(absDir);
-    const svcFromConfig = cfg ? EmbeddingService.fromConfig(cfg) : null;
-    if (svcFromConfig) {
-      embedSvc = svcFromConfig;
-    } else {
-      searchMode = 'bm25_fallback';
-    }
-  }
-
+  const embedSvc = await configuredEmbedder(absDir);
   limit = Math.max(1, Math.min(limit, 50));
-  const [results, mappingIdx] = await Promise.all([
-    SpecVectorIndex.search(outputDir, query, embedSvc, { limit, domain, section }),
+  const [specs, mappingIdx] = await Promise.all([
+    searchWithStatus(status => SpecVectorIndex.search(outputDir, query, embedSvc, { limit, domain, section, status })),
     loadMappingIndex(absDir),
   ]);
+  const { results, index } = specs;
+  if (index?.mode === 'unavailable') return { query, error: index.reason!.message, index };
 
   return {
     query,
-    searchMode,
-    ...(searchMode === 'bm25_fallback'
-      ? {
-          note: 'No embedding endpoint — spec results based on keyword matching only. Configure EMBED_BASE_URL + EMBED_MODEL for semantic spec search.',
-        }
-      : {}),
+    searchMode: index?.mode === 'semantic' ? 'hybrid' : 'bm25_fallback',
+    index,
+    ...(index?.mode === 'text' ? { note: index.reason?.message ?? 'This index uses keyword matching (BM25).' } : {}),
     count: results.length,
     results: results.map((r) => ({
       score: r.score,
@@ -587,42 +523,22 @@ export async function handleUnifiedSearch(
   const absDir = await validateDirectory(directory);
   const outputDir = openloreReadTarget(absDir, OPENLORE_ANALYSIS_SUBDIR);
 
-  const { UnifiedSearch, unifiedSearchAvailable } =
-    await import('../../analyzer/unified-search.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
-
-  if (!(await unifiedSearchAvailable(outputDir))) {
-    return {
-      error:
-        'No unified search available. Run "openlore analyze --embed" first, ' +
-        'then configure EMBED_BASE_URL and EMBED_MODEL.',
-    };
-  }
-
-  // Resolve embedding service
-  let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readOpenLoreConfig(absDir);
-    const svcFromConfig = cfg ? EmbeddingService.fromConfig(cfg) : null;
-    if (svcFromConfig) {
-      embedSvc = svcFromConfig;
-    }
-  }
-
+  const { UnifiedSearch } = await import('../../analyzer/unified-search.js');
+  const embedSvc = await configuredEmbedder(absDir);
   limit = Math.max(1, Math.min(limit, 50));
+  const indexes: Partial<Record<IndexTable, IndexCapability>> = {};
   const results = await UnifiedSearch.unifiedSearch(outputDir, query, embedSvc, {
     limit,
     language,
     domain,
     section,
+    status: (table, capability) => { indexes[table] = capability; },
   });
+  const observed = Object.values(indexes);
+  if (observed.length && observed.every(index => index.mode === 'unavailable')) {
+    return { query, error: 'No requested search index is available.', indexes };
+  }
+  return { query, count: results.length, results, indexes };
 
-  return {
-    query,
-    count: results.length,
-    results,
-  };
 }
 

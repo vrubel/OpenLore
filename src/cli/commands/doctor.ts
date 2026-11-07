@@ -460,8 +460,17 @@ Checks performed:
 `
   )
   .option('--json', 'Output results as JSON', false)
-  .action(async (options: { json: boolean }) => {
+  .option('--index-only', 'Inspect saved search tables without network embedding or LLM checks', false)
+  .option('--pinned-index', 'Require immutable remote search generations in --index-only mode', false)
+  .action(async (options: { json: boolean; indexOnly: boolean; pinnedIndex: boolean }) => {
     const rootPath = process.cwd();
+    if (options.indexOnly) {
+      if (!options.json) throw new Error('--index-only requires --json');
+      const { inspectSearchIndexes } = await import('../../core/analyzer/index-capabilities.js');
+      console.log(JSON.stringify(await inspectSearchIndexes(rootPath, options.pinnedIndex)));
+      return;
+    }
+    if (options.pinnedIndex) throw new Error('--pinned-index requires --index-only');
     const useColor = process.stdout.isTTY && !options.json;
 
     if (!options.json) {

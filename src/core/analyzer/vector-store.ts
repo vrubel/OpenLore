@@ -1,31 +1,11 @@
-/**
- * VectorStore backend — хранилище векторного индекса за единым интерфейсом (D7 ось B, PDLC §12).
- *   QDRANT_URL задан           → Qdrant: коллекция openlore_<table>_<hash(dbPath)>, точки {id,vector,payload}.
- *   нет QDRANT_URL, есть lancedb→ LanceDB (папка <dbPath>/, таблица tableName) — ANN, как раньше (dev/integration).
- *   нет ни того, ни другого    → File: <dbPath>/<table>.records.json — слим-дистрибутив без 129-МБ напи и без
- *                                Qdrant. BM25 (loadAll) работает «из коробки»; dense — brute-force cosine.
- *
- * @lancedb/lancedb теперь optionalDependencies: дистрибутив PDLC (single-installer) собирается `--omit=optional`
- * и нативный 129-МБ napi-бинарь LanceDB в поставку НЕ входит (он один форсил per-OS-разбиение артефакта).
- * РАНЬШЕ его отсутствие без QDRANT_URL = fail-loud (orient/BM25 падал «задайте QDRANT_URL» даже без --embed,
- * т.к. _bm25Only зовёт backend.loadAll()). Теперь при отсутствии lancedb выбирается FileBackend — навигация
- * (orient/search_code) работает на standalone БЕЗ Qdrant и БЕЗ 129-МБ нативки; семантика большого масштаба —
- * внешний Qdrant (QDRANT_URL). Где lancedb установлен (dev/integration) — LanceBackend остаётся ANN, как раньше.
- *
- * Контракт наружу один (VectorIndex/SpecVectorIndex используют его, не зная бэкенд): build (overwrite), loadAll
- * (все строки id+payload+vector — для BM25-корпуса и инкрементального кэша), searchDense (ANN best-first c _distance),
- * exists. BM25/RRF-слой остаётся бэкенд-агностичным (работает над строками).
- *
- * exists() ОСТАЁТСЯ синхронным (не рябит async на вызывающих): в Qdrant-режиме build пишет локальный маркер
- * <dbPath>/.qdrant — existsSync(dbPath) истинно для обоих бэкендов; данные при этом в Qdrant.
- * fail-loud: Qdrant не-2xx → throw (НЕ молчаливый пустой результат).
- */
-import { existsSync, mkdirSync, writeFileSync, readFileSync, createReadStream, createWriteStream, renameSync, openSync, readSync, closeSync } from 'node:fs';
+/** Persisted backend selection for reads, environment selection for publication. */
+import { existsSync, mkdirSync, writeFileSync, readFileSync, createReadStream, createWriteStream, renameSync, openSync, readSync, closeSync, statSync, unlinkSync, rmSync } from 'node:fs';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
-import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { dirname, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { assertPathAllowed } from '../services/mcp-handlers/root-allowlist.js';
 
 export interface VectorRecord extends Record<string, unknown> {
   id: string;
@@ -75,14 +55,322 @@ export function selectBackendKind(opts: { qdrantUrl: string | null; hasLancedb: 
   return opts.hasLancedb ? 'lance' : 'file';
 }
 
-/** Выбор бэкенда по окружению (Qdrant → LanceDB → File). */
-export function openVectorBackend(dbPath: string, tableName: string): VectorBackend {
-  const url = qdrantUrl();
-  switch (selectBackendKind({ qdrantUrl: url, hasLancedb: hasLancedb() })) {
-    case 'qdrant': return new QdrantBackend(url as string, dbPath, tableName);
-    case 'lance':  return new LanceBackend(dbPath, tableName);
-    default:       return new FileBackend(dbPath, tableName);
+export type BackendKind = ReturnType<typeof selectBackendKind>;
+export type IndexTable = 'functions' | 'specs' | 'text_lines';
+
+export interface IndexIdentity {
+  table: IndexTable;
+  generation: string | null;
+  source_sha256: string | null;
+  model: string | null;
+  dim: number;
+}
+
+interface Descriptor extends IndexIdentity {
+  version: 1;
+  generation: string;
+  source_sha256: string;
+  backend: BackendKind;
+  count: number;
+  analysis_fingerprint: string | null;
+  distance: 'Cosine' | null;
+  embedding_input: 'text-24000-v1' | null;
+}
+
+export interface IndexIssue {
+  code: 'missing-index' | 'legacy-remote-unpinned' | 'collection-missing' |
+    'collection-binding-mismatch' | 'backend-unreachable' | 'embedding-mismatch' | 'index-invalid';
+  message: string;
+}
+
+export class IndexUnavailable extends Error {
+  constructor(readonly code: IndexIssue['code'], message: string, readonly backend: BackendKind | null = null) {
+    super(message);
   }
+}
+
+export function indexIssue(error: unknown): IndexIssue {
+  return error instanceof IndexUnavailable
+    ? { code: error.code, message: error.message }
+    : { code: 'index-invalid', message: 'The stored search index could not be read.' };
+}
+
+export interface StoredIndex {
+  backend: VectorBackend;
+  kind: BackendKind;
+  identity: IndexIdentity;
+  cacheKey: string;
+}
+
+export interface OpenStoredOptions {
+  pinned?: boolean;
+  signal?: AbortSignal;
+}
+
+const SHA256 = /^[a-f0-9]{64}$/;
+const GENERATION = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+const descriptorPath = (db: string, table: IndexTable) => join(db, table + '.index.json');
+const markerPath = (db: string, table: IndexTable) => join(db, '.qdrant-' + table);
+const filePath = (db: string, table: string) => join(db, table + '.records.json');
+const lancePath = (db: string, table: string) => join(db, table + '.lance');
+const legacyCollection = (db: string, table: IndexTable) =>
+  'openlore_' + table + '_' + createHash('sha1').update(db).digest('hex').slice(0, 12);
+const localTable = (d: Descriptor) => d.table + '_' + d.generation.replaceAll('-', '');
+const collection = (d: Descriptor) => 'openlore_' + localTable(d);
+
+function readSmall(path: string): string | null {
+  let fd: number;
+  try {
+    fd = openSync(assertPathAllowed(path, 'read'), 'r');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const data = Buffer.alloc(8193);
+    const n = readSync(fd, data, 0, data.length, 0);
+    if (n === data.length) throw new IndexUnavailable('index-invalid', 'Search index metadata exceeds its size limit.');
+    return data.toString('utf8', 0, n);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function artifactPresent(path: string): boolean {
+  try {
+    statSync(assertPathAllowed(path, 'read'));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+export function hasStoredVectorIndex(db: string, table: IndexTable): boolean {
+  try {
+    return [descriptorPath(db, table), filePath(db, table), lancePath(db, table), markerPath(db, table)]
+      .some(artifactPresent);
+  } catch {
+    // Let the reader report a broken artifact instead of treating it as absent.
+    return true;
+  }
+}
+
+function readDescriptor(db: string, table: IndexTable): Descriptor | null {
+  const raw = readSmall(descriptorPath(db, table));
+  if (raw === null) return null;
+  const d = JSON.parse(raw) as Descriptor;
+  if (!d || d.version !== 1 || d.table !== table || !GENERATION.test(d.generation) ||
+      typeof d.generation !== 'string' || typeof d.source_sha256 !== 'string' || !SHA256.test(d.source_sha256) ||
+      (d.analysis_fingerprint !== null && (typeof d.analysis_fingerprint !== 'string' || !SHA256.test(d.analysis_fingerprint))) ||
+      !['file', 'lance', 'qdrant'].includes(d.backend) ||
+      !Number.isSafeInteger(d.count) || d.count < 0 || !Number.isSafeInteger(d.dim) || d.dim < 0 ||
+      (d.model !== null && (typeof d.model !== 'string' || !d.model)) ||
+      (d.dim === 0
+        ? d.distance !== null || d.model !== null || d.embedding_input !== null
+        : d.distance !== 'Cosine' || d.embedding_input !== 'text-24000-v1') ||
+      (d.backend === 'qdrant' && (d.dim === 0 || d.count === 0))) {
+    throw new IndexUnavailable('index-invalid', 'Invalid persisted search index descriptor.');
+  }
+  return d;
+}
+
+function readLegacyMeta(db: string, table: IndexTable): { dim: number; model: string | null } | null {
+  if (table === 'text_lines') return { dim: 0, model: null };
+  const raw = readSmall(join(dirname(db), table === 'functions' ? 'vector-index-meta.json' : 'spec-index-meta.json'));
+  if (raw === null) return null;
+  const meta = JSON.parse(raw);
+  if (!meta || typeof meta.hasEmbeddings !== 'boolean' || !Number.isSafeInteger(meta.dim) ||
+      (meta.hasEmbeddings ? meta.dim <= 0 : meta.dim !== 0) ||
+      (meta.model !== null && typeof meta.model !== 'string')) {
+    throw new IndexUnavailable('index-invalid', 'Invalid legacy search index metadata.');
+  }
+  return { dim: meta.dim, model: meta.hasEmbeddings ? meta.model || null : null };
+}
+
+function localKey(db: string, table: string, kind: 'file' | 'lance'): string {
+  const path = kind === 'file' ? filePath(db, table) : lancePath(db, table);
+  const stat = statSync(assertPathAllowed(path, 'read'));
+  return JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+}
+
+function localBackend(db: string, table: string, kind: 'file' | 'lance', expected?: Descriptor): FileBackend | LanceBackend {
+  if (kind === 'lance' && !hasLancedb()) {
+    throw new IndexUnavailable('backend-unreachable', 'This saved index requires the local LanceDB runtime.', kind);
+  }
+  assertPathAllowed(kind === 'file' ? filePath(db, table) : lancePath(db, table), 'read');
+  return kind === 'file' ? new FileBackend(db, table, expected, true) : new LanceBackend(db, table, expected);
+}
+
+export async function openStoredVectorIndex(
+  db: string, table: IndexTable, options: OpenStoredOptions = {},
+): Promise<StoredIndex> {
+  let kind: BackendKind | null = null;
+  try {
+    db = assertPathAllowed(db, 'read');
+    const descriptor = readDescriptor(db, table);
+    const pinned = options.pinned || process.env.OPENLORE_PINNED_INDEX === '1';
+    if (descriptor) {
+      kind = descriptor.backend;
+      const { generation, source_sha256, model, dim } = descriptor;
+      const identity = { table, generation, source_sha256, model, dim };
+      if (kind === 'qdrant') {
+        if (pinned && (!descriptor.analysis_fingerprint ||
+            publishedAnalysisFingerprint(dirname(db)) !== descriptor.analysis_fingerprint)) {
+          throw new IndexUnavailable('collection-binding-mismatch', 'The saved search generation does not match this pinned analysis.', kind);
+        }
+        const remote = new QdrantBackend(collection(descriptor), descriptor, options.signal);
+        await remote.verify();
+        return { backend: remote, kind, identity, cacheKey: remote.proof! };
+      }
+      const storage = localTable(descriptor);
+      const local = localBackend(db, storage, kind, descriptor);
+      if (!local.exists()) throw new IndexUnavailable('index-invalid', 'The published local index table is missing.', kind);
+      await local.inspect(descriptor, options.signal);
+      return { backend: local, kind, identity, cacheKey: generation + ':' + localKey(db, storage, kind) };
+    }
+
+    const marker = readSmall(markerPath(db, table));
+    const file = artifactPresent(filePath(db, table));
+    const lance = artifactPresent(lancePath(db, table));
+    if (Number(file) + Number(lance) + Number(marker !== null) > 1) {
+      throw new IndexUnavailable('index-invalid', 'Multiple legacy backends claim the same search table.');
+    }
+    if (marker !== null) {
+      kind = 'qdrant';
+      if (pinned) {
+        throw new IndexUnavailable('legacy-remote-unpinned', 'This legacy Qdrant index has no pinned generation. Publish it with an explicit OpenLore analysis.', kind);
+      }
+      const name = legacyCollection(db, table);
+      if (marker.trim() !== name) {
+        throw new IndexUnavailable('collection-binding-mismatch', 'The legacy Qdrant marker does not belong to this repository.', kind);
+      }
+      const remote = new QdrantBackend(name, null, options.signal);
+      const dim = await remote.verify();
+      const meta = readLegacyMeta(db, table);
+      if (meta && meta.dim !== dim) {
+        throw new IndexUnavailable('collection-binding-mismatch', 'The legacy Qdrant vector schema differs from its index metadata.', kind);
+      }
+      const identity = { table, generation: null, source_sha256: null, model: meta?.model ?? null, dim };
+      return { backend: remote, kind, identity, cacheKey: randomUUID() };
+    }
+    if (!file && !lance) {
+      throw new IndexUnavailable('missing-index', 'No saved search index for this table. Run OpenLore analysis to build it.');
+    }
+    kind = file ? 'file' : 'lance';
+    const local = localBackend(db, table, kind);
+    const meta = readLegacyMeta(db, table);
+    const dim = await local.inspect(meta, options.signal);
+    const identity = { table, generation: null, source_sha256: null, model: meta?.model ?? null, dim };
+    return { backend: local, kind, identity, cacheKey: 'legacy:' + kind + ':' + localKey(db, table, kind) + ':' + JSON.stringify(meta) };
+  } catch (error) {
+    if (error instanceof IndexUnavailable) throw error;
+    throw new IndexUnavailable('index-invalid', 'The stored search index metadata or table could not be read.', kind);
+  }
+}
+
+/** The analysis fingerprint is a separate anchor from each table's content basis. */
+export function publishedAnalysisFingerprint(outputDir: string): string | null {
+  const raw = readSmall(join(outputDir, 'fingerprint.json'));
+  if (raw === null) return null;
+  const hash: unknown = JSON.parse(raw)?.hash;
+  return typeof hash === 'string' && SHA256.test(hash) ? hash : null;
+}
+
+function sourceDigest(records: Record<string, unknown>[]): string {
+  const source = createHash('sha256');
+  for (const row of [...records].sort((a, b) => String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0)) {
+    const { vector: _vector, ...input } = row;
+    const fields = Object.entries(input).filter(([, value]) => value !== undefined)
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    source.update(JSON.stringify(fields) + '\n');
+  }
+  return source.digest('hex');
+}
+
+function discardLocalGeneration(db: string, descriptor: Descriptor): void {
+  if (descriptor.backend === 'qdrant') return;
+  const table = localTable(descriptor);
+  const path = descriptor.backend === 'file' ? filePath(db, table) : lancePath(db, table);
+  try {
+    rmSync(path, { recursive: descriptor.backend === 'lance', force: true });
+  } catch {
+    // A stale local artifact is harmless after the descriptor has switched.
+  }
+}
+
+export async function publishVectorIndex(
+  db: string, table: IndexTable, records: VectorRecord[], model: string | null, analysisFingerprint: string | null,
+): Promise<void> {
+  if (process.env.OPENLORE_PINNED_INDEX === '1') {
+    throw new IndexUnavailable('index-invalid', 'A pinned index reader cannot publish search data.');
+  }
+  db = assertPathAllowed(db, 'write');
+  const dim = records[0]?.vector?.length ?? 0;
+  if (records.some(row => (row.vector?.length ?? 0) !== dim || row.vector?.some(value => !Number.isFinite(value)))) {
+    throw new IndexUnavailable('embedding-mismatch', 'Cannot publish a search index with mixed or invalid vector dimensions.');
+  }
+  const backend = selectBackendKind({ qdrantUrl: dim > 0 ? qdrantUrl() : null, hasLancedb: records.length > 0 && hasLancedb() });
+  const descriptor: Descriptor = {
+    version: 1, table, generation: randomUUID(), backend, count: records.length,
+    source_sha256: sourceDigest(records), model: dim > 0 ? model || null : null, dim,
+    analysis_fingerprint: analysisFingerprint, distance: dim > 0 ? 'Cosine' : null,
+    // EmbeddingService truncates each input at 24,000 characters before either transport.
+    embedding_input: dim > 0 ? 'text-24000-v1' : null,
+  };
+  let previous: Descriptor | null;
+  try {
+    previous = readDescriptor(db, table);
+  } catch {
+    // An explicit build can replace a broken descriptor without trusting it for cleanup.
+    previous = null;
+  }
+  const target = descriptorPath(db, table);
+  const tmp = target + '.' + descriptor.generation + '.tmp';
+  mkdirSync(db, { recursive: true });
+  try {
+    if (backend === 'qdrant') {
+      await new QdrantBackend(collection(descriptor), descriptor).build(records);
+    } else {
+      const storage = localTable(descriptor);
+      const store = backend === 'file' ? new FileBackend(db, storage) : new LanceBackend(db, storage);
+      await store.build(records);
+      await store.inspect(descriptor);
+    }
+    writeFileSync(tmp, JSON.stringify(descriptor) + '\n', { flag: 'wx', flush: true });
+    renameSync(tmp, target);
+  } catch (error) {
+    discardLocalGeneration(db, descriptor);
+    throw error;
+  } finally {
+    try { unlinkSync(tmp); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  if (previous) discardLocalGeneration(db, previous);
+}
+
+function inspectRow(
+  row: Record<string, unknown> | undefined, expected: { dim: number; count?: number } | null,
+  kind: 'file' | 'lance',
+): number {
+  if ((!row && expected?.count !== undefined && expected.count !== 0) ||
+      (row && (typeof row.id !== 'string' || typeof row.text !== 'string' || expected?.count === 0))) {
+    throw new IndexUnavailable('index-invalid', 'The local search table does not match its descriptor.', kind);
+  }
+  const dim = row ? (row.vector as ArrayLike<number> | undefined)?.length ?? 0 : expected?.dim ?? 0;
+  if (expected && expected.dim !== dim) {
+    throw new IndexUnavailable('index-invalid', 'The local search table vector schema does not match its metadata.', kind);
+  }
+  return dim;
+}
+
+function checkRows(rows: Record<string, unknown>[], expected: Descriptor | undefined, kind: 'file' | 'lance'): void {
+  if (!expected) return;
+  if (rows.length !== expected.count) {
+    throw new IndexUnavailable('index-invalid', 'The local search table is incomplete.', kind);
+  }
+  for (const row of rows) inspectRow(row, expected, kind);
 }
 
 // ── LanceDB (standalone, поведение прежнее) ───────────────────────────────────────────────────────
@@ -92,7 +380,7 @@ export function openVectorBackend(dbPath: string, tableName: string): VectorBack
 // там, где lancedb установлен (dev/integration без Qdrant); если пакета нет — fail-loud с понятной причиной,
 // а НЕ тихий BM25-fallback (принцип «без fallback'ов»). Импорт ленивый: на --no-embed-пути не вызывается.
 class LanceBackend implements VectorBackend {
-  constructor(private dbPath: string, private tableName: string) {}
+  constructor(private dbPath: string, private tableName: string, private expected?: Descriptor) {}
 
   /** Ленивая загрузка опционального lancedb. Нет пакета → громкая ошибка с указанием задать QDRANT_URL. */
   private async lance(): Promise<typeof import('@lancedb/lancedb')> {
@@ -127,6 +415,7 @@ class LanceBackend implements VectorBackend {
     const table = await db.openTable(this.tableName);
     const rows = await table.query().toArray();
     for (const r of rows) if (r.vector) r.vector = Array.from(r.vector as ArrayLike<number>);
+    checkRows(rows, this.expected, 'lance');
     return rows;
   }
 
@@ -135,6 +424,19 @@ class LanceBackend implements VectorBackend {
     const db = await connect(this.dbPath);
     const table = await db.openTable(this.tableName);
     return table.query().nearestTo(queryVector).limit(limit).toArray();
+  }
+
+  async inspect(expected: { dim: number; count?: number } | null, signal?: AbortSignal): Promise<number> {
+    signal?.throwIfAborted();
+    const { connect } = await this.lance();
+    const db = await connect(this.dbPath);
+    const table = await db.openTable(this.tableName);
+    if (expected?.count !== undefined && await table.countRows() !== expected.count) {
+      throw new IndexUnavailable('index-invalid', 'The local LanceDB table has an unexpected record count.', 'lance');
+    }
+    const [row] = await table.query().limit(1).toArray();
+    signal?.throwIfAborted();
+    return inspectRow(row, expected, 'lance');
   }
 
   // table-specific: LanceDB createTable создаёт <dbPath>/<table>.lance (для specs совпадает с прежним check)
@@ -150,7 +452,7 @@ class LanceBackend implements VectorBackend {
 // Экспортируется для прямого юнит-теста (в dev-окружении форка @lancedb установлен → авто-выбор даёт Lance).
 export class FileBackend implements VectorBackend {
   private file: string;
-  constructor(private dbPath: string, private tableName: string) {
+  constructor(private dbPath: string, tableName: string, private expected?: Descriptor, private required = false) {
     this.file = join(dbPath, `${tableName}.records.json`);
   }
 
@@ -169,38 +471,47 @@ export class FileBackend implements VectorBackend {
   async build(records: VectorRecord[]): Promise<void> {
     mkdirSync(this.dbPath, { recursive: true });   // папка vector-index/ → VectorIndex.exists() (проверка папки) истинно
     // tmp + rename: читатель никогда не видит наполовину переписанный корпус.
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    const out = createWriteStream(tmp, { encoding: 'utf8' });
-    for (const r of records) {
-      if (!out.write(`${JSON.stringify(r)}\n`)) await once(out, 'drain');
+    const tmp = this.file + '.' + randomUUID() + '.tmp';
+    const out = createWriteStream(tmp, { encoding: 'utf8', flags: 'wx', flush: true });
+    try {
+      for (const r of records) {
+        if (!out.write(JSON.stringify(r) + '\n')) await once(out, 'drain');
+      }
+      out.end();
+      await once(out, 'close');
+      renameSync(tmp, this.file);
+    } finally {
+      out.destroy();
+      try { unlinkSync(tmp); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
     }
-    out.end();
-    await once(out, 'finish');
-    renameSync(tmp, this.file);
   }
 
   async loadAll(): Promise<Record<string, unknown>[]> {
-    if (!existsSync(this.file)) return [];
+    const file = assertPathAllowed(this.file, 'read');
+    if (!this.required && !existsSync(file)) return [];
     const rows: Record<string, unknown>[] = [];
     // Формат распознаём по первому байту. '[' — корпус, записанный ДО перехода на
     // NDJSON; такой файл по построению помещался в одну строку (иначе его не
     // удалось бы записать), поэтому читать его целиком безопасно. Иначе — NDJSON
     // построчно: целиком его читать нельзя, readFile('utf8') на корпусе больше
     // предела строки бросил бы ERR_STRING_TOO_LONG и обнулил бы смысл правки.
-    const fd = openSync(this.file, 'r');
+    const fd = openSync(file, 'r');
     const head = Buffer.alloc(1);
     const got = readSync(fd, head, 0, 1, 0);
     closeSync(fd);
 
     if (got === 1 && head.toString('utf8') === '[') {
-      rows.push(...(JSON.parse(readFileSync(this.file, 'utf8')) as Record<string, unknown>[]));
+      rows.push(...(JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>[]));
     } else if (got === 1) {
-      const rl = createInterface({ input: createReadStream(this.file, 'utf8'), crlfDelay: Infinity });
+      const rl = createInterface({ input: createReadStream(file, 'utf8'), crlfDelay: Infinity });
       for await (const line of rl) {
         if (line.length > 0) rows.push(JSON.parse(line) as Record<string, unknown>);
       }
     }
     for (const r of rows) if (r.vector) r.vector = Array.from(r.vector as ArrayLike<number>);
+    checkRows(rows, this.expected, 'file');
     return rows;
   }
 
@@ -221,73 +532,206 @@ export class FileBackend implements VectorBackend {
     return scored.slice(0, limit).map(({ r, _distance }) => ({ ...r, _distance }));
   }
 
+  async inspect(expected: { dim: number; count?: number } | null, signal?: AbortSignal): Promise<number> {
+    const file = assertPathAllowed(this.file, 'read');
+    const stream = createReadStream(file, { encoding: 'utf8', highWaterMark: 16 * 1024, signal });
+    // Bound this probe to one object in either NDJSON or the original JSON array.
+    let row = '';
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    let examined = 0;
+    for await (const chunk of stream) {
+      for (const char of chunk as string) {
+        if (++examined > 2 * 1024 * 1024) {
+          throw new IndexUnavailable('index-invalid', 'The first local search index record exceeds its size limit.', 'file');
+        }
+        if (!row) {
+          if (/\s/.test(char) || char === '[') continue;
+          if (char === ']') return inspectRow(undefined, expected, 'file');
+          if (char !== '{') throw new IndexUnavailable('index-invalid', 'Invalid local search index record.', 'file');
+        }
+        row += char;
+        if (quoted) {
+          if (escaped) escaped = false;
+          else if (char === '\\') escaped = true;
+          else if (char === '"') quoted = false;
+        } else if (char === '"') {
+          quoted = true;
+        } else if (char === '{') {
+          depth++;
+        } else if (char === '}' && --depth === 0) {
+          return inspectRow(JSON.parse(row), expected, 'file');
+        }
+      }
+    }
+    if (row) throw new IndexUnavailable('index-invalid', 'Truncated local search index record.', 'file');
+    return inspectRow(undefined, expected, 'file');
+  }
+
   exists(): boolean { return existsSync(this.file); }
 }
 
 // ── Qdrant (distributed) ──────────────────────────────────────────────────────────────────────────
+const PROOF_FIELD = '_openlore_generation_sha256';
+const RECORD_FIELD = '_openlore_record_sha256';
+
 class QdrantBackend implements VectorBackend {
-  private coll: string;
-  private marker: string;
-  constructor(private url: string, private dbPath: string, private tableName: string) {
-    const h = createHash('sha1').update(dbPath).digest('hex').slice(0, 12);
-    this.coll = `openlore_${tableName}_${h}`;
-    this.marker = join(dbPath, `.qdrant-${tableName}`);   // table-specific маркер для синхронного exists()
+  readonly proof: string | null;
+  private readonly url: string;
+  private readonly base: string;
+
+  constructor(name: string, private readonly descriptor: Descriptor | null, private readonly signal?: AbortSignal) {
+    const url = qdrantUrl();
+    if (!url) throw new IndexUnavailable('backend-unreachable', 'The saved Qdrant index requires its Qdrant connection.', 'qdrant');
+    this.url = url;
+    this.base = '/collections/' + name;
+    this.proof = descriptor
+      ? createHash('sha256').update(JSON.stringify([
+          descriptor.version, descriptor.table, descriptor.generation, descriptor.source_sha256,
+          descriptor.analysis_fingerprint, descriptor.model, descriptor.dim, descriptor.distance,
+          descriptor.embedding_input, descriptor.count,
+        ])).digest('hex')
+      : null;
   }
 
-  private hdr(): Record<string, string> {
-    const h: Record<string, string> = { 'content-type': 'application/json' };
-    if (process.env.QDRANT_API_KEY) h['api-key'] = process.env.QDRANT_API_KEY;
-    return h;
+  private async req(method: string, suffix = '', body?: unknown, signal = this.signal, bounded = false): Promise<any> {
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (process.env.QDRANT_API_KEY) headers['api-key'] = process.env.QDRANT_API_KEY;
+    let response: Response;
+    try {
+      response = await fetch(this.url + this.base + suffix, {
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+        redirect: 'error', signal: signal ?? AbortSignal.timeout(10_000),
+      });
+    } catch {
+      throw new IndexUnavailable('backend-unreachable', 'The Qdrant search backend did not answer the request.', 'qdrant');
+    }
+    if (response.status === 404) {
+      void response.body?.cancel().catch(() => {});
+      throw new IndexUnavailable('collection-missing', 'The saved Qdrant collection is missing.', 'qdrant');
+    }
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
+      throw new IndexUnavailable('backend-unreachable', 'Qdrant rejected the search index request (HTTP ' + response.status + ').', 'qdrant');
+    }
+    const json: any = await (bounded ? this.probeBody(response) : response.json()).catch(error => {
+      if (error instanceof IndexUnavailable) throw error;
+      return null;
+    });
+    if (json?.status !== 'ok' || json.result == null) {
+      throw new IndexUnavailable('index-invalid', 'Qdrant returned an invalid search index response.', 'qdrant');
+    }
+    return json.result;
   }
-  private async req(method: string, path: string, body?: unknown): Promise<{ status: number; json: any }> {
-    const r = await fetch(`${this.url}${path}`, { method, headers: this.hdr(), body: body ? JSON.stringify(body) : undefined });
-    return { status: r.status, json: await r.json().catch(() => null) };
+
+  private async probeBody(response: Response): Promise<unknown> {
+    const reader = response.body?.getReader();
+    if (!reader) return null;
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > 64 * 1024) {
+          void reader.cancel().catch(() => {});
+          throw new IndexUnavailable('index-invalid', 'Qdrant index verification response exceeds its size limit.', 'qdrant');
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return JSON.parse(Buffer.concat(chunks, bytes).toString('utf8'));
   }
-  /** Qdrant требует uint64/UUID id точки — детерминированный UUID из строкового id (оригинал — в payload). */
-  private static pid(s: string): string {
-    const h = createHash('sha1').update(s).digest('hex');
-    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+
+  async verify(signal = this.signal ?? AbortSignal.timeout(3000)): Promise<number> {
+    const expected = this.descriptor;
+    const [info, count, sample] = await Promise.all([
+      this.req('GET', '', undefined, signal, true),
+      expected ? this.req('POST', '/points/count', { exact: true }, signal, true) : null,
+      expected ? this.req('POST', '/points/scroll', { limit: 1, with_payload: [PROOF_FIELD], with_vector: false }, signal, true) : null,
+    ]);
+    const vectors = info?.config?.params?.vectors;
+    const dim = vectors?.size;
+    if (!Number.isSafeInteger(dim) || dim <= 0 || vectors.distance !== 'Cosine' ||
+        (expected && (dim !== expected.dim || count?.count !== expected.count ||
+          sample?.points?.length !== 1 || sample.points[0]?.payload?.[PROOF_FIELD] !== this.proof))) {
+      throw new IndexUnavailable('collection-binding-mismatch', 'The Qdrant collection does not match the saved source generation or vector schema.', 'qdrant');
+    }
+    return dim;
+  }
+
+  private static pid(id: string): string {
+    const h = createHash('sha1').update(id).digest('hex');
+    return [h.slice(0, 8), h.slice(8, 12), h.slice(12, 16), h.slice(16, 20), h.slice(20, 32)].join('-');
   }
 
   async build(records: VectorRecord[]): Promise<void> {
-    const dim = records[0]?.vector?.length;
-    if (!dim) throw new Error('VectorStore(Qdrant): пустой/безразмерный вектор — нечего индексировать');
-    await this.req('DELETE', `/collections/${this.coll}`);   // overwrite: снести старую (404 ок)
-    const c = await this.req('PUT', `/collections/${this.coll}`, { vectors: { size: dim, distance: 'Cosine' } });
-    if (c.status < 200 || c.status >= 300) throw new Error(`VectorStore(Qdrant): создание коллекции ${this.coll} → HTTP ${c.status}`);
+    const descriptor = this.descriptor;
+    if (!descriptor) throw new Error('A Qdrant build requires a new publication generation.');
+    const created = await this.req('PUT', '', { vectors: { size: descriptor.dim, distance: descriptor.distance } });
+    if (created !== true) throw new IndexUnavailable('index-invalid', 'Qdrant did not create a new search generation.', 'qdrant');
     for (let i = 0; i < records.length; i += 256) {
-      const batch = records.slice(i, i + 256).map((r) => {
-        const { vector, ...payload } = r;   // payload = всё кроме вектора (включая оригинальный id/text)
-        return { id: QdrantBackend.pid(r.id), vector, payload };
-      });
-      const up = await this.req('PUT', `/collections/${this.coll}/points?wait=true`, { points: batch });
-      if (up.status < 200 || up.status >= 300) throw new Error(`VectorStore(Qdrant): upsert → HTTP ${up.status}: ${JSON.stringify(up.json).slice(0, 200)}`);
+      const points = records.slice(i, i + 256).map(({ vector, ...payload }) => ({
+        id: QdrantBackend.pid(payload.id), vector, payload: { ...payload, [PROOF_FIELD]: this.proof, [RECORD_FIELD]: sourceDigest([payload]) },
+      }));
+      const result = await this.req('PUT', '/points?wait=true', { points });
+      if (result.status !== 'completed') throw new IndexUnavailable('index-invalid', 'Qdrant did not confirm the new index batch.', 'qdrant');
     }
-    // локальный table-specific маркер — чтобы синхронный exists() работал для обоих бэкендов (данные в Qdrant)
-    try { mkdirSync(this.dbPath, { recursive: true }); writeFileSync(this.marker, this.coll + '\n'); } catch { /* маркер best-effort */ }
+    await this.verify();
+  }
+
+  private row(point: any): Record<string, unknown> {
+    const payload = point?.payload;
+    if (!payload || typeof payload.id !== 'string' || typeof payload.text !== 'string' ||
+        (this.proof && payload[PROOF_FIELD] !== this.proof)) {
+      throw new IndexUnavailable('collection-binding-mismatch', 'Qdrant returned a record from an unexpected search generation.', 'qdrant');
+    }
+    const { [PROOF_FIELD]: _proof, [RECORD_FIELD]: digest, ...row } = payload;
+    if (this.proof && digest !== sourceDigest([row])) {
+      throw new IndexUnavailable('collection-binding-mismatch', 'Qdrant returned a search record with mismatched content.', 'qdrant');
+    }
+    return row;
   }
 
   async loadAll(): Promise<Record<string, unknown>[]> {
     const out: Record<string, unknown>[] = [];
-    let offset: unknown = undefined;
+    const offsets = new Set<unknown>();
+    let offset: unknown;
     for (;;) {
-      const r = await this.req('POST', `/collections/${this.coll}/points/scroll`, { limit: 512, with_payload: true, with_vector: true, ...(offset != null ? { offset } : {}) });
-      if (r.status < 200 || r.status >= 300) throw new Error(`VectorStore(Qdrant): scroll → HTTP ${r.status}`);
-      const pts = r.json?.result?.points ?? [];
-      for (const p of pts) out.push({ ...(p.payload || {}), vector: p.vector });
-      offset = r.json?.result?.next_page_offset;
-      if (offset == null || pts.length === 0) break;
+      const page = await this.req('POST', '/points/scroll', {
+        limit: 512, with_payload: true, with_vector: true, ...(offset != null ? { offset } : {}),
+      });
+      if (!Array.isArray(page.points)) throw new IndexUnavailable('index-invalid', 'Qdrant returned an invalid search page.', 'qdrant');
+      for (const point of page.points) {
+        if (!Array.isArray(point?.vector) || (this.descriptor && point.vector.length !== this.descriptor.dim)) {
+          throw new IndexUnavailable('collection-binding-mismatch', 'Qdrant returned a record with an unexpected vector schema.', 'qdrant');
+        }
+        out.push({ ...this.row(point), vector: point.vector });
+      }
+      offset = page.next_page_offset;
+      if (offset == null) break;
+      if (offsets.has(offset) || page.points.length === 0 || (typeof offset !== 'number' && typeof offset !== 'string')) {
+        throw new IndexUnavailable('index-invalid', 'Qdrant returned an invalid search cursor.', 'qdrant');
+      }
+      offsets.add(offset);
+    }
+    if (this.descriptor && (out.length !== this.descriptor.count || sourceDigest(out) !== this.descriptor.source_sha256)) {
+      throw new IndexUnavailable('collection-binding-mismatch', 'Qdrant returned an incomplete or mismatched search generation.', 'qdrant');
     }
     return out;
   }
 
   async searchDense(queryVector: number[], limit: number): Promise<Record<string, unknown>[]> {
-    const r = await this.req('POST', `/collections/${this.coll}/points/search`, { vector: queryVector, limit, with_payload: true });
-    if (r.status < 200 || r.status >= 300) throw new Error(`VectorStore(Qdrant): search → HTTP ${r.status}`);
-    // Qdrant Cosine score: больше = ближе. VectorIndex dense-only трактует _distance как «меньше = ближе» →
-    // отдаём _distance = 1 - score (гибрид по умолчанию использует лишь ПОРЯДОК, он best-first и так).
-    return (r.json?.result ?? []).map((p: any) => ({ ...(p.payload || {}), _distance: 1 - (p.score ?? 0) }));
+    const results = await this.req('POST', '/points/search', { vector: queryVector, limit, with_payload: true });
+    if (!Array.isArray(results) || results.some(point => !Number.isFinite(point?.score))) {
+      throw new IndexUnavailable('index-invalid', 'Qdrant returned invalid search results.', 'qdrant');
+    }
+    return results.map(point => ({ ...this.row(point), _distance: 1 - point.score }));
   }
 
-  exists(): boolean { return existsSync(this.marker); }
+  exists(): boolean { return true; }
 }

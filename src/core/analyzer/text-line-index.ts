@@ -24,7 +24,6 @@
  * Table name: "text_lines"
  */
 
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   buildBm25Corpus,
@@ -32,7 +31,7 @@ import {
   bm25Score,
   type Bm25Corpus,
 } from './vector-index.js';
-import { openVectorBackend, type VectorRecord } from './vector-store.js';
+import { hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex, type VectorRecord } from './vector-store.js';
 
 // ============================================================================
 // TYPES
@@ -73,11 +72,10 @@ const TABLE_NAME = 'text_lines';
 /** Lines longer than this are truncated (not dropped) to keep rows bounded. */
 const MAX_LINE_LEN = 1000;
 
-// Module-level BM25 corpus cache, keyed by dbPath. Invalidated by build();
-// patched in place by updateFiles().
+// At most one current generation per database path.
 const _bm25Cache = new Map<
   string,
-  { corpus: Bm25Corpus; rows: TextLineRecord[] }
+  { key: string; corpus: Bm25Corpus; rows: TextLineRecord[] }
 >();
 
 /** Test-only: clear the in-memory BM25 cache to force the cold path. */
@@ -117,7 +115,7 @@ function recordsToCorpusInput(rows: TextLineRecord[]): Array<{ id: string; text:
 export class TextLineIndex {
   /** Returns true if a text-line index has been built for this output dir. */
   static exists(outputDir: string): boolean {
-    return existsSync(join(outputDir, DB_FOLDER));
+    return hasStoredVectorIndex(join(outputDir, DB_FOLDER), TABLE_NAME);
   }
 
   /**
@@ -125,7 +123,9 @@ export class TextLineIndex {
    * existing table. Files that yield no indexable lines contribute nothing.
    * Returns the number of lines indexed.
    */
-  static async build(outputDir: string, files: TextFileInput[]): Promise<{ lines: number; files: number }> {
+  static async build(
+    outputDir: string, files: TextFileInput[], analysisFingerprint: string | null = null,
+  ): Promise<{ lines: number; files: number }> {
     const records: TextLineRecord[] = [];
     let indexedFiles = 0;
     for (const f of files) {
@@ -135,12 +135,7 @@ export class TextLineIndex {
     }
 
     const dbPath = join(outputDir, DB_FOLDER);
-    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant), text-line всегда BM25-only
-    // (вектора нет). Пустой набор = overwrite пустым корпусом: FileBackend пишет []
-    // (+ создаёт папку), LanceBackend сносит устаревшую таблицу. В обоих случаях папка
-    // <dbPath> остаётся → exists() (по папке) истинно, search вернёт пусто.
-    const backend = openVectorBackend(dbPath, TABLE_NAME);
-    await backend.build(records as unknown as VectorRecord[]);
+    await publishVectorIndex(dbPath, TABLE_NAME, records as unknown as VectorRecord[], null, analysisFingerprint);
     _bm25Cache.delete(dbPath);
     return records.length === 0
       ? { lines: 0, files: 0 }
@@ -150,17 +145,18 @@ export class TextLineIndex {
   /**
    * Incrementally update the index for changed and deleted files. Changed files
    * have their old lines replaced; deleted files have their lines removed. The
-   * cached BM25 corpus is patched in place. No-op if the index does not exist.
+   * cache is invalidated on publication. No-op if the index does not exist.
    */
   static async updateFiles(
     outputDir: string,
     changed: TextFileInput[],
     deletedPaths: string[] = [],
+    analysisFingerprint: string | null = null,
   ): Promise<{ lines: number }> {
     if (!TextLineIndex.exists(outputDir)) return { lines: 0 };
 
     const dbPath = join(outputDir, DB_FOLDER);
-    const backend = openVectorBackend(dbPath, TABLE_NAME);
+    const { backend } = await openStoredVectorIndex(dbPath, TABLE_NAME);
 
     const affectedPaths = new Set<string>([
       ...changed.map((c) => c.filePath),
@@ -172,20 +168,10 @@ export class TextLineIndex {
       for (const l of extractLines(f.filePath, f.content)) newRecords.push(l);
     }
 
-    // load → splice → overwrite через бэкенд (нет row-level delete/add; PDLC watch
-    // не гоняет). loadAll может бросить, если папка есть, а таблицы нет (пустой build) —
-    // тогда корпус пуст, перезаписываем только изменёнными строками (как прежний
-    // build-from-scratch при openTable-промахе).
-    let existing: TextLineRecord[];
-    try {
-      existing = (await backend.loadAll()) as unknown as TextLineRecord[];
-    } catch {
-      existing = [];
-    }
+    const existing = (await backend.loadAll()) as unknown as TextLineRecord[];
     const survivors = existing.filter((r) => !affectedPaths.has(r.filePath));
-    await backend.build([...survivors, ...newRecords] as unknown as VectorRecord[]);
-
-    TextLineIndex._patchCache(dbPath, affectedPaths, newRecords);
+    await publishVectorIndex(dbPath, TABLE_NAME, [...survivors, ...newRecords] as unknown as VectorRecord[], null, analysisFingerprint);
+    _bm25Cache.delete(dbPath);
     return { lines: newRecords.length };
   }
 
@@ -199,25 +185,19 @@ export class TextLineIndex {
     opts: { limit?: number; filePath?: string } = {},
   ): Promise<TextSearchResult[]> {
     const { limit = 10, filePath } = opts;
-    if (!TextLineIndex.exists(outputDir)) return [];
 
     const dbPath = join(outputDir, DB_FOLDER);
+    const { backend, cacheKey } = await openStoredVectorIndex(dbPath, TABLE_NAME);
     let cached = _bm25Cache.get(dbPath);
-    if (!cached) {
-      const backend = openVectorBackend(dbPath, TABLE_NAME);
-      let rows: Record<string, unknown>[];
-      try {
-        rows = await backend.loadAll();
-      } catch {
-        return [];
-      }
+    if (cached?.key !== cacheKey) {
+      const rows = await backend.loadAll();
       const records: TextLineRecord[] = rows.map((r) => ({
         id: r.id as string,
         filePath: r.filePath as string,
         lineNumber: r.lineNumber as number,
         text: r.text as string,
       }));
-      cached = { corpus: buildBm25Corpus(recordsToCorpusInput(records)), rows: records };
+      cached = { key: cacheKey, corpus: buildBm25Corpus(recordsToCorpusInput(records)), rows: records };
       _bm25Cache.set(dbPath, cached);
     }
 
@@ -250,23 +230,4 @@ export class TextLineIndex {
       }));
   }
 
-  /**
-   * Patch the cached BM25 corpus: drop rows for `affectedPaths`, splice in
-   * `newRecords`, rebuild the corpus. No-op when nothing is cached (the next
-   * search rebuilds from the table).
-   */
-  private static _patchCache(
-    dbPath: string,
-    affectedPaths: Set<string>,
-    newRecords: TextLineRecord[],
-  ): void {
-    const entry = _bm25Cache.get(dbPath);
-    if (!entry) return;
-    const kept = entry.rows.filter((r) => !affectedPaths.has(r.filePath));
-    for (const r of newRecords) kept.push(r);
-    _bm25Cache.set(dbPath, {
-      corpus: buildBm25Corpus(recordsToCorpusInput(kept)),
-      rows: kept,
-    });
-  }
 }

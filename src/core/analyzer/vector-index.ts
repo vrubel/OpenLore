@@ -16,14 +16,14 @@
  *   const results = await VectorIndex.search(outputDir, "authenticate user with JWT", embedSvc);
  */
 
-import { existsSync, readFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { FunctionNode } from './call-graph.js';
 import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { getSkeletonContent, isSkeletonWorthIncluding } from './code-shaper.js';
-import { openVectorBackend, type VectorBackend, type VectorRecord } from './vector-store.js';
+import { hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex, type VectorBackend, type VectorRecord } from './vector-store.js';
+import { searchVector, type SearchStatus } from './index-capabilities.js';
 
 // ============================================================================
 // TYPES
@@ -80,34 +80,8 @@ export interface VectorIndexMeta {
   schemaVersion: number;
 }
 
-// Module-level meta cache, keyed by dbPath. Invalidated by build().
-const _metaCache = new Map<string, VectorIndexMeta | null>();
-
-function metaFilePath(outputDir: string): string {
-  return join(outputDir, META_FILE);
-}
-
-/**
- * Read the index metadata sidecar (cached per dbPath).
- * Returns null when no sidecar exists — e.g. a legacy index built before the
- * sidecar was introduced. Callers treat a missing sidecar as "embeddings
- * present" to preserve pre-change behaviour for those indexes.
- */
-function readMeta(outputDir: string): VectorIndexMeta | null {
-  const dbPath = join(outputDir, DB_FOLDER);
-  if (_metaCache.has(dbPath)) return _metaCache.get(dbPath) ?? null;
-  let meta: VectorIndexMeta | null = null;
-  try {
-    meta = JSON.parse(readFileSync(metaFilePath(outputDir), 'utf-8')) as VectorIndexMeta;
-  } catch {
-    meta = null;
-  }
-  _metaCache.set(dbPath, meta);
-  return meta;
-}
-
 async function writeMeta(outputDir: string, meta: VectorIndexMeta): Promise<void> {
-  await writeFile(metaFilePath(outputDir), JSON.stringify(meta, null, 2) + '\n', 'utf-8');
+  await writeFile(join(outputDir, META_FILE), JSON.stringify(meta, null, 2) + '\n', 'utf-8');
 }
 
 /** Convert a raw LanceDB row to a FunctionRecord (without the vector field). */
@@ -190,28 +164,12 @@ function rrfScore(rankDense: number, rankSparse: number, k = 60): number {
 }
 
 // Module-level BM25 corpus cache: avoids a full backend scan on every search call.
-// Keyed by dbPath; invalidated by build() when the index is rebuilt.
-const _bm25Cache = new Map<string, { corpus: Bm25Corpus; rowCount: number; rows: Record<string, unknown>[] }>();
+// At most one current generation per database path.
+const _bm25Cache = new Map<string, { key: string; corpus: Bm25Corpus; rows: Record<string, unknown>[] }>();
 
-/** Test-only: clear the in-memory BM25 + meta caches to force the cold path. */
+/** Test-only: clear the in-memory BM25 cache to force the cold path. */
 export function _resetVectorIndexCachesForTesting(): void {
   _bm25Cache.clear();
-  _metaCache.clear();
-}
-
-/**
- * Surgically patch the cached BM25 corpus for `dbPath` (Spec 13.1): drop the
- * rows belonging to `changedFilePaths` and splice in `newRows`, then rebuild the
- * in-memory corpus. No disk read — if nothing is cached yet this is a no-op and
- * the next search builds the corpus fresh from the table.
- */
-function patchBm25Cache(dbPath: string, changedFilePaths: Set<string>, newRows: Record<string, unknown>[]): void {
-  const entry = _bm25Cache.get(dbPath);
-  if (!entry) return;
-  const kept = entry.rows.filter((r) => !changedFilePaths.has(r.filePath as string));
-  for (const r of newRows) kept.push(r);
-  const corpus = buildBm25Corpus(kept.map((r) => ({ id: r.id as string, text: r.text as string })));
-  _bm25Cache.set(dbPath, { corpus, rowCount: kept.length, rows: kept });
 }
 
 // ============================================================================
@@ -316,7 +274,8 @@ export class VectorIndex {
     /** Optional map of filePath → source content for skeleton-based body indexing */
     fileContents?: Map<string, string>,
     /** When true, reuse cached vectors for unchanged functions */
-    incremental = false
+    incremental = false,
+    analysisFingerprint: string | null = null,
   ): Promise<{ embedded: number; reused: number; total: number; hasEmbeddings: boolean }> {
     if (nodes.length === 0) {
       throw new Error('No functions to index');
@@ -379,55 +338,31 @@ export class VectorIndex {
     }
 
     const dbPath = join(outputDir, DB_FOLDER);
-    // Хранилище за единым интерфейсом: File (lancedb-free standalone) / LanceDB / Qdrant —
-    // выбор по окружению (нет QDRANT_URL и нет @lancedb → FileBackend, BM25 без нативки).
-    const backend = openVectorBackend(dbPath, TABLE_NAME);
-
-    // ── BM25-only build (no embedding service) ───────────────────────────────
-    // Write the corpus without a `vector` column so the table can never be
-    // searched with ANN, and record `hasEmbeddings: false` in the sidecar.
     if (!embedSvc) {
-      await backend.build(candidates as unknown as VectorRecord[]);
+      await publishVectorIndex(dbPath, TABLE_NAME, candidates as unknown as VectorRecord[], null, analysisFingerprint);
       await writeMeta(outputDir, {
-        hasEmbeddings: false,
-        dim: 0,
-        model: null,
-        builtAt: new Date().toISOString(),
-        schemaVersion: META_SCHEMA_VERSION,
+        hasEmbeddings: false, dim: 0, model: null,
+        builtAt: new Date().toISOString(), schemaVersion: META_SCHEMA_VERSION,
       });
       _bm25Cache.delete(dbPath);
-      _metaCache.delete(dbPath);
       return { embedded: 0, reused: 0, total: candidates.length, hasEmbeddings: false };
     }
 
-    // ── Incremental cache lookup ─────────────────────────────────────────────
-    let cachedVectors = new Map<string, number[]>(); // id → vector
-
-    // Only reuse vectors from an existing index that actually has them. A
-    // previously BM25-only index (hasEmbeddings:false) has no `vector` column,
-    // so rebuild it fully as a hybrid index (upgrade path).
-    const existingMeta = incremental ? readMeta(outputDir) : null;
-    const canReuseVectors =
-      incremental &&
-      VectorIndex.exists(outputDir) &&
-      (existingMeta === null || existingMeta.hasEmbeddings);
-
-    if (canReuseVectors) {
+    const cachedVectors = new Map<string, number[]>();
+    if (incremental && embedSvc.modelName && VectorIndex.exists(outputDir)) {
       try {
-        // Full scan via the backend to load existing vectors (LanceDB: table scan,
-        // File: read records.json, Qdrant: scroll). loadAll already normalises the
-        // vector to a plain number[].
-        const existing = await backend.loadAll();
-        for (const row of existing) {
-          const id = row.id as string;
-          const text = row.text as string;
-          const vector = Array.from((row.vector ?? []) as ArrayLike<number>);
-          // Cache the vector keyed by "id::text" so a text change invalidates it
-          cachedVectors.set(`${id}::${text}`, vector);
+        const existing = await openStoredVectorIndex(dbPath, TABLE_NAME);
+        if (existing.identity.generation && existing.identity.model === embedSvc.modelName) {
+          for (const row of await existing.backend.loadAll()) {
+            const vector = Array.from((row.vector ?? []) as ArrayLike<number>);
+            if (vector.length === existing.identity.dim && vector.length > 0) {
+              cachedVectors.set(JSON.stringify([row.id, row.text]), vector);
+            }
+          }
         }
       } catch {
-        // Existing index unreadable — fall back to full build
-        cachedVectors = new Map();
+        // An explicit build can replace an unreadable previous index.
+        cachedVectors.clear();
       }
     }
 
@@ -438,7 +373,7 @@ export class VectorIndex {
 
     for (let i = 0; i < candidates.length; i++) {
       const r = candidates[i];
-      const cacheKey = `${r.id}::${r.text}`;
+      const cacheKey = JSON.stringify([r.id, r.text]);
       if (cachedVectors.has(cacheKey)) {
         cachedIdx.push(i);
       } else {
@@ -463,15 +398,24 @@ export class VectorIndex {
     for (let i = 0; i < cachedIdx.length; i++) {
       const idx = cachedIdx[i];
       const r = candidates[idx];
-      fullRecords[idx] = { ...r, vector: cachedVectors.get(`${r.id}::${r.text}`)! };
+      fullRecords[idx] = { ...r, vector: cachedVectors.get(JSON.stringify([r.id, r.text]))! };
     }
     for (let i = 0; i < toEmbedIdx.length; i++) {
       const idx = toEmbedIdx[i];
       fullRecords[idx] = { ...candidates[idx], vector: newVectors[i] };
     }
 
-    // ── Write store (overwrite) — File / LanceDB createTable / Qdrant recreate+upsert ──
-    await backend.build(fullRecords as unknown as VectorRecord[]);
+    let embedded = toEmbed.length;
+    // A provider may change dimensions under the same model name. Only reuse vectors
+    // that match the newly observed dimension. Re-embed once on an explicit build.
+    if (cachedIdx.length && newVectors.length && fullRecords.some(row => row.vector.length !== newVectors[0].length)) {
+      const vectors = await embedSvc.embed(candidates.map(row => row.text));
+      if (vectors.length !== candidates.length) throw new Error('Embedding count mismatch while rebuilding changed vector dimensions.');
+      for (let i = 0; i < fullRecords.length; i++) fullRecords[i] = { ...candidates[i], vector: vectors[i] };
+      cachedIdx.length = 0;
+      embedded = candidates.length;
+    }
+    await publishVectorIndex(dbPath, TABLE_NAME, fullRecords as unknown as VectorRecord[], embedSvc.modelName, analysisFingerprint);
 
     await writeMeta(outputDir, {
       hasEmbeddings: true,
@@ -483,10 +427,9 @@ export class VectorIndex {
 
     // Invalidate search caches — index was just rebuilt
     _bm25Cache.delete(dbPath);
-    _metaCache.delete(dbPath);
 
     return {
-      embedded: toEmbed.length,
+      embedded,
       reused: cachedIdx.length,
       total: fullRecords.length,
       hasEmbeddings: true,
@@ -520,13 +463,13 @@ export class VectorIndex {
     entryPointIds: Set<string>,
     embedSvc: EmbeddingService | null | undefined,
     fileContents?: Map<string, string>,
+    analysisFingerprint: string | null = null,
   ): Promise<{ embedded: number; reused: number; total: number; hasEmbeddings: boolean }> {
     if (!VectorIndex.exists(outputDir)) {
       return { embedded: 0, reused: 0, total: 0, hasEmbeddings: false };
     }
     const dbPath = join(outputDir, DB_FOLDER);
-    const existingMeta = readMeta(outputDir);
-    const indexHasEmbeddings = existingMeta === null ? true : existingMeta.hasEmbeddings;
+
 
     // ── Build candidate records for the changed files' functions ──────────────
     const sigIndex = buildSignatureIndex(signatures);
@@ -579,62 +522,42 @@ export class VectorIndex {
       }
     }
 
-    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant) — никакого прямого lancedb.
-    // FileBackend/LanceBackend не делают row-level delete/add, поэтому инкремент сводим
-    // к «load → splice → overwrite» через backend: грузим весь корпус, выкидываем строки
-    // изменённых/удалённых файлов (survivors), доклеиваем свежие записи и пишем весь набор
-    // назад (overwrite). loadAll нормализует vector к plain number[]. Результат идентичен
-    // прежнему delete+add; стоимость O(corpus) на изменение для watch приемлема (PDLC watch
-    // не использует — гоняется полный analyze).
-    const backend = openVectorBackend(dbPath, TABLE_NAME);
-    const existingRows = await backend.loadAll();
-    const survivors = existingRows.filter((r) => !changedFilePaths.has(r.filePath as string));
-
-    // ── BM25-only index ───────────────────────────────────────────────────────
-    if (!embedSvc || !indexHasEmbeddings) {
-      await backend.build([...survivors, ...candidates] as unknown as VectorRecord[]);
-      patchBm25Cache(dbPath, changedFilePaths, candidates as unknown as Record<string, unknown>[]);
-      return { embedded: 0, reused: 0, total: candidates.length, hasEmbeddings: false };
-    }
-
-    // ── Embedded index: reuse unchanged vectors for the changed files only ────
-    const cachedVectors = new Map<string, number[]>(); // "id::text" → vector
-    for (const row of existingRows) {
-      if (!changedFilePaths.has(row.filePath as string) || !row.vector) continue;
-      cachedVectors.set(`${row.id as string}::${row.text as string}`, Array.from(row.vector as ArrayLike<number>));
-    }
-
-    const toEmbed: typeof candidates = [];
-    const toEmbedIdx: number[] = [];
-    const cachedIdx: number[] = [];
-    for (let i = 0; i < candidates.length; i++) {
-      const key = `${candidates[i].id}::${candidates[i].text}`;
-      if (cachedVectors.has(key)) cachedIdx.push(i);
-      else { toEmbed.push(candidates[i]); toEmbedIdx.push(i); }
-    }
-
-    let newVectors: number[][] = [];
-    if (toEmbed.length > 0) {
-      newVectors = await embedSvc.embed(toEmbed.map((r) => r.text));
-      if (newVectors.length !== toEmbed.length) {
-        throw new Error(`Embedding count mismatch: expected ${toEmbed.length}, got ${newVectors.length}`);
+    const previous = await openStoredVectorIndex(dbPath, TABLE_NAME);
+    const existingRows = await previous.backend.loadAll() as VectorRecord[];
+    const survivors = existingRows.filter(row => !changedFilePaths.has(row.filePath as string));
+    const { model, dim, generation } = previous.identity;
+    const compatible = Boolean(generation && model && embedSvc?.modelName === model);
+    const vectorsByInput = new Map(existingRows.map(row => [JSON.stringify([row.id, row.text]), row.vector]));
+    let reused = 0;
+    let embedded = 0;
+    let records: VectorRecord[];
+    let savedModel: string | null = null;
+    if (dim > 0 && candidates.length === 0) {
+      // Pure deletion can retain the surviving vectors without a model call.
+      records = survivors;
+      savedModel = model;
+    } else if (dim > 0 && compatible && embedSvc) {
+      const pending = candidates.filter(row => vectorsByInput.get(JSON.stringify([row.id, row.text]))?.length !== dim);
+      const vectors = await embedSvc.embed(pending.map(row => row.text));
+      if (vectors.length !== pending.length || vectors.some(vector => vector.length !== dim)) {
+        throw new Error('The embedding backend returned vectors incompatible with the saved index. Run OpenLore analysis to rebuild it.');
       }
+      for (const [i, row] of pending.entries()) vectorsByInput.set(JSON.stringify([row.id, row.text]), vectors[i]);
+      const changed = candidates.map(row => ({ ...row, vector: vectorsByInput.get(JSON.stringify([row.id, row.text]))! }));
+      records = [...survivors, ...changed];
+      embedded = pending.length;
+      reused = candidates.length - embedded;
+      savedModel = model;
+    } else {
+      // Keep keyword navigation available without mixing vectors from different models.
+      records = [...survivors, ...candidates].map(row => {
+        const { vector: _vector, ...text } = row as VectorRecord;
+        return text as VectorRecord;
+      });
     }
-
-    const fullRecords: FunctionRecord[] = new Array(candidates.length);
-    for (const idx of cachedIdx) {
-      const r = candidates[idx];
-      fullRecords[idx] = { ...r, vector: cachedVectors.get(`${r.id}::${r.text}`)! };
-    }
-    for (let i = 0; i < toEmbedIdx.length; i++) {
-      fullRecords[toEmbedIdx[i]] = { ...candidates[toEmbedIdx[i]], vector: newVectors[i] };
-    }
-
-    await backend.build([...survivors, ...fullRecords] as unknown as VectorRecord[]);
-    // Patch the in-memory BM25 corpus cache for the changed files.
-    patchBm25Cache(dbPath, changedFilePaths, fullRecords as unknown as Record<string, unknown>[]);
-
-    return { embedded: toEmbed.length, reused: cachedIdx.length, total: fullRecords.length, hasEmbeddings: true };
+    await publishVectorIndex(dbPath, TABLE_NAME, records, savedModel, analysisFingerprint);
+    _bm25Cache.delete(dbPath);
+    return { embedded, reused, total: records.length, hasEmbeddings: Boolean(records[0]?.vector?.length) };
   }
 
   /**
@@ -657,38 +580,18 @@ export class VectorIndex {
       minFanIn?: number;
       /** Enable hybrid dense+sparse retrieval via RRF (default: true when embedSvc available) */
       hybrid?: boolean;
+      status?: SearchStatus;
     } = {}
   ): Promise<SearchResult[]> {
     const { limit = 10, language, minFanIn, hybrid = true } = opts;
 
-    if (!VectorIndex.exists(outputDir)) {
-      throw new Error('Vector index not found. Run "openlore analyze --embed" first.');
-    }
-
     const dbPath = join(outputDir, DB_FOLDER);
-    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant). FileBackend держит корпус
-    // в records.json — отдельного table-handle нет, бэкенд дёшев в открытии.
-    const backend = openVectorBackend(dbPath, TABLE_NAME);
-
-    // ── BM25-only path ─────────────────────────────────────────────────────────
-    // Force BM25 when no embedder is available OR when the index was built
-    // without embeddings (no `vector` column). The sidecar is the source of
-    // truth: a missing sidecar (legacy index) is treated as embeddings-present.
-    const meta = readMeta(outputDir);
-    const indexHasEmbeddings = meta === null ? true : meta.hasEmbeddings;
-    if (!embedSvc || !indexHasEmbeddings) {
-      return VectorIndex._bm25Only(backend, dbPath, query, limit, language, minFanIn);
+    const index = await openStoredVectorIndex(dbPath, TABLE_NAME);
+    const { backend, cacheKey } = index;
+    const queryVector = await searchVector(index, query, embedSvc, opts.status);
+    if (!queryVector) {
+      return VectorIndex._bm25Only(backend, dbPath, cacheKey, query, limit, language, minFanIn);
     }
-
-    // ── Dense recall ──────────────────────────────────────────────────────────
-    let queryVector: number[];
-    try {
-      [queryVector] = await embedSvc.embed([query]);
-    } catch {
-      // Embedding server unreachable — fall back to BM25
-      return VectorIndex._bm25Only(backend, dbPath, query, limit, language, minFanIn);
-    }
-    if (!queryVector) throw new Error('Failed to embed query');
 
     const denseFetch = hybrid ? Math.min(limit * 5, 500) : Math.min(limit * 10, 1000);
     const denseRows = await backend.searchDense(queryVector, denseFetch);
@@ -711,12 +614,12 @@ export class VectorIndex {
     let cachedEntry = _bm25Cache.get(dbPath);
     let allRows: Record<string, unknown>[];
 
-    if (!cachedEntry) {
+    if (cachedEntry?.key !== cacheKey) {
       allRows = await backend.loadAll();
       const corpus = buildBm25Corpus(
         allRows.map(r => ({ id: r.id as string, text: r.text as string }))
       );
-      cachedEntry = { corpus, rowCount: allRows.length, rows: allRows };
+      cachedEntry = { key: cacheKey, corpus, rows: allRows };
       _bm25Cache.set(dbPath, cachedEntry);
     } else {
       // Use cached rows — invalidated by build() when index is rebuilt
@@ -781,6 +684,7 @@ export class VectorIndex {
   private static async _bm25Only(
     backend: VectorBackend,
     dbPath: string,
+    cacheKey: string,
     query: string,
     limit: number,
     language?: string,
@@ -789,12 +693,12 @@ export class VectorIndex {
     let cachedEntry = _bm25Cache.get(dbPath);
     let allRows: Record<string, unknown>[];
 
-    if (!cachedEntry) {
+    if (cachedEntry?.key !== cacheKey) {
       allRows = await backend.loadAll();
       const corpus = buildBm25Corpus(
         allRows.map(r => ({ id: r.id as string, text: r.text as string }))
       );
-      cachedEntry = { corpus, rowCount: allRows.length, rows: allRows };
+      cachedEntry = { key: cacheKey, corpus, rows: allRows };
       _bm25Cache.set(dbPath, cachedEntry);
     } else {
       // Use cached rows — invalidated by build() when index is rebuilt
@@ -830,6 +734,6 @@ export class VectorIndex {
    * Returns true if a vector index has been built for this output directory.
    */
   static exists(outputDir: string): boolean {
-    return existsSync(join(outputDir, DB_FOLDER));
+    return hasStoredVectorIndex(join(outputDir, DB_FOLDER), TABLE_NAME);
   }
 }

@@ -33,7 +33,7 @@ import { extractSignatures, detectLanguage } from '../analyzer/signature-extract
 import type { FunctionNode } from '../analyzer/call-graph.js';
 import { isTestFile } from '../analyzer/test-file.js';
 import { EdgeStore } from './edge-store.js';
-import { primeContextCache, type CachedContext } from './mcp-handlers/utils.js';
+import { computeProjectFingerprint, primeContextCache, type CachedContext } from './mcp-handlers/utils.js';
 import {
   OPENLORE_DIR,
   OPENLORE_ANALYSIS_SUBDIR,
@@ -845,6 +845,7 @@ export class McpWatcher {
         entryIds,
         embedSvc,
         fileContents,
+        await computeProjectFingerprint(this.rootPath),
       );
 
       if (this.debug) {
@@ -868,7 +869,7 @@ export class McpWatcher {
       const { TextLineIndex } = await import('../analyzer/text-line-index.js');
       if (!TextLineIndex.exists(this.outputPath)) return;
       const changed = changedFiles.map((f) => ({ filePath: f.rel, content: f.content }));
-      await TextLineIndex.updateFiles(this.outputPath, changed);
+      await TextLineIndex.updateFiles(this.outputPath, changed, [], await computeProjectFingerprint(this.rootPath));
       if (this.debug) {
         process.stderr.write(`[mcp-watcher] text-line index: updated ${changed.length} file(s)\n`);
       }
@@ -1017,11 +1018,14 @@ export class McpWatcher {
       }
     }
 
+    let basis: Promise<string> | undefined;
+    const fingerprint = () => basis ??= computeProjectFingerprint(this.rootPath);
+
     // 3. Text-line index — drop the deleted files' lines.
     try {
       const { TextLineIndex } = await import('../analyzer/text-line-index.js');
       if (TextLineIndex.exists(this.outputPath)) {
-        await TextLineIndex.updateFiles(this.outputPath, [], rels);
+        await TextLineIndex.updateFiles(this.outputPath, [], rels, await fingerprint());
       }
     } catch (err) {
       process.stderr.write(`[mcp-watcher] delete (text) error: ${(err as Error).message}\n`);
@@ -1033,7 +1037,7 @@ export class McpWatcher {
       if (VectorIndex.exists(this.outputPath)) {
         await VectorIndex.updateFiles(
           this.outputPath, [], new Set(rels), context?.signatures ?? [],
-          new Set(), new Set(), undefined,
+          new Set(), new Set(), undefined, undefined, await fingerprint(),
         );
       }
     } catch (err) {

@@ -861,6 +861,8 @@ async function runEmbedStep(
   try {
     const { EmbeddingService } = await import('../../core/analyzer/embedding-service.js');
     const { VectorIndex } = await import('../../core/analyzer/vector-index.js');
+    const { publishedAnalysisFingerprint } = await import('../../core/analyzer/vector-store.js');
+    const analysisFingerprint = publishedAnalysisFingerprint(outputPath);
 
     // Resolve embedding service — best-effort. When --no-embed was passed
     // (keywordOnly) or none is configured we build a keyword-only (BM25) index
@@ -912,14 +914,14 @@ async function runEmbedStep(
       try {
         result = await VectorIndex.build(
           outputPath, cg.nodes, sigs, hubIds, entryIds, embedSvc, fileContents,
-          /* incremental */ !force
+          /* incremental */ !force, analysisFingerprint,
         );
       } catch (buildErr) {
         if (embedSvc) {
           console.log(`    ⚠ Embedding failed (${(buildErr as Error).message}) — building keyword (BM25) index instead.`);
           result = await VectorIndex.build(
             outputPath, cg.nodes, sigs, hubIds, entryIds, null, fileContents,
-            /* incremental */ false
+            /* incremental */ false, analysisFingerprint,
           );
         } else {
           throw buildErr;
@@ -938,10 +940,10 @@ async function runEmbedStep(
     // Build the literal-text line index (BM25-only, separate from the symbol
     // index) so literal strings in markup/text — UI copy, error messages — are
     // findable even when they extract no symbols. Non-fatal.
-    await runTextLineIndexing(rootPath, outputPath);
+    await runTextLineIndexing(rootPath, outputPath, analysisFingerprint);
 
     // Also index specs if they exist
-    await runSpecIndexing(rootPath, outputPath, openloreConfig, keywordOnly);
+    await runSpecIndexing(rootPath, outputPath, openloreConfig, keywordOnly, analysisFingerprint);
   } catch (embedErr) {
     console.log(`    ✗ Vector index failed: ${(embedErr as Error).message}`);
   }
@@ -961,7 +963,7 @@ const TEXT_INDEX_MAX_FILE_BYTES = 2_000_000;
  * each file, and indexes its non-blank lines. Non-fatal: a failure here never
  * breaks `analyze`.
  */
-async function runTextLineIndexing(rootPath: string, outputPath: string): Promise<void> {
+async function runTextLineIndexing(rootPath: string, outputPath: string, analysisFingerprint: string | null): Promise<void> {
   try {
     const { FileWalker } = await import('../../core/analyzer/file-walker.js');
     const { TextLineIndex } = await import('../../core/analyzer/text-line-index.js');
@@ -980,7 +982,7 @@ async function runTextLineIndexing(rootPath: string, outputPath: string): Promis
       }),
     );
 
-    const { lines, files: indexedFiles } = await TextLineIndex.build(outputPath, files);
+    const { lines, files: indexedFiles } = await TextLineIndex.build(outputPath, files, analysisFingerprint);
     console.log(`    ✓ Text line index built (${lines} lines across ${indexedFiles} files)`);
     console.log(`    → ${displayPathArg(rootPath, outputPath)}text-line-index/`);
   } catch (err) {
@@ -1001,7 +1003,8 @@ async function runSpecIndexing(
   rootPath: string,
   outputPath: string,
   openloreConfig: OpenLoreConfig | null,
-  keywordOnly = false
+  keywordOnly = false,
+  analysisFingerprint: string | null = null,
 ): Promise<void> {
   const { join: pathJoin } = await import('node:path');
   const { SpecVectorIndex } = await import('../../core/analyzer/spec-vector-index.js');
@@ -1031,7 +1034,7 @@ async function runSpecIndexing(
 
   try {
     const decisionsDir = pathJoin(rootPath, OPENSPEC_DIR, OPENSPEC_DECISIONS_SUBDIR);
-    const { recordCount, hasEmbeddings } = await SpecVectorIndex.build(outputPath, specsDir, embedSvc, mappingJsonPath, decisionsDir);
+    const { recordCount, hasEmbeddings } = await SpecVectorIndex.build(outputPath, specsDir, embedSvc, mappingJsonPath, decisionsDir, analysisFingerprint);
     const specNote = hasEmbeddings ? '' : ' (keyword/BM25 — set EMBED_* for semantic spec search)';
     console.log(`    ✓ Spec index built (${recordCount} sections)${specNote}`);
     console.log(`    → ${displayPathArg(rootPath, outputPath)}vector-index/`);

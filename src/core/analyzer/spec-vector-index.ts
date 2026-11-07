@@ -16,13 +16,13 @@
  *   const results = await SpecVectorIndex.search(outputDir, "email validation", embedSvc);
  */
 
-import { readFileSync } from 'node:fs';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { tokenize, buildBm25Corpus, bm25Score } from './vector-index.js';
-import { openVectorBackend, type VectorBackend, type VectorRecord } from './vector-store.js';
+import { hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex, type VectorBackend, type VectorRecord } from './vector-store.js';
+import { searchVector, type SearchStatus } from './index-capabilities.js';
 
 // ============================================================================
 // TYPES
@@ -80,15 +80,6 @@ interface SpecIndexMeta {
 
 function specMetaPath(outputDir: string): string {
   return join(outputDir, META_FILE);
-}
-
-/** Read the spec-index meta sidecar. Missing sidecar ⇒ legacy embedded index. */
-function readSpecMeta(outputDir: string): SpecIndexMeta | null {
-  try {
-    return JSON.parse(readFileSync(specMetaPath(outputDir), 'utf-8')) as SpecIndexMeta;
-  } catch {
-    return null;
-  }
 }
 
 async function writeSpecMeta(outputDir: string, meta: SpecIndexMeta): Promise<void> {
@@ -301,7 +292,8 @@ export class SpecVectorIndex {
     specsDir: string,
     embedSvc: EmbeddingService | null,
     mappingJsonPath?: string,
-    decisionsDir?: string
+    decisionsDir?: string,
+    analysisFingerprint: string | null = null,
   ): Promise<{ recordCount: number; hasEmbeddings: boolean }> {
     // Load mapping index (optional)
     let mappingIndex = new Map<string, string[]>();
@@ -373,13 +365,11 @@ export class SpecVectorIndex {
     }
 
     const dbPath = join(outputDir, DB_FOLDER);
-    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant) — выбор по окружению.
-    const backend = openVectorBackend(dbPath, TABLE_NAME);
 
     // ── BM25-only build (no embedding service) ───────────────────────────────
     // Write records without a `vector` column and record hasEmbeddings:false.
     if (!embedSvc) {
-      await backend.build(records as unknown as VectorRecord[]);
+      await publishVectorIndex(dbPath, TABLE_NAME, records as unknown as VectorRecord[], null, analysisFingerprint);
       await writeSpecMeta(outputDir, {
         hasEmbeddings: false,
         dim: 0,
@@ -403,8 +393,7 @@ export class SpecVectorIndex {
       vector: vectors[i],
     }));
 
-    // Write store (same DB folder, table "specs") — File / LanceDB / Qdrant (overwrite)
-    await backend.build(fullRecords as unknown as VectorRecord[]);
+    await publishVectorIndex(dbPath, TABLE_NAME, fullRecords as unknown as VectorRecord[], embedSvc.modelName, analysisFingerprint);
 
     await writeSpecMeta(outputDir, {
       hasEmbeddings: true,
@@ -428,29 +417,17 @@ export class SpecVectorIndex {
       limit?: number;
       domain?: string;
       section?: string;
+      status?: SearchStatus;
     } = {}
   ): Promise<SpecSearchResult[]> {
     const { limit = 10, domain, section } = opts;
 
-    if (!SpecVectorIndex.exists(outputDir)) {
-      throw new Error('No spec index found. Run "openlore analyze" first.');
-    }
-
-    const dbPath = join(outputDir, DB_FOLDER);
-    // Хранилище за единым интерфейсом (File/LanceDB/Qdrant) — выбор по окружению.
-    const backend = openVectorBackend(dbPath, TABLE_NAME);
-
-    // ── BM25-only path ─────────────────────────────────────────────────────────
-    // Force BM25 when no embedder is available OR the spec index was built
-    // without embeddings (no `vector` column). Missing sidecar ⇒ legacy embedded.
-    const meta = readSpecMeta(outputDir);
-    const indexHasEmbeddings = meta === null ? true : meta.hasEmbeddings;
-    if (!embedSvc || !indexHasEmbeddings) {
+    const index = await openStoredVectorIndex(join(outputDir, DB_FOLDER), TABLE_NAME);
+    const { backend } = index;
+    const queryVector = await searchVector(index, query, embedSvc, opts.status);
+    if (!queryVector) {
       return SpecVectorIndex._bm25Only(backend, query, limit, domain, section);
     }
-
-    const [queryVector] = await embedSvc.embed([query]);
-    if (!queryVector) throw new Error('Failed to embed query');
 
     const fetchLimit = Math.min(limit * 10, 500);
     const rows = await backend.searchDense(queryVector, fetchLimit);
@@ -543,7 +520,7 @@ export class SpecVectorIndex {
   static exists(outputDir: string): boolean {
     // Table-specific существование через бэкенд: LanceDB → <db>/specs.lance,
     // File → <db>/specs.records.json, Qdrant → маркер <db>/.qdrant-specs.
-    return openVectorBackend(join(outputDir, DB_FOLDER), TABLE_NAME).exists();
+    return hasStoredVectorIndex(join(outputDir, DB_FOLDER), TABLE_NAME);
   }
 }
 

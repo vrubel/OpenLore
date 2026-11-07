@@ -40,6 +40,7 @@ import { type Reversal, collectReversals, fileScope, supersededDecisionIds } fro
 import { getSourceRoots, moduleFromPath } from './epistemic-lease.js';
 import { readHotspotArtifact, hotspotsForModules } from './behavioral-hotspots.js';
 import { openloreReadTarget } from '../write-target.js';
+import { configuredEmbedder, searchWithStatus, type IndexCapability } from '../../analyzer/index-capabilities.js';
 
 // ============================================================================
 // MANIFEST CACHE
@@ -176,43 +177,16 @@ export async function handleOrient(
   const outputDir = openloreReadTarget(absDir, 'analysis');
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
   const { SpecVectorIndex } = await import('../../analyzer/spec-vector-index.js');
-
-  const hasCodeIndex = VectorIndex.exists(outputDir);
-  const hasSpecIndex = SpecVectorIndex.exists(outputDir);
-
-  if (!hasCodeIndex) {
-    return {
-      error: 'No analysis found. Run "openlore analyze" first.',
-      hint: 'Plain "openlore analyze" builds a keyword (BM25) index that orient can use; add EMBED_* (or --embed) for semantic search.',
-    };
-  }
-
-  // Resolve embedding service — null triggers BM25 fallback in VectorIndex.search()
-  let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
-  let searchMode = 'hybrid';
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readOpenLoreConfig(absDir);
-    const svcFromConfig = cfg ? EmbeddingService.fromConfig(cfg) : null;
-    if (svcFromConfig) {
-      embedSvc = svcFromConfig;
-    } else {
-      searchMode = 'bm25_fallback';
-    }
-  }
-
+  const embedSvc = await configuredEmbedder(absDir);
   const clampedLimit = Math.max(1, Math.min(limit, 20));
 
-  // ── Parallel data loading ──────────────────────────────────────────────────
-  const [rawResults, mappingIdx, llmCtx] = await Promise.all([
-    VectorIndex.search(outputDir, task, embedSvc, { limit: clampedLimit * 3 }),
+  const [code, mappingIdx, llmCtx] = await Promise.all([
+    searchWithStatus(status => VectorIndex.search(outputDir, task, embedSvc, { limit: clampedLimit * 3, status })),
     loadMappingIndex(absDir),
     readCachedContext(absDir),
   ]);
-
+  const { results: rawResults, index: codeIndex } = code;
 
   // ── Relevant functions (top-N) ────────────────────────────────────────────
   // Exclude external synthetic nodes (fetch, https.request, etc.) — they have no spec/docstring
@@ -337,20 +311,20 @@ export async function handleOrient(
   // block is now guarded by `!lean`, so lean skips the *work*, not just the
   // bytes: it makes the shallow-task path measurably faster, not only smaller.
 
-  // ── Spec search (best-effort — skipped if spec index not available) ────────
+  // Specs are an independent lane. Keep the useful parts of orient if either search is unavailable.
   let matchingSpecs: OrientSpecMatch[] | undefined;
-  if (!lean && hasSpecIndex) {  // embedSvc may be null — SpecVectorIndex.search falls back to BM25
-    try {
-      const specResults = await SpecVectorIndex.search(outputDir, task, embedSvc, { limit: 3 });
-      matchingSpecs = specResults.map(r => ({
+  let specIndex: IndexCapability | undefined;
+  if (!lean) {
+    const specs = await searchWithStatus(status => SpecVectorIndex.search(outputDir, task, embedSvc, { limit: 3, status }));
+    specIndex = specs.index;
+    if (specIndex?.mode !== 'unavailable') {
+      matchingSpecs = specs.results.map(r => ({
         domain: r.record.domain,
         section: r.record.section,
         title: r.record.title,
         score: parseFloat(r.score.toFixed(3)),
         text: r.record.text.slice(0, 300) + (r.record.text.length > 300 ? '…' : ''),
       }));
-    } catch {
-      // non-fatal — spec index may be corrupt or unavailable
     }
   }
 
@@ -785,10 +759,14 @@ export async function handleOrient(
   // Minimal-sufficient navigation core — always returned (Spec 27).
   const core = {
     task,
-    searchMode,
-    ...(searchMode === 'bm25_fallback'
-      ? { note: 'Embedding server unavailable — results use keyword matching. Run "openlore analyze --embed" for semantic search.' }
-      : {}),
+    searchMode: codeIndex?.mode === 'unavailable' ? 'unavailable' :
+      codeIndex?.mode === 'semantic' ? 'hybrid' : 'bm25_fallback',
+    indexes: { functions: codeIndex, ...(specIndex ? { specs: specIndex } : {}) },
+    ...(codeIndex?.mode === 'unavailable'
+      ? { note: codeIndex.reason?.message + ' Structural navigation and file reads are still available where indexed.' }
+      : codeIndex?.mode === 'text'
+        ? { note: codeIndex.reason?.message ?? 'This index uses keyword matching (BM25).' }
+        : {}),
     ...(graphIndexStale
       ? { graphIndexNote: 'Graph index unavailable — call paths, provenance, decisions, and change-coupling are omitted. Run analyze_codebase to (re)build it (a version upgrade resets the graph index until the next analyze).' }
       : {}),
