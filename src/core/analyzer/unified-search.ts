@@ -276,9 +276,7 @@ export class UnifiedSearch {
     const svc = embedSvc ?? null;
     const [code, specs] = await Promise.all([
       searchWithStatus(status => VectorIndex.search(outputDir, query, svc, { limit: limit * 3, language, status })),
-      svc
-        ? searchWithStatus(status => SpecVectorIndex.search(outputDir, query, svc, { limit: limit * 3, domain, section, status }))
-        : null,
+      searchWithStatus(status => SpecVectorIndex.search(outputDir, query, svc, { limit: limit * 3, domain, section, status })),
     ]);
     if (code.index) opts.status?.('functions', code.index);
     if (specs?.index) opts.status?.('specs', specs.index);
