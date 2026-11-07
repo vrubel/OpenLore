@@ -1820,6 +1820,7 @@ export function selectActiveTools<T extends { name: string }>(
 }
 
 interface McpServerOptions {
+  pinnedIndex?: boolean;
   watch?: string;
   watchAuto?: boolean;
   /** Spawn a shared `openlore serve` daemon when none is running and delegate to
@@ -1883,6 +1884,7 @@ function withWatchAutoOffUnderPerimeter(options: McpServerOptions): McpServerOpt
 }
 
 function applyRootAllowlist(options: McpServerOptions): void {
+  if (options.pinnedIndex) process.env.OPENLORE_PINNED_INDEX = '1';
   const cwd = process.cwd();
   // `--watch <dir>` is an instruction to WRITE: the watcher re-indexes into
   // `<dir>/.openlore/analysis`. Left out of the perimeter it produced a command at
@@ -2578,6 +2580,7 @@ const collectPath = (value: string, previous?: string[]): string[] => [...(previ
 
 export const mcpCommand = new Command('mcp')
   .description('Start openlore as an MCP server (stdio by default, or --http for remote/isolated agents)')
+  .option('--pinned-index', 'Require immutable remote search generations for this MCP process')
   .option('--watch <directory>', 'Watch a project directory and incrementally re-index signatures on file changes')
   .option('--watch-auto', 'Auto-detect the project directory from the first tool call and start watching', true)
   .option('--no-watch-auto', 'Disable auto-watch (use for one-shot tool calls, e.g. the orient skill wrapper)')
