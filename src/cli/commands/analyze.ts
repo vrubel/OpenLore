@@ -438,7 +438,10 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       // ========================================================================
       if (opts.reindexSpecs) {
         await ensureOutputDir(outputPath);
-        await runSpecIndexing(rootPath, outputPath, openloreConfig);
+        // Same anchor as runEmbedStep: a spec generation published without the
+        // analysis fingerprint is refused by the pinned reader (PDLC-2785, D14).
+        const { publishedAnalysisFingerprint } = await import('../../core/analyzer/vector-store.js');
+        await runSpecIndexing(rootPath, outputPath, openloreConfig, false, publishedAnalysisFingerprint(outputPath));
         return;
       }
 

@@ -160,6 +160,26 @@ interface InlineSpec {
   content: string;
 }
 
+/**
+ * Why an orient result carries no code context, or null when its code search ran.
+ *
+ * Orient reports an unavailable code index as an ordinary result — empty lists and
+ * `indexes.functions.mode: 'unavailable'` with the reason — so that its spec and
+ * structural lanes still reach the agent. Callers that used to test `error` alone
+ * read such a result as a clean, merely empty orientation (PDLC-2785, D12). This is
+ * the one rule for both signals: an argument refusal (`error`) and an unavailable
+ * code index.
+ */
+export function orientUnavailableReason(result: {
+  error?: string;
+  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
+}): string | null {
+  if (result.error) return result.error;
+  const functions = result.indexes?.functions;
+  if (functions?.mode !== 'unavailable') return null;
+  return functions.reason?.message ?? 'The code search index is unavailable.';
+}
+
 // ============================================================================
 // HANDLER
 // ============================================================================

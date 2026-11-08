@@ -30,7 +30,7 @@ import { resolve, join, basename } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
 import { isPathAllowed } from './root-allowlist.js';
 import { handleSpecStoreStatus, type SpecStoreStatusReport } from './spec-store.js';
-import { handleOrient } from './orient.js';
+import { handleOrient, orientUnavailableReason } from './orient.js';
 import { applyTokenBudget, omissionNote } from './progressive.js';
 
 /** Default token budget for the whole merged briefing when none is supplied. */
@@ -44,7 +44,7 @@ export type WorkingSetFindingCode =
   | 'change-not-found'    // the change id resolves to no proposal under the store
   | 'no-briefable-targets'// the binding has no resolved, indexed target to orient
   | 'target-not-briefable'// a declared target is unresolved/unindexed/stale → skipped
-  | 'orient-unavailable'  // a target resolved + indexed but orientation returned an error
+  | 'orient-unavailable'  // a target resolved + indexed but orientation failed or its code search is unavailable
   | 'store-out-of-perimeter'; // specStore.path points outside this server's root allowlist
 
 export type WorkingSetFindingSeverity = 'info' | 'warn' | 'error';
@@ -136,6 +136,8 @@ interface OrientFnView {
 }
 export interface OrientView {
   error?: string;
+  /** Per-lane search state; `functions.mode: 'unavailable'` means no code context (see orientUnavailableReason). */
+  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
   relevantFunctions?: OrientFnView[];
   callPaths?: Array<{ function: string; filePath: string; callers?: Array<{ name: string }> }>;
   specDomains?: Array<{ domain: string }>;
@@ -465,11 +467,12 @@ export async function handleWorkingSetContext(
       continue;
     }
 
-    if (orient.error) {
-      targets.push({ target: t.name, briefed: false, reason: orient.error, insertionPoints: [], specDomains: [], anchoredIntent: [] });
+    const unavailable = orientUnavailableReason(orient);
+    if (unavailable) {
+      targets.push({ target: t.name, briefed: false, reason: unavailable, insertionPoints: [], specDomains: [], anchoredIntent: [] });
       findings.push({
         code: 'orient-unavailable', severity: 'warn', subject: t.name,
-        message: `Target "${t.name}" could not be oriented: ${orient.error}`,
+        message: `Target "${t.name}" could not be oriented: ${unavailable}`,
         remediation: `Re-run \`openlore analyze\` in ${t.path}, then re-brief.`,
       });
       continue;
