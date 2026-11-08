@@ -466,6 +466,12 @@ Checks performed:
     const rootPath = process.cwd();
     if (options.indexOnly) {
       if (!options.json) throw new Error('--index-only requires --json');
+      // The answer is about the MCP server started in this cwd, so judge the index
+      // through the perimeter that server applies without flags, canonicalization
+      // included (PDLC-2785, D15). Without it a `.openlore` symlinked out of the roots
+      // read as searchable while the server refused every search there.
+      const { configureRootAllowlist, serverRoots } = await import('../../core/services/mcp-handlers/root-allowlist.js');
+      configureRootAllowlist(serverRoots(rootPath));
       const { inspectSearchIndexes } = await import('../../core/analyzer/index-capabilities.js');
       console.log(JSON.stringify(await inspectSearchIndexes(rootPath, options.pinnedIndex)));
       return;

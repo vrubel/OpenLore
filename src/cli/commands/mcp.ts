@@ -52,9 +52,9 @@ import {
   assertRootAllowed,
   getRootAllowlist,
   isPathAllowed,
-  isPathWithinRoots,
   isPerimeterRefusal,
   isRootAllowlistConfigured,
+  serverRoots,
   toolAccessMode,
 } from '../../core/services/mcp-handlers/root-allowlist.js';
 
@@ -1886,31 +1886,9 @@ function withWatchAutoOffUnderPerimeter(options: McpServerOptions): McpServerOpt
 
 function applyRootAllowlist(options: McpServerOptions): void {
   if (options.pinnedIndex) process.env.OPENLORE_PINNED_INDEX = '1';
-  const cwd = process.cwd();
-  // `--watch <dir>` is an instruction to WRITE: the watcher re-indexes into
-  // `<dir>/.openlore/analysis`. Left out of the perimeter it produced a command at
-  // war with itself — the watcher writing where tool calls were refused. So the
-  // watched directory joins the roots when they are implicit, and must be inside
-  // them when they were given explicitly (an operator who names both and means two
-  // different places has made a mistake worth hearing about at startup).
-  const watchDir = options.watch ? nodeResolve(options.watch) : null;
-  const explicitRead = options.root && options.root.length > 0 ? options.root : null;
-  if (explicitRead && watchDir && !isPathWithinRoots(watchDir, explicitRead)) {
-    throw new Error(
-      `openlore mcp --watch ${watchDir}: наблюдаемый каталог обязан лежать внутри корней чтения ` +
-      `(${explicitRead.join(', ')}) — вотчер пишет в него индекс. Добавьте его в --root или уберите --watch.`
-    );
-  }
-  const readRoots = explicitRead ?? (watchDir && !isPathWithinRoots(watchDir, [cwd]) ? [cwd, watchDir] : [cwd]);
-  // Write default: own repository, never neighbours (see above). The watched
-  // directory is added because watching IS an explicit instruction to write there —
-  // that is stated intent, not writability by implication.
-  const implicitWrite = [
-    ...(isPathWithinRoots(cwd, readRoots) ? [cwd] : []),
-    ...(watchDir && isPathWithinRoots(watchDir, readRoots) ? [watchDir] : []),
-  ];
-  const writeRoots = options.writeRoot && options.writeRoot.length > 0 ? options.writeRoot : implicitWrite;
-  configureRootAllowlist({ readRoots, writeRoots });
+  // The composition itself lives in `serverRoots`: `doctor --index-only` judges the
+  // index this server will serve and must apply the very same perimeter (D15).
+  configureRootAllowlist(serverRoots(process.cwd(), options));
   // A shared `openlore serve` daemon has no perimeter of its own and is discovered
   // through a file the agent can write (see `resolveDaemon`). Spawning one from a
   // perimeter-bearing server would export the whole tool surface past the boundary,
