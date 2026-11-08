@@ -24,7 +24,7 @@ import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { getSkeletonContent, isSkeletonWorthIncluding } from './code-shaper.js';
 import {
-  embeddingVectorsReusable, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex,
+  IndexPublicationError, embeddingVectorsReusable, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex,
   type IndexIdentity, type VectorBackend, type VectorRecord,
 } from './vector-store.js';
 import { searchVector, type SearchStatus } from './index-capabilities.js';
@@ -268,7 +268,8 @@ function findSignatureEntry(
 export class VectorIndexRebuildRequired extends Error {
   static readonly recovery = 'openlore analyze --embed --force';
   constructor(
-    readonly reason: 'legacy-index' | 'no-embedder' | 'model-differs' | 'dimension-differs' | 'vectors-behind',
+    readonly reason: 'legacy-index' | 'no-embedder' | 'model-differs' | 'dimension-differs' | 'vectors-behind'
+      | 'repeated-ids' | 'publication-failed',
     readonly detail: string,
   ) {
     super(`${detail} Nothing was published for this update; rebuild the index with \`${VectorIndexRebuildRequired.recovery}\`.`);
@@ -508,8 +509,10 @@ export class VectorIndex {
    *  - BM25-only index: overwrite survivors + the changed files' documents and
    *    patch the cached BM25 corpus in place rather than dropping it wholesale.
    *  - An embedded index whose vectors cannot stay valid (no publication
-   *    generation, a different model, no embedder, another dimension) is not
-   *    touched: VectorIndexRebuildRequired, and a full analysis rebuilds it.
+   *    generation, a different model, no embedder, another dimension), an index
+   *    that still holds repeated ids from an older OpenLore, or an update whose
+   *    publication fails is not touched: VectorIndexRebuildRequired plus the
+   *    "vectors behind" marker, and a full analysis rebuilds it.
    *
    * Note: PDLC never runs watch (it re-runs a full `analyze`), so the O(corpus)
    * overwrite cost here is acceptable; the result is identical to a row-level
@@ -594,6 +597,18 @@ export class VectorIndex {
     if (blocker) throw await VectorIndex.refused(outputDir, blocker);
     const existingRows = await previous.backend.loadAll() as VectorRecord[];
     const survivors = existingRows.filter(row => !changedFilePaths.has(row.filePath as string));
+    // An index written by v2.1.3-ru19 or earlier may hold two records with one id
+    // (`export const X` + `export type X`). The publisher refuses such pairs, so
+    // surviving repeats mark an index of the old format that only a full build
+    // can rewrite.
+    const seenIds = new Set<string>();
+    for (const row of survivors) {
+      if (seenIds.has(row.id)) {
+        throw await VectorIndex.refused(outputDir, new VectorIndexRebuildRequired('repeated-ids',
+          `The saved search index holds several records with the id "${row.id}" (written by an older OpenLore).`));
+      }
+      seenIds.add(row.id);
+    }
     const vectorsByInput = new Map(existingRows.map(row => [JSON.stringify([row.id, row.text]), row.vector]));
     let reused = 0;
     let embedded = 0;
@@ -622,7 +637,15 @@ export class VectorIndex {
         return text as VectorRecord;
       });
     }
-    await publishVectorIndex(dbPath, TABLE_NAME, records, savedModel, analysisFingerprint);
+    try {
+      await publishVectorIndex(dbPath, TABLE_NAME, records, savedModel, analysisFingerprint);
+    } catch (error) {
+      // The graph already holds this delta and will not offer it again: a failed
+      // publication leaves the index behind, which must not read as success.
+      if (!(error instanceof IndexPublicationError)) throw error;
+      const cause = /[.!?]$/.test(error.message) ? error.message : error.message + '.';
+      throw await VectorIndex.refused(outputDir, new VectorIndexRebuildRequired('publication-failed', cause));
+    }
     _bm25Cache.delete(dbPath);
     return { embedded, reused, total: records.length, hasEmbeddings: Boolean(records[0]?.vector?.length) };
   }

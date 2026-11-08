@@ -117,6 +117,7 @@ export class IndexUnavailable extends Error {
 export class IndexPublicationError extends Error {
   constructor(cause: unknown) {
     super('Publishing the search index failed: ' + (cause instanceof Error ? cause.message : String(cause)), { cause });
+    this.name = 'IndexPublicationError';
   }
 }
 
