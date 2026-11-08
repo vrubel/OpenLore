@@ -339,9 +339,11 @@ export async function publishVectorIndex(
   const target = descriptorPath(db, table);
   const tmp = target + '.' + descriptor.generation + '.tmp';
   mkdirSync(db, { recursive: true });
+  let remote: QdrantBackend | null = null;
   try {
     if (backend === 'qdrant') {
-      await new QdrantBackend(collection(descriptor), descriptor).build(records);
+      remote = new QdrantBackend(collection(descriptor), descriptor);
+      await remote.build(records);
     } else {
       const storage = localTable(descriptor);
       const store = backend === 'file' ? new FileBackend(db, storage) : new LanceBackend(db, storage);
@@ -352,6 +354,9 @@ export async function publishVectorIndex(
     renameSync(tmp, target);
   } catch (error) {
     discardLocalGeneration(db, descriptor);
+    // Only this publication's own collection, and only once Qdrant created it; the
+    // published generation is untouched. A failed cleanup must not mask the cause.
+    if (remote?.created) await remote.drop().catch(() => {});
     throw new IndexPublicationError(error);
   } finally {
     try { unlinkSync(tmp); } catch (error) {
@@ -589,6 +594,8 @@ const RECORD_FIELD = '_openlore_record_sha256';
 
 class QdrantBackend implements VectorBackend {
   readonly proof: string | null;
+  /** Qdrant confirmed creating this generation's collection (set by build()). */
+  created = false;
   private readonly url: string;
   private readonly base: string;
 
@@ -685,6 +692,7 @@ class QdrantBackend implements VectorBackend {
     if (!descriptor) throw new Error('A Qdrant build requires a new publication generation.');
     const created = await this.req('PUT', '', { vectors: { size: descriptor.dim, distance: descriptor.distance } });
     if (created !== true) throw new IndexUnavailable('index-invalid', 'Qdrant did not create a new search generation.', 'qdrant');
+    this.created = true;
     for (let i = 0; i < records.length; i += 256) {
       const points = records.slice(i, i + 256).map(({ vector, ...payload }) => ({
         id: QdrantBackend.pid(payload.id), vector, payload: { ...payload, [PROOF_FIELD]: this.proof, [RECORD_FIELD]: sourceDigest([payload]) },
@@ -693,6 +701,11 @@ class QdrantBackend implements VectorBackend {
       if (result.status !== 'completed') throw new IndexUnavailable('index-invalid', 'Qdrant did not confirm the new index batch.', 'qdrant');
     }
     await this.verify();
+  }
+
+  /** Delete this generation's collection — only for a publication that never completed. */
+  async drop(): Promise<void> {
+    await this.req('DELETE');
   }
 
   private row(point: any): Record<string, unknown> {
