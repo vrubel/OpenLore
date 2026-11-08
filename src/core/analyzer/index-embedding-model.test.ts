@@ -89,3 +89,55 @@ describe('D13: an unknown embedding model is not a different model', () => {
     expect(await searchMode(named('model-b'))).toMatchObject({ mode: 'text', reason: { code: 'embedding-mismatch' } });
   });
 });
+
+describe('D13 writer: stored vectors are reused only from the same model, or when neither side names one', () => {
+  const RECOVERY = /openlore analyze --embed --force/;
+  const nodes = () => [node('src/a.ts', 'alpha'), node('src/b.ts', 'beta')];
+  const descriptor = async () => (await openStoredVectorIndex(join(outputDir, 'vector-index'), 'functions')).identity;
+
+  it('build(incremental) over an unnamed-model index with a named model re-embeds everything', async () => {
+    await VectorIndex.build(outputDir, nodes(), [], new Set(), new Set(), named(''));
+    expect((await descriptor()).model).toBeNull();
+
+    const svc = named('model-b');
+    const result = await VectorIndex.build(outputDir, nodes(), [], new Set(), new Set(), svc, undefined, true);
+
+    expect(result.reused).toBe(0);
+    expect(svc.embed).toHaveBeenCalledWith(expect.arrayContaining([expect.stringContaining('alpha'), expect.stringContaining('beta')]));
+    expect((await descriptor()).model).toBe('model-b');
+  });
+
+  it('build(incremental) with the same unnamed embedder reuses the vectors', async () => {
+    await VectorIndex.build(outputDir, nodes(), [], new Set(), new Set(), named(''));
+    const svc = named('');
+    const result = await VectorIndex.build(outputDir, nodes(), [], new Set(), new Set(), svc, undefined, true);
+
+    expect(result.reused).toBe(2);
+    expect(svc.embed).not.toHaveBeenCalled();
+  });
+
+  it('updateFiles() on a named-model index with an unnamed embedder refuses and publishes nothing', async () => {
+    await VectorIndex.build(outputDir, nodes(), [], new Set(), new Set(), named('model-a'));
+    const before = await descriptor();
+
+    await expect(VectorIndex.updateFiles(
+      outputDir, [node('src/b.ts', 'betaRenamed')], new Set(['src/b.ts']), [], new Set(), new Set(), named(''),
+    )).rejects.toThrow(RECOVERY);
+    expect(await descriptor()).toEqual(before);
+  });
+
+  it('updateFiles() on an unnamed-model index with a named embedder refuses and publishes nothing', async () => {
+    await VectorIndex.build(outputDir, nodes(), [], new Set(), new Set(), named(''));
+    const before = await descriptor();
+
+    await expect(VectorIndex.updateFiles(
+      outputDir, [node('src/b.ts', 'betaRenamed')], new Set(['src/b.ts']), [], new Set(), new Set(), named('model-b'),
+    )).rejects.toThrow(RECOVERY);
+    expect(await descriptor()).toEqual(before);
+  });
+
+  it('the reader still treats an unnamed model as unknown, not different', async () => {
+    await VectorIndex.build(outputDir, nodes(), [], new Set(), new Set(), named(''));
+    expect(await searchMode(named('model-b'))).toMatchObject({ mode: 'semantic', reason: null });
+  });
+});
