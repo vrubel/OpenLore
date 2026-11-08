@@ -8,13 +8,14 @@
  * stdio with telemetry on, as PDLC runs it, and the JSONL is read back.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, realpathSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, realpathSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { VectorIndex, _resetVectorIndexCachesForTesting } from '../../core/analyzer/vector-index.js';
+import { SpecVectorIndex } from '../../core/analyzer/spec-vector-index.js';
 import type { FunctionNode } from '../../core/analyzer/call-graph.js';
 import type { FileSignatureMap } from '../../core/analyzer/signature-extractor.js';
 
@@ -124,5 +125,22 @@ describe('openlore mcp: состояние поискового индекса �
     const orient = telemetry(repo, 'orient').filter(r => r.event === 'orient_call');
     expect(orient[0]).toMatchObject({ index_mode: 'text', index_reason: null });
     expect(orient[0].functions).toBeGreaterThan(0);
+  }, 120_000);
+
+  // Суд по openlore#15, находка 3: единый поиск отбрасывал недоступную полосу, если
+  // ответила другая, и строка совпадала со здоровым текстовым поиском.
+  it('search_unified: недоступная полоса кода при ответившей полосе спецификаций различима', async () => {
+    const repo = mk('partial');
+    mkdirSync(join(repo, 'openspec', 'specs', 'auth'), { recursive: true });
+    writeFileSync(join(repo, 'openspec', 'specs', 'auth', 'spec.md'),
+      '# Auth\n\n## Purpose\n\nAuthenticate users.\n\n## Requirements\n\n### Requirement: Login\n\n' +
+      'The system SHALL authenticate a user by token.\n');
+    const built = await SpecVectorIndex.build(join(repo, '.openlore', 'analysis'), join(repo, 'openspec', 'specs'), null);
+    expect(built.recordCount).toBeGreaterThan(0);          // полоса спецификаций есть, полосы кода нет
+    client = await connect(repo);
+
+    expect((await call(client, 'search_unified', { directory: repo, query: 'authenticate' })).isError).toBeFalsy();
+    const line = telemetry(repo, 'mcp').find(r => r.event === 'tool_call' && r.tool === 'search_unified');
+    expect(line).toMatchObject({ outcome: 'partial', index_mode: 'unavailable', index_reason: 'missing-index' });
   }, 120_000);
 });
