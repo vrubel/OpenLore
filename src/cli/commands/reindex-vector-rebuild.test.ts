@@ -24,6 +24,8 @@ import { reindexCommand } from './reindex.js';
 
 const DIM = 4;
 const vector = (text: string) => [text.length % 5 + 1, 1, 2, 3];
+/** Dimension the stubbed `/embeddings` provider answers with. */
+let providerDim = DIM;
 
 let root: string;
 let analysisDir: string;
@@ -91,8 +93,9 @@ beforeEach(async () => {
   vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
     if (String(url) !== 'http://embed.test/v1/embeddings') throw new TypeError('fetch failed');
     const { input } = JSON.parse(String(init.body)) as { input: string[] };
-    return new Response(JSON.stringify({ data: input.map((text, index) => ({ index, embedding: vector(text) })) }));
+    return new Response(JSON.stringify({ data: input.map((text, index) => ({ index, embedding: vector(text).slice(0, providerDim) })) }));
   }));
+  providerDim = DIM;
   reindexCommand.setOptionValue('embed', true);
   reindexCommand.setOptionValue('json', false);
   _resetVectorIndexCachesForTesting();
@@ -230,6 +233,60 @@ describe('D2: reindex refuses up front when the semantic index cannot be kept cu
     const { exitCode } = await runReindex(['--since', base]);
 
     expect(exitCode).toBe(0);
+    expect(marker()).toBe(true);
+  });
+});
+
+describe('D2: every reindex fails until the vector index has caught up with the graph', () => {
+  const RECOVERY = /openlore analyze --embed --force/;
+  const marker = () => existsSync(join(analysisDir, 'reindex-state.json'));
+  const fooNode = {
+    id: 'a.ts::foo', name: 'foo', filePath: 'a.ts', language: 'TypeScript', isAsync: false,
+    signature: 'export function foo()', docstring: '', fanIn: 0, fanOut: 0, startIndex: 0, endIndex: 0,
+  } as FunctionNode;
+  const svc = () => ({ modelName: 'embed-model', embed: vi.fn(async (texts: string[]) => texts.map(vector)) }) as unknown as EmbeddingService;
+
+  it('another vector dimension: the repeated reindex still fails although the graph already has the files', async () => {
+    const base = await seedAnalysis();
+    await VectorIndex.build(analysisDir, [fooNode], [], new Set(), new Set(), svc());
+    await commitChange();
+    providerDim = 3;
+
+    expect((await runReindex(['--since', base])).exitCode).not.toBe(0);
+    const again = await runReindex(['--since', base]);
+
+    expect(again.exitCode).not.toBe(0);
+    expect(again.stderr).toMatch(RECOVERY);
+    expect(marker()).toBe(false);
+  });
+
+  it('the model fixed after a refusal: the repeated reindex still fails, the delta never reached the vectors', async () => {
+    const base = await seedAnalysis();
+    await VectorIndex.build(analysisDir, [fooNode], [], new Set(), new Set(), svc());
+    await commitChange();
+    vi.stubEnv('EMBED_MODEL', 'model-b');
+    expect((await runReindex(['--since', base])).exitCode).not.toBe(0);
+
+    vi.stubEnv('EMBED_MODEL', 'embed-model');
+    const again = await runReindex(['--since', base]);
+
+    expect(again.exitCode).not.toBe(0);
+    expect(again.stderr).toMatch(RECOVERY);
+    expect(marker()).toBe(false);
+  });
+
+  it('control: a full build clears it — the next reindex exits 0', async () => {
+    const base = await seedAnalysis();
+    await VectorIndex.build(analysisDir, [fooNode], [], new Set(), new Set(), svc());
+    await commitChange();
+    providerDim = 3;
+    expect((await runReindex(['--since', base])).exitCode).not.toBe(0);
+    providerDim = DIM;
+
+    const baz = { ...fooNode, id: 'a.ts::baz', name: 'baz', signature: 'export function baz()' } as FunctionNode;
+    await VectorIndex.build(analysisDir, [fooNode, baz], [], new Set(), new Set(), svc());
+
+    expect((await runReindex(['--since', base])).exitCode).toBe(0);
     expect(marker()).toBe(true);
   });
 });
