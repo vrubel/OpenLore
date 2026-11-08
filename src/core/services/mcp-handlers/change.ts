@@ -13,10 +13,11 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
-import { handleOrient, orientUnavailableReason } from './orient.js';
+import { handleOrient, orientUnavailableReason, withSearchLanes } from './orient.js';
 import { handleSearchSpecs } from './semantic.js';
 import { handleAnalyzeImpact } from './graph.js';
 import { writeTarget } from '../write-target.js';
+import type { IndexCapability } from '../../analyzer/index-capabilities.js';
 
 // ============================================================================
 // INTERNAL TYPES  (narrow slices of handler outputs we actually use)
@@ -43,7 +44,7 @@ interface OrientResult {
     score: number;
   }>;
   matchingSpecs?: Array<{ domain: string; section: string; title: string; score: number; text: string }>;
-  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
+  indexes?: { functions?: IndexCapability | null };
   error?: string;
 }
 
@@ -346,7 +347,8 @@ export async function handleGenerateChangeProposal(
     ? Math.max(...impacts.map(i => i.riskScore ?? 0))
     : null;
 
-  return {
+  // orient's code lane goes to telemetry beside the result, never into it (D11).
+  return withSearchLanes({
     slug: safeSlug,
     proposalPath: join('openspec', 'changes', safeSlug, 'proposal.md'),
     domainsAffected: domains,
@@ -359,7 +361,7 @@ export async function handleGenerateChangeProposal(
     nextStep: `Review and complete openspec/changes/${safeSlug}/proposal.md, then run: openspec specs ${safeSlug}`,
     orientErrors: orientFailures(orient),
     specSearchErrors: specSearch.error ? [specSearch.error] : [],
-  };
+  }, [orient.indexes?.functions]);
 }
 
 // ============================================================================
@@ -532,7 +534,7 @@ export async function handleAnnotateStory(
     : null;
   const domains = (orient.specDomains ?? []).map(d => d.domain);
 
-  return {
+  return withSearchLanes({
     storyFile: storyFilePath,
     domainsAffected: domains,
     functionsFound: (orient.relevantFunctions ?? []).length,
@@ -544,5 +546,5 @@ export async function handleAnnotateStory(
       : 'critical',
     blocked: maxRisk !== null && maxRisk >= 70,
     orientErrors: orientFailures(orient),
-  };
+  }, [orient.indexes?.functions]);
 }

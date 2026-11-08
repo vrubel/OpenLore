@@ -30,8 +30,9 @@ import { resolve, join, basename } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
 import { isPathAllowed } from './root-allowlist.js';
 import { handleSpecStoreStatus, type SpecStoreStatusReport } from './spec-store.js';
-import { handleOrient, orientUnavailableReason } from './orient.js';
+import { handleOrient, orientUnavailableReason, withSearchLanes } from './orient.js';
 import { applyTokenBudget, omissionNote } from './progressive.js';
+import type { IndexCapability } from '../../analyzer/index-capabilities.js';
 
 /** Default token budget for the whole merged briefing when none is supplied. */
 const DEFAULT_WORKING_SET_BUDGET = 8_000;
@@ -137,7 +138,7 @@ interface OrientFnView {
 export interface OrientView {
   error?: string;
   /** Per-lane search state; `functions.mode: 'unavailable'` means no code context (see orientUnavailableReason). */
-  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
+  indexes?: { functions?: IndexCapability | null };
   relevantFunctions?: OrientFnView[];
   callPaths?: Array<{ function: string; filePath: string; callers?: Array<{ name: string }> }>;
   specDomains?: Array<{ domain: string }>;
@@ -436,6 +437,8 @@ export async function handleWorkingSetContext(
   const briefable = status.targets.filter(t => t.resolved && t.state === 'indexed' && t.path);
   const targets: WorkingSetTargetBrief[] = [];
   const allItems: WorkingSetItem[] = [];
+  // Orient's code lane per oriented target — for telemetry, beside the report (D11).
+  const searched: Array<IndexCapability | null | undefined> = [];
 
   for (const t of status.targets) {
     if (!briefable.includes(t)) {
@@ -456,6 +459,7 @@ export async function handleWorkingSetContext(
     let orient: OrientView;
     try {
       orient = (await handleOrient(t.path!, intent, limit)) as OrientView;
+      searched.push(orient.indexes?.functions);
     } catch (err) {
       const reason = `Orientation failed: ${err instanceof Error ? err.message : String(err)}`;
       targets.push({ target: t.name, briefed: false, reason, insertionPoints: [], specDomains: [], anchoredIntent: [] });
@@ -504,7 +508,7 @@ export async function handleWorkingSetContext(
     : `Working set for change "${id}" on store "${store.name}": no briefable targets` +
       (errors ? `, ${errors} blocking issue(s)` : '') + '.';
 
-  return {
+  return withSearchLanes({
     bound: true,
     store,
     change: {
@@ -518,5 +522,5 @@ export async function handleWorkingSetContext(
     findings,
     ready,
     summary,
-  };
+  }, searched);
 }
