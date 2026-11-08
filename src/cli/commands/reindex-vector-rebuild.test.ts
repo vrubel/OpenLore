@@ -123,7 +123,7 @@ describe('D2: reindex on an index it cannot update semantically', () => {
 
     expect(exitCode).not.toBe(0);
     expect(stderr).toMatch(/openlore analyze --embed --force/);
-    expect(stderr).toContain('[mcp-watcher] vector index not updated:');
+    expect(stderr).toContain('[mcp-watcher] vector update refused:');
     expect(await folder()).toEqual(before);
     expect((await openStoredVectorIndex(vectorDir(), 'functions')).identity).toMatchObject({ generation: null, dim: DIM });
     expect(existsSync(join(analysisDir, 'reindex-state.json'))).toBe(false);
@@ -288,5 +288,77 @@ describe('D2: every reindex fails until the vector index has caught up with the 
 
     expect((await runReindex(['--since', base])).exitCode).toBe(0);
     expect(marker()).toBe(true);
+  });
+});
+
+describe('D2: the reindex outcome text says what happened to the vector index', () => {
+  const NOT_CHANGED = /left unchanged|was not updated|did not change it/;
+  const node = (filePath: string, name: string) => ({
+    id: `${filePath}::${name}`, name, filePath, language: 'TypeScript', isAsync: false,
+    signature: `export function ${name}()`, docstring: '', fanIn: 0, fanOut: 0, startIndex: 0, endIndex: 0,
+  }) as FunctionNode;
+  const svc = () => ({ modelName: 'embed-model', embed: vi.fn(async (texts: string[]) => texts.map(vector)) }) as unknown as EmbeddingService;
+  const generation = async () => (await openStoredVectorIndex(vectorDir(), 'functions')).identity.generation;
+
+  /** a.ts::foo and b.ts::bar analysed and indexed with embed-model. */
+  async function seedTwoFiles(): Promise<string> {
+    await writeFile(join(root, 'a.ts'), 'export function foo() { return 1; }\n', 'utf-8');
+    await writeFile(join(root, 'b.ts'), 'export function bar() { return 2; }\n', 'utf-8');
+    git(['add', 'a.ts', 'b.ts']);
+    git(['commit', '-m', 'init']);
+    await writeFile(join(analysisDir, 'llm-context.json'), JSON.stringify({
+      signatures: [
+        { path: 'a.ts', language: 'TypeScript', entries: [{ kind: 'function', name: 'foo', signature: 'export function foo()' }] },
+        { path: 'b.ts', language: 'TypeScript', entries: [{ kind: 'function', name: 'bar', signature: 'export function bar()' }] },
+      ],
+      callGraph: null,
+    }), 'utf-8');
+    EdgeStore.open(EdgeStore.dbPath(analysisDir)).close();
+    await VectorIndex.build(analysisDir, [node('a.ts', 'foo'), node('b.ts', 'bar')], [], new Set(), new Set(), svc());
+    return git(['rev-parse', 'HEAD']);
+  }
+
+  it('deletion published, change refused (another model): exit 1, and the text says an update was published', async () => {
+    const base = await seedTwoFiles();
+    const before = await generation();
+    git(['rm', '-q', 'b.ts']);
+    await commitChange();
+    vi.stubEnv('EMBED_MODEL', 'model-b');
+
+    const { exitCode, stderr } = await runReindex(['--since', base]);
+
+    expect(exitCode).not.toBe(0);
+    expect(await generation()).not.toBe(before);
+    expect(stderr).toMatch(/published an update/);
+    expect(stderr).not.toMatch(NOT_CHANGED);
+  });
+
+  it('pure deletion without an embedder: exit 1, the deletion is in the index and the text says so', async () => {
+    const base = await seedTwoFiles();
+    git(['rm', '-q', 'b.ts']);
+    git(['commit', '-q', '-m', 'drop b']);
+    vi.stubEnv('EMBED_BASE_URL', undefined);
+    vi.stubEnv('EMBED_MODEL', undefined);
+
+    const { exitCode, stderr } = await runReindex(['--since', base]);
+
+    expect(exitCode).not.toBe(0);
+    expect((await (await openStoredVectorIndex(vectorDir(), 'functions')).backend.loadAll()).map(row => row.id)).toEqual(['a.ts::foo']);
+    expect(stderr).toMatch(/published an update/);
+    expect(stderr).not.toMatch(NOT_CHANGED);
+  });
+
+  it('nothing published (ru18 index, empty delta): the text says this run did not change it', async () => {
+    const base = await seedAnalysis();
+    await writeFile(join(vectorDir(), 'functions.records.json'), JSON.stringify({
+      id: 'a.ts::foo', name: 'foo', filePath: 'a.ts', className: '', language: 'TypeScript', signature: 'export function foo()',
+      docstring: '', fanIn: 0, fanOut: 0, isHub: false, isEntryPoint: false, text: 'foo', vector: [1, 0, 0, 0],
+    }) + '\n');
+    await writeFile(join(analysisDir, 'vector-index-meta.json'), JSON.stringify({ hasEmbeddings: true, dim: DIM, model: 'embed-model', builtAt: 'x', schemaVersion: 1 }));
+
+    const { exitCode, stderr } = await runReindex(['--since', base]);
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toMatch(/This run did not change it/);
   });
 });
