@@ -12,6 +12,10 @@
  *
  * `intercept` подменяет ответ на отдельный запрос (сбой Qdrant), `fallback` —
  * обработчик запросов не к Qdrant (например, к поддельному embedder).
+ *
+ * Имя `*.test.helper.ts`: vitest не берёт его как тест (маска `*.test.ts`), а
+ * исключение `*.test.*` для dist в поле `files` package.json не кладёт его в
+ * пакет, как и прочие собранные тесты.
  */
 
 export interface FakePoint {

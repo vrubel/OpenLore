@@ -1,12 +1,12 @@
 /**
  * Публикация и чтение поколений поискового индекса в Qdrant — на поддельном
- * Qdrant (`__tests__/fake-qdrant.ts`), без сети.
+ * Qdrant (`__tests__/fake-qdrant.test.helper.ts`), без сети.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FakeQdrant } from './__tests__/fake-qdrant.js';
+import { FakeQdrant } from './__tests__/fake-qdrant.test.helper.js';
 import { VectorIndex, _resetVectorIndexCachesForTesting } from './vector-index.js';
 import { openStoredVectorIndex, publishVectorIndex, type VectorRecord } from './vector-store.js';
 import { extractSignatures } from './signature-extractor.js';

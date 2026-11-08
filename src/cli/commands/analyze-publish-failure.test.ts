@@ -9,7 +9,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FakeQdrant } from '../../core/analyzer/__tests__/fake-qdrant.js';
+import { FakeQdrant } from '../../core/analyzer/__tests__/fake-qdrant.test.helper.js';
 
 vi.mock('../../utils/logger.js', () => ({
   logger: {
