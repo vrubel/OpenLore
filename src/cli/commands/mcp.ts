@@ -52,9 +52,9 @@ import {
   assertRootAllowed,
   getRootAllowlist,
   isPathAllowed,
-  isPathWithinRoots,
   isPerimeterRefusal,
   isRootAllowlistConfigured,
+  serverRoots,
   toolAccessMode,
 } from '../../core/services/mcp-handlers/root-allowlist.js';
 
@@ -65,6 +65,8 @@ import type { EpistemicTracker } from '../../core/services/mcp-handlers/epistemi
 import type { PanicResponseMode } from '../../types/index.js';
 import { readPanicState, mutatePanicStateLocked, getPanicSignalText } from '../../core/services/mcp-handlers/panic-response.js';
 import { emit } from '../../core/services/telemetry.js';
+import type { IndexCapability } from '../../core/analyzer/index-capabilities.js';
+import { searchLanesOf } from '../../core/services/mcp-handlers/orient.js';
 import { readOpenLoreConfig } from '../../core/services/config-manager.js';
 import { MCP_TOOL_MAX_BYTES } from '../../constants.js';
 import {
@@ -1885,31 +1887,9 @@ function withWatchAutoOffUnderPerimeter(options: McpServerOptions): McpServerOpt
 
 function applyRootAllowlist(options: McpServerOptions): void {
   if (options.pinnedIndex) process.env.OPENLORE_PINNED_INDEX = '1';
-  const cwd = process.cwd();
-  // `--watch <dir>` is an instruction to WRITE: the watcher re-indexes into
-  // `<dir>/.openlore/analysis`. Left out of the perimeter it produced a command at
-  // war with itself — the watcher writing where tool calls were refused. So the
-  // watched directory joins the roots when they are implicit, and must be inside
-  // them when they were given explicitly (an operator who names both and means two
-  // different places has made a mistake worth hearing about at startup).
-  const watchDir = options.watch ? nodeResolve(options.watch) : null;
-  const explicitRead = options.root && options.root.length > 0 ? options.root : null;
-  if (explicitRead && watchDir && !isPathWithinRoots(watchDir, explicitRead)) {
-    throw new Error(
-      `openlore mcp --watch ${watchDir}: наблюдаемый каталог обязан лежать внутри корней чтения ` +
-      `(${explicitRead.join(', ')}) — вотчер пишет в него индекс. Добавьте его в --root или уберите --watch.`
-    );
-  }
-  const readRoots = explicitRead ?? (watchDir && !isPathWithinRoots(watchDir, [cwd]) ? [cwd, watchDir] : [cwd]);
-  // Write default: own repository, never neighbours (see above). The watched
-  // directory is added because watching IS an explicit instruction to write there —
-  // that is stated intent, not writability by implication.
-  const implicitWrite = [
-    ...(isPathWithinRoots(cwd, readRoots) ? [cwd] : []),
-    ...(watchDir && isPathWithinRoots(watchDir, readRoots) ? [watchDir] : []),
-  ];
-  const writeRoots = options.writeRoot && options.writeRoot.length > 0 ? options.writeRoot : implicitWrite;
-  configureRootAllowlist({ readRoots, writeRoots });
+  // The composition itself lives in `serverRoots`: `doctor --index-only` judges the
+  // index this server will serve and must apply the very same perimeter (D15).
+  configureRootAllowlist(serverRoots(process.cwd(), options));
   // A shared `openlore serve` daemon has no perimeter of its own and is discovered
   // through a file the agent can write (see `resolveDaemon`). Spawning one from a
   // perimeter-bearing server would export the whole tool surface past the boundary,
@@ -1935,6 +1915,62 @@ function applyRootAllowlist(options: McpServerOptions): void {
     process.stderr.write(`openlore MCP: периметр — чтение [${st.readRoots.join(', ')}], ${w}\n`);
   }
 }
+
+/** Search-index fields of a telemetry line, plus how much of the search the call lost. */
+interface SearchIndexState {
+  index_mode: IndexCapability['mode'];
+  index_reason: string | null;
+  /** 'unavailable' — every lane the call searched is; 'partial' — some lane is, another answered. */
+  degraded: 'unavailable' | 'partial' | null;
+}
+
+/**
+ * Search-index state a search tool's result reports, for telemetry (PDLC-2785, D11).
+ *
+ * Search handlers answer an unavailable index with an ordinary result that carries
+ * the reason (`mode: 'unavailable'`), not by throwing: the agent keeps the lanes that
+ * still work. Telemetry therefore reads the state from the result; otherwise the call
+ * is logged as a successful empty search, indistinguishable from "nothing matched".
+ *
+ * The lane a tool answers from: orient — its code lane; search_code — its index, or
+ * the code lane it fell back from to literal text; suggest_insertion_points and
+ * search_specs — their index.
+ * Several lanes searched as equals: search_unified — its lanes; the tools that search
+ * through orient, with their lanes attached beside the result by `withSearchLanes`,
+ * never inside it (their response is model input): generate_change_proposal — orient's
+ * code lane and its own spec search; annotate_story — orient's code lane;
+ * working_set_context — one orient per target. An unavailable lane is reported (its
+ * mode and reason) even when another answered — `degraded: 'partial'` — and otherwise
+ * the weakest answering lane, so a degraded answer shows. Not a search result → null,
+ * and the telemetry line keeps its former shape.
+ */
+function searchIndexState(tool: string, result: unknown): SearchIndexState | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as { index?: unknown; indexes?: Record<string, unknown>; indexDiagnostics?: { functions?: unknown } };
+  const lane = (value: unknown): IndexCapability | null =>
+    value && typeof value === 'object' && typeof (value as IndexCapability).mode === 'string' ? value as IndexCapability : null;
+  const state = (c: IndexCapability, degraded: SearchIndexState['degraded']): SearchIndexState =>
+    ({ index_mode: c.mode, index_reason: c.reason?.code ?? null, degraded });
+  const single = (c: IndexCapability | null): SearchIndexState | null =>
+    c ? state(c, c.mode === 'unavailable' ? 'unavailable' : null) : null;
+  const several = (values: unknown[]): SearchIndexState | null => {
+    const lanes = values.map(lane).filter((c): c is IndexCapability => c !== null);
+    const down = lanes.find(c => c.mode === 'unavailable');
+    if (down) return state(down, lanes.every(c => c.mode === 'unavailable') ? 'unavailable' : 'partial');
+    const weakest = lanes.find(c => c.mode === 'text') ?? lanes[0];
+    return weakest ? state(weakest, null) : null;
+  };
+  if (tool === 'orient') return single(lane(r.indexes?.functions));
+  if (tool === 'search_unified') return several(Object.values(r.indexes ?? {}));
+  if (tool === 'generate_change_proposal' || tool === 'annotate_story' || tool === 'working_set_context') {
+    return several(searchLanesOf(result) ?? []);
+  }
+  return single(lane(r.index) ?? lane(r.indexDiagnostics?.functions));
+}
+
+/** The two fields a telemetry line carries; `degraded` speaks through `outcome` instead. */
+const indexFields = (s: SearchIndexState | null) =>
+  s ? { index_mode: s.index_mode, index_reason: s.index_reason } : {};
 
 /**
  * Собрать настроенный openlore MCP Server (ТРАНСПОРТ-АГНОСТИЧНО): те же tool-хендлеры, что у stdio.
@@ -2237,6 +2273,7 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
             files: Array.isArray(r['relevantFiles']) ? r['relevantFiles'].length : 0,
             spec_domains: Array.isArray(r['specDomains']) ? r['specDomains'].length : 0,
             insertion_points: Array.isArray(r['insertionPoints']) ? r['insertionPoints'].length : 0,
+            ...indexFields(searchIndexState(name, result)),
           });
         }
       })(), name);
@@ -2267,10 +2304,13 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
       }
 
       const { text, truncated } = capStructuredResult(result, MCP_TOOL_MAX_BYTES);
+      const searchState = searchIndexState(name, result);
 
       emit(directory, 'mcp', {
         event: 'tool_call', tool: name, ms: Date.now() - _t0, agent: agentName, agent_version: agentVersion,
-        bytes: Buffer.byteLength(text, 'utf8'), outcome: truncated ? 'truncated' : 'ok',
+        bytes: Buffer.byteLength(text, 'utf8'),
+        outcome: searchState?.degraded ?? (truncated ? 'truncated' : 'ok'),
+        ...indexFields(searchState),
         panic_level: tracker?.panicLevel ?? 0,
         panic_score: tracker?.panicScore ?? 0,
       });

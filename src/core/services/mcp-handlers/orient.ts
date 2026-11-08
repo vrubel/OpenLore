@@ -160,6 +160,49 @@ interface InlineSpec {
   content: string;
 }
 
+/**
+ * Why an orient result carries no code context, or null when its code search ran.
+ *
+ * Orient reports an unavailable code index as an ordinary result — empty lists and
+ * `indexes.functions.mode: 'unavailable'` with the reason — so that its spec and
+ * structural lanes still reach the agent. Callers that used to test `error` alone
+ * read such a result as a clean, merely empty orientation (PDLC-2785, D12). This is
+ * the one rule for both signals: an argument refusal (`error`) and an unavailable
+ * code index.
+ */
+export function orientUnavailableReason(result: {
+  error?: string;
+  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
+}): string | null {
+  if (result.error) return result.error;
+  const functions = result.indexes?.functions;
+  if (functions?.mode !== 'unavailable') return null;
+  return functions.reason?.message ?? 'The code search index is unavailable.';
+}
+
+/**
+ * Search lanes a tool's result was built from, kept OFF the result (PDLC-2785, D11).
+ *
+ * Tools that search through orient (generate_change_proposal, annotate_story,
+ * working_set_context) must let MCP telemetry see orient's code-lane state, but their
+ * response is model input and must not change. A WeakMap keyed by the result object
+ * is invisible to `JSON.stringify` (the MCP response is the serialized result) and
+ * dies with the object. The serve daemon returns a parsed copy, so a call delegated
+ * there carries no lanes and is logged as before.
+ */
+const searchLanes = new WeakMap<object, IndexCapability[]>();
+
+/** Attach the lanes `result` was searched with; returns `result` unchanged. */
+export function withSearchLanes<T extends object>(result: T, lanes: Array<IndexCapability | null | undefined>): T {
+  searchLanes.set(result, lanes.filter((c): c is IndexCapability => c != null));
+  return result;
+}
+
+/** The lanes attached by {@link withSearchLanes}, or undefined. */
+export function searchLanesOf(result: unknown): IndexCapability[] | undefined {
+  return result !== null && typeof result === 'object' ? searchLanes.get(result) : undefined;
+}
+
 // ============================================================================
 // HANDLER
 // ============================================================================

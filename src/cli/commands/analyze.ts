@@ -438,7 +438,10 @@ After analysis, run 'openlore generate' to create OpenSpec files.
       // ========================================================================
       if (opts.reindexSpecs) {
         await ensureOutputDir(outputPath);
-        await runSpecIndexing(rootPath, outputPath, openloreConfig);
+        // Same anchor as runEmbedStep: a spec generation published without the
+        // analysis fingerprint is refused by the pinned reader (PDLC-2785, D14).
+        const { publishedAnalysisFingerprint } = await import('../../core/analyzer/vector-store.js');
+        await runSpecIndexing(rootPath, outputPath, openloreConfig, false, publishedAnalysisFingerprint(outputPath));
         return;
       }
 
@@ -918,7 +921,12 @@ async function runEmbedStep(
         );
       } catch (buildErr) {
         if (embedSvc) {
-          console.log(`    ⚠ Embedding failed (${(buildErr as Error).message}) — building keyword (BM25) index instead.`);
+          // A store that refused the new generation is not an embedding failure.
+          const { IndexPublicationError } = await import('../../core/analyzer/vector-store.js');
+          const failure = buildErr instanceof IndexPublicationError
+            ? `Publishing the semantic search index failed (${(buildErr.cause as Error)?.message ?? buildErr.message})`
+            : `Embedding failed (${(buildErr as Error).message})`;
+          console.log(`    ⚠ ${failure} — building keyword (BM25) index instead.`);
           result = await VectorIndex.build(
             outputPath, cg.nodes, sigs, hubIds, entryIds, null, fileContents,
             /* incremental */ false, analysisFingerprint,

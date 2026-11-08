@@ -83,9 +83,41 @@ export interface IndexIssue {
   message: string;
 }
 
+export type EmbeddingModelMatch = 'same' | 'different' | 'unknown';
+
+/**
+ * The embedding-model comparison shared by the index writer and the reader. A name
+ * missing on either side is unknown (the distributed embedder carries its own
+ * model, `EMBEDDER_URL` without `EMBED_MODEL`). For the reader unknown is not
+ * different: the query vector's dimension is still checked. The writer is stricter
+ * — see embeddingVectorsReusable().
+ */
+export function embeddingModelMatch(stored: string | null | undefined, configured: string | null | undefined): EmbeddingModelMatch {
+  if (!stored || !configured) return 'unknown';
+  return stored === configured ? 'same' : 'different';
+}
+
+/**
+ * Writer rule: stored vectors may be kept and mixed with new ones only from the
+ * same model, or when neither side names one (the same unnamed embedder). A name
+ * on one side only proves nothing, and keeping those vectors would record them
+ * under a model that did not produce them.
+ */
+export function embeddingVectorsReusable(stored: string | null | undefined, configured: string | null | undefined): boolean {
+  return embeddingModelMatch(stored, configured) === 'same' || (!stored && !configured);
+}
+
 export class IndexUnavailable extends Error {
   constructor(readonly code: IndexIssue['code'], message: string, readonly backend: BackendKind | null = null) {
     super(message);
+  }
+}
+
+/** A new search generation could not be stored; the published generation stays current. */
+export class IndexPublicationError extends Error {
+  constructor(cause: unknown) {
+    super('Publishing the search index failed: ' + (cause instanceof Error ? cause.message : String(cause)), { cause });
+    this.name = 'IndexPublicationError';
   }
 }
 
@@ -188,10 +220,13 @@ function readLegacyMeta(db: string, table: IndexTable): { dim: number; model: st
   return { dim: meta.dim, model: meta.hasEmbeddings ? meta.model || null : null };
 }
 
-function localKey(db: string, table: string, kind: 'file' | 'lance'): string {
-  const path = kind === 'file' ? filePath(db, table) : lancePath(db, table);
+function statKey(path: string): number[] {
   const stat = statSync(assertPathAllowed(path, 'read'));
-  return JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
+}
+
+function localKey(db: string, table: string, kind: 'file' | 'lance'): string {
+  return JSON.stringify(statKey(kind === 'file' ? filePath(db, table) : lancePath(db, table)));
 }
 
 function localBackend(db: string, table: string, kind: 'file' | 'lance', expected?: Descriptor): FileBackend | LanceBackend {
@@ -252,7 +287,11 @@ export async function openStoredVectorIndex(
         throw new IndexUnavailable('collection-binding-mismatch', 'The legacy Qdrant vector schema differs from its index metadata.', kind);
       }
       const identity = { table, generation: null, source_sha256: null, model: meta?.model ?? null, dim };
-      return { backend: remote, kind, identity, cacheKey: randomUUID() };
+      // No generation proves this collection unchanged. A legacy build rewrites the
+      // marker when it finishes and changes the point count while it runs, so the
+      // marker's stat and the reported point count are a cheap signal to reload on.
+      const state = [name, statKey(markerPath(db, table)), remote.pointsCount, dim, meta];
+      return { backend: remote, kind, identity, cacheKey: 'legacy:qdrant:' + JSON.stringify(state) };
     }
     if (!file && !lance) {
       throw new IndexUnavailable('missing-index', 'No saved search index for this table. Run OpenLore analysis to build it.');
@@ -306,6 +345,19 @@ export async function publishVectorIndex(
     throw new IndexUnavailable('index-invalid', 'A pinned index reader cannot publish search data.');
   }
   db = assertPathAllowed(db, 'write');
+  // One record per id: Qdrant keeps one point per id, so the count and the source
+  // digest must describe the set every backend stores. An exact repeat is stored
+  // once; two different records with one id are a producer error, refused loudly
+  // rather than losing one of them.
+  const byId = new Map<string, VectorRecord>();
+  for (const row of records) {
+    const prior = byId.get(row.id);
+    if (!prior) byId.set(row.id, row);
+    else if (JSON.stringify(prior) !== JSON.stringify(row)) {
+      throw new IndexPublicationError(new Error(`Two different search records share the id "${row.id}"; ids must be unique before publication.`));
+    }
+  }
+  records = [...byId.values()];
   const dim = records[0]?.vector?.length ?? 0;
   if (records.some(row => (row.vector?.length ?? 0) !== dim || row.vector?.some(value => !Number.isFinite(value)))) {
     throw new IndexUnavailable('embedding-mismatch', 'Cannot publish a search index with mixed or invalid vector dimensions.');
@@ -328,9 +380,11 @@ export async function publishVectorIndex(
   const target = descriptorPath(db, table);
   const tmp = target + '.' + descriptor.generation + '.tmp';
   mkdirSync(db, { recursive: true });
+  let remote: QdrantBackend | null = null;
   try {
     if (backend === 'qdrant') {
-      await new QdrantBackend(collection(descriptor), descriptor).build(records);
+      remote = new QdrantBackend(collection(descriptor), descriptor);
+      await remote.build(records);
     } else {
       const storage = localTable(descriptor);
       const store = backend === 'file' ? new FileBackend(db, storage) : new LanceBackend(db, storage);
@@ -341,7 +395,12 @@ export async function publishVectorIndex(
     renameSync(tmp, target);
   } catch (error) {
     discardLocalGeneration(db, descriptor);
-    throw error;
+    // This publication's own collection: its name is unique to the new generation,
+    // so deleting it is safe even when Qdrant created it without confirming (a lost
+    // or timed-out answer); a missing collection is fine. The published generation
+    // is untouched, and a failed cleanup must not mask the cause.
+    if (remote) await remote.drop().catch(() => {});
+    throw new IndexPublicationError(error);
   } finally {
     try { unlinkSync(tmp); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -578,6 +637,8 @@ const RECORD_FIELD = '_openlore_record_sha256';
 
 class QdrantBackend implements VectorBackend {
   readonly proof: string | null;
+  /** `points_count` from the last collection info read by verify(). */
+  pointsCount: unknown = null;
   private readonly url: string;
   private readonly base: string;
 
@@ -654,6 +715,7 @@ class QdrantBackend implements VectorBackend {
       expected ? this.req('POST', '/points/count', { exact: true }, signal, true) : null,
       expected ? this.req('POST', '/points/scroll', { limit: 1, with_payload: [PROOF_FIELD], with_vector: false }, signal, true) : null,
     ]);
+    this.pointsCount = info?.points_count ?? null;
     const vectors = info?.config?.params?.vectors;
     const dim = vectors?.size;
     if (!Number.isSafeInteger(dim) || dim <= 0 || vectors.distance !== 'Cosine' ||
@@ -682,6 +744,11 @@ class QdrantBackend implements VectorBackend {
       if (result.status !== 'completed') throw new IndexUnavailable('index-invalid', 'Qdrant did not confirm the new index batch.', 'qdrant');
     }
     await this.verify();
+  }
+
+  /** Delete this generation's collection — only for a publication that never completed. */
+  async drop(): Promise<void> {
+    await this.req('DELETE');
   }
 
   private row(point: any): Record<string, unknown> {

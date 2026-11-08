@@ -25,7 +25,10 @@ vi.mock('./utils.js', async () => {
   };
 });
 
-vi.mock('./orient.js', () => ({
+// Only the handler is stubbed: the rule that reads its result (orientUnavailableReason)
+// stays the real one, so these tests and the real-orient ones judge the same code.
+vi.mock('./orient.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./orient.js')>(),
   handleOrient: vi.fn(async () => ({
     relevantFunctions: [],
     specDomains: [],

@@ -321,7 +321,8 @@ export class SpecVectorIndex {
     // Parse all specs into records (without vectors)
     const records: Omit<SpecRecord, 'vector'>[] = [];
 
-    for (const specFile of specFiles) {
+    // Sorted, so a repeated id below always gets the same suffix.
+    for (const specFile of [...specFiles].sort()) {
       const domain = basename(dirname(specFile));
       let markdown: string;
       try {
@@ -362,6 +363,18 @@ export class SpecVectorIndex {
 
     if (records.length === 0) {
       throw new Error('No spec sections could be parsed');
+    }
+
+    // One record per id, so no section is lost at publication. Ids repeat when
+    // non-Latin H2 headings all slug to an empty section, requirements share a
+    // name, or ADRs share a number: the first keeps its id, each repeat gets the
+    // next free `#<n>`. An id that does not repeat is unchanged.
+    const taken = new Set<string>();
+    for (const record of records) {
+      let id = record.id;
+      for (let n = 2; taken.has(id); n++) id = `${record.id}#${n}`;
+      taken.add(id);
+      record.id = id;
     }
 
     const dbPath = join(outputDir, DB_FOLDER);

@@ -233,6 +233,8 @@ export class McpWatcher {
   private embedTimer?: ReturnType<typeof setTimeout>;
   private embedRunning = false;
   private lastEmbedContext?: CachedContext;
+  private vectorRebuild: string | null = null;      // semantic index refused an incremental update
+  private vectorPublished = false;                   // an incremental vector update was published
 
   constructor(options: McpWatcherOptions) {
     this.rootPath   = options.rootPath;
@@ -451,6 +453,33 @@ export class McpWatcher {
    * catch-up, not a cold build. Paths are ABSOLUTE (same contract as handleBatch/
    * handleDeletions). Returns the applied counts for the command summary.
    */
+  /**
+   * The cause, when the saved semantic index refused an incremental update (that
+   * update was not published; the index needs a full `analyze --embed --force`).
+   * `reindex` fails on it.
+   */
+  get vectorRebuildRequired(): string | null {
+    return this.vectorRebuild;
+  }
+
+  /** Whether this watcher published an incremental vector update (e.g. deletions). */
+  get vectorIndexPublished(): boolean {
+    return this.vectorPublished;
+  }
+
+  /**
+   * A refused vector update is an outcome, not a transient error: say it on every
+   * occurrence (not only in debug) and keep it for the caller. No retry is
+   * scheduled — the next change of a file is the next attempt.
+   */
+  private refusedVectorUpdate(err: unknown): boolean {
+    if ((err as Error | undefined)?.name !== 'VectorIndexRebuildRequired') return false;
+    const detail = (err as { detail?: unknown }).detail;
+    this.vectorRebuild = typeof detail === 'string' ? detail : (err as Error).message;
+    process.stderr.write(`[mcp-watcher] vector update refused: ${(err as Error).message}\n`);
+    return true;
+  }
+
   async reindexDelta(delta: { changed?: string[]; deleted?: string[] }): Promise<{ changed: number; deleted: number }> {
     const deleted = delta.deleted ?? [];
     const changed = delta.changed ?? [];
@@ -796,8 +825,9 @@ export class McpWatcher {
         const cfg = await readOpenLoreConfig(this.rootPath);
         embedSvc = cfg ? EmbeddingService.fromConfig(cfg) : null;
       }
-      // embedSvc may be null: updateFiles then refreshes the BM25-only corpus
-      // rather than re-embedding, keeping the keyword index live in watch mode.
+      // embedSvc may be null: updateFiles then refreshes a BM25-only corpus,
+      // keeping the keyword index live in watch mode; a semantic index it cannot
+      // keep valid is left unchanged (VectorIndexRebuildRequired, see below).
 
       const changedFilePaths = new Set(changedFiles.map((f) => f.rel));
       const fileContents = new Map(changedFiles.map((f) => [f.rel, f.content]));
@@ -847,6 +877,7 @@ export class McpWatcher {
         fileContents,
         await computeProjectFingerprint(this.rootPath),
       );
+      this.vectorPublished = true;
 
       if (this.debug) {
         process.stderr.write(
@@ -856,6 +887,7 @@ export class McpWatcher {
         );
       }
     } catch (err) {
+      if (this.refusedVectorUpdate(err)) return;
       process.stderr.write(`[mcp-watcher] embed error: ${(err as Error).message}\n`);
     }
   }
@@ -1039,9 +1071,12 @@ export class McpWatcher {
           this.outputPath, [], new Set(rels), context?.signatures ?? [],
           new Set(), new Set(), undefined, undefined, await fingerprint(),
         );
+        this.vectorPublished = true;
       }
     } catch (err) {
-      process.stderr.write(`[mcp-watcher] delete (vector) error: ${(err as Error).message}\n`);
+      if (!this.refusedVectorUpdate(err)) {
+        process.stderr.write(`[mcp-watcher] delete (vector) error: ${(err as Error).message}\n`);
+      }
     }
 
     // 5. Dependency graph — remove the deleted nodes and every edge touching them.

@@ -183,6 +183,48 @@ export function isPathWithinRoots(candidate: string, roots: string[]): boolean {
 }
 
 /**
+ * The perimeter an openlore server process declares from its flags and its cwd.
+ *
+ * ONE composition for every process that judges paths the way the MCP server does:
+ * `openlore mcp` itself, and `doctor --index-only`, whose answer ("is search usable
+ * here?") is a statement about that server. Two compositions drift: doctor once
+ * declared no perimeter at all, so a `.openlore` symlinked out of the roots read as
+ * "keyword search" while every MCP search was refused (PDLC-2785, D15).
+ *
+ * No flags ⇒ read `[cwd]`, write `[cwd]` (see the file header and `applyRootAllowlist`
+ * in mcp.ts for why the write default is never the neighbours).
+ */
+export function serverRoots(
+  cwd: string,
+  flags: { root?: string[]; writeRoot?: string[]; watch?: string } = {},
+): { readRoots: string[]; writeRoots: string[] } {
+  // `--watch <dir>` is an instruction to WRITE: the watcher re-indexes into
+  // `<dir>/.openlore/analysis`. Left out of the perimeter it produced a command at
+  // war with itself — the watcher writing where tool calls were refused. So the
+  // watched directory joins the roots when they are implicit, and must be inside
+  // them when they were given explicitly (an operator who names both and means two
+  // different places has made a mistake worth hearing about at startup).
+  const watchDir = flags.watch ? resolve(flags.watch) : null;
+  const explicitRead = flags.root && flags.root.length > 0 ? flags.root : null;
+  if (explicitRead && watchDir && !isPathWithinRoots(watchDir, explicitRead)) {
+    throw new Error(
+      `openlore mcp --watch ${watchDir}: наблюдаемый каталог обязан лежать внутри корней чтения ` +
+      `(${explicitRead.join(', ')}) — вотчер пишет в него индекс. Добавьте его в --root или уберите --watch.`
+    );
+  }
+  const readRoots = explicitRead ?? (watchDir && !isPathWithinRoots(watchDir, [cwd]) ? [cwd, watchDir] : [cwd]);
+  // Write default: own repository, never neighbours. The watched directory is added
+  // because watching IS an explicit instruction to write there — that is stated
+  // intent, not writability by implication.
+  const implicitWrite = [
+    ...(isPathWithinRoots(cwd, readRoots) ? [cwd] : []),
+    ...(watchDir && isPathWithinRoots(watchDir, readRoots) ? [watchDir] : []),
+  ];
+  const writeRoots = flags.writeRoot && flags.writeRoot.length > 0 ? flags.writeRoot : implicitWrite;
+  return { readRoots, writeRoots };
+}
+
+/**
  * Declare the perimeter. Called ONCE, at MCP server start, before any request is
  * served. Fails loudly rather than degrading: a root that does not exist, or a
  * write root outside every read root, is an operator mistake that must surface at

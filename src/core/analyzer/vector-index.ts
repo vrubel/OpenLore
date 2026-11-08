@@ -16,13 +16,17 @@
  *   const results = await VectorIndex.search(outputDir, "authenticate user with JWT", embedSvc);
  */
 
-import { writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { FunctionNode } from './call-graph.js';
 import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { getSkeletonContent, isSkeletonWorthIncluding } from './code-shaper.js';
-import { hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex, type VectorBackend, type VectorRecord } from './vector-store.js';
+import {
+  IndexPublicationError, embeddingVectorsReusable, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex,
+  type IndexIdentity, type VectorBackend, type VectorRecord,
+} from './vector-store.js';
 import { searchVector, type SearchStatus } from './index-capabilities.js';
 
 // ============================================================================
@@ -83,6 +87,14 @@ export interface VectorIndexMeta {
 async function writeMeta(outputDir: string, meta: VectorIndexMeta): Promise<void> {
   await writeFile(join(outputDir, META_FILE), JSON.stringify(meta, null, 2) + '\n', 'utf-8');
 }
+
+/**
+ * Lag marker, sibling to the meta sidecar: an incremental update was refused, so
+ * the graph holds changes the semantic index lacks. Graph hashes are already
+ * stored, so a repeated incremental pass would not retry those files; the marker
+ * keeps every `reindex` failing until a full build() removes it.
+ */
+const BEHIND_FILE = 'vector-index-behind.json';
 
 /** Convert a raw LanceDB row to a FunctionRecord (without the vector field). */
 function rowToRecord(row: Record<string, unknown>): Omit<FunctionRecord, 'vector'> {
@@ -247,6 +259,47 @@ function findSignatureEntry(
 // VECTOR INDEX
 // ============================================================================
 
+/**
+ * The saved semantic function index cannot take this incremental update without
+ * dropping or mixing vectors. Nothing was published for this update; a full
+ * analysis rebuilds the index. `detail` is the cause alone, `name` identifies the
+ * error across module boundaries.
+ */
+export class VectorIndexRebuildRequired extends Error {
+  static readonly recovery = 'openlore analyze --embed --force';
+  constructor(
+    readonly reason: 'legacy-index' | 'no-embedder' | 'model-differs' | 'dimension-differs' | 'vectors-behind'
+      | 'repeated-ids' | 'publication-failed',
+    readonly detail: string,
+  ) {
+    super(`${detail} Nothing was published for this update; rebuild the index with \`${VectorIndexRebuildRequired.recovery}\`.`);
+    this.name = 'VectorIndexRebuildRequired';
+  }
+}
+
+/**
+ * The one rule for keeping a saved semantic index valid under incremental updates,
+ * shared by updateFiles() and the `reindex` preflight. `adding`: new or changed
+ * records will need vectors (a pure deletion needs no embedder).
+ */
+function incrementalUpdateBlocker(
+  identity: IndexIdentity, embedSvc: EmbeddingService | null | undefined, adding: boolean,
+): VectorIndexRebuildRequired | null {
+  if (identity.dim === 0) return null;
+  if (!identity.generation) {
+    return new VectorIndexRebuildRequired('legacy-index', 'The saved semantic index was written by an older OpenLore and has no publication generation.');
+  }
+  if (!adding) return null;
+  if (!embedSvc) {
+    return new VectorIndexRebuildRequired('no-embedder', 'No embedding service is configured for the saved semantic index.');
+  }
+  if (!embeddingVectorsReusable(identity.model, embedSvc.modelName)) {
+    const name = (model: string | null | undefined) => model ? `"${model}"` : 'an unnamed model';
+    return new VectorIndexRebuildRequired('model-differs', `The saved semantic index was built with ${name(identity.model)}, the configured embedder uses ${name(embedSvc.modelName)}.`);
+  }
+  return null;
+}
+
 export class VectorIndex {
   /**
    * Build (or rebuild) the vector index from call graph nodes + signatures.
@@ -315,9 +368,12 @@ export class VectorIndex {
     for (const fsm of signatures) {
       for (const entry of fsm.entries) {
         const syntheticId = `${fsm.path}::${entry.name}`;
-        if (nodeIds.has(syntheticId)) continue; // already covered by call graph
+        // Already covered by the call graph or by an earlier entry of the same
+        // name (`export const User` + `export type User`): one record per id.
+        if (nodeIds.has(syntheticId)) continue;
         // Skip if any call graph node from this file matches the name
         if (nodes.some(n => n.filePath === fsm.path && n.name === entry.name)) continue;
+        nodeIds.add(syntheticId);
         const sig = entry.signature ?? '';
         const doc = entry.docstring ?? '';
         candidates.push({
@@ -344,15 +400,16 @@ export class VectorIndex {
         hasEmbeddings: false, dim: 0, model: null,
         builtAt: new Date().toISOString(), schemaVersion: META_SCHEMA_VERSION,
       });
+      await rm(join(outputDir, BEHIND_FILE), { force: true });   // the index now matches the analysis
       _bm25Cache.delete(dbPath);
       return { embedded: 0, reused: 0, total: candidates.length, hasEmbeddings: false };
     }
 
     const cachedVectors = new Map<string, number[]>();
-    if (incremental && embedSvc.modelName && VectorIndex.exists(outputDir)) {
+    if (incremental && VectorIndex.exists(outputDir)) {
       try {
         const existing = await openStoredVectorIndex(dbPath, TABLE_NAME);
-        if (existing.identity.generation && existing.identity.model === embedSvc.modelName) {
+        if (existing.identity.generation && embeddingVectorsReusable(existing.identity.model, embedSvc.modelName)) {
           for (const row of await existing.backend.loadAll()) {
             const vector = Array.from((row.vector ?? []) as ArrayLike<number>);
             if (vector.length === existing.identity.dim && vector.length > 0) {
@@ -425,6 +482,8 @@ export class VectorIndex {
       schemaVersion: META_SCHEMA_VERSION,
     });
 
+    await rm(join(outputDir, BEHIND_FILE), { force: true });   // the index now matches the analysis
+
     // Invalidate search caches — index was just rebuilt
     _bm25Cache.delete(dbPath);
 
@@ -449,6 +508,11 @@ export class VectorIndex {
    *    rebuilt rows.
    *  - BM25-only index: overwrite survivors + the changed files' documents and
    *    patch the cached BM25 corpus in place rather than dropping it wholesale.
+   *  - An embedded index whose vectors cannot stay valid (no publication
+   *    generation, a different model, no embedder, another dimension), an index
+   *    that still holds repeated ids from an older OpenLore, or an update whose
+   *    publication fails is not touched: VectorIndexRebuildRequired plus the
+   *    "vectors behind" marker, and a full analysis rebuilds it.
    *
    * Note: PDLC never runs watch (it re-runs a full `analyze`), so the O(corpus)
    * overwrite cost here is acceptable; the result is identical to a row-level
@@ -501,8 +565,10 @@ export class VectorIndex {
       if (!changedFilePaths.has(fsm.path)) continue;
       for (const entry of fsm.entries) {
         const syntheticId = `${fsm.path}::${entry.name}`;
+        // One record per id, as in build(): the first entry of a repeated name wins.
         if (nodeIds.has(syntheticId)) continue;
         if (nodes.some((n) => n.filePath === fsm.path && n.name === entry.name)) continue;
+        nodeIds.add(syntheticId);
         const sig = entry.signature ?? '';
         const doc = entry.docstring ?? '';
         candidates.push({
@@ -523,10 +589,26 @@ export class VectorIndex {
     }
 
     const previous = await openStoredVectorIndex(dbPath, TABLE_NAME);
+    const { model, dim } = previous.identity;
+    // A semantic index is updated only while its vectors stay valid. Otherwise nothing
+    // is published — neither a keyword-only nor a partial index — and a full analysis
+    // must rebuild it; the published index stays as it was.
+    const blocker = incrementalUpdateBlocker(previous.identity, embedSvc, candidates.length > 0);
+    if (blocker) throw await VectorIndex.refused(outputDir, blocker);
     const existingRows = await previous.backend.loadAll() as VectorRecord[];
     const survivors = existingRows.filter(row => !changedFilePaths.has(row.filePath as string));
-    const { model, dim, generation } = previous.identity;
-    const compatible = Boolean(generation && model && embedSvc?.modelName === model);
+    // An index written by v2.1.3-ru19 or earlier may hold two records with one id
+    // (`export const X` + `export type X`). The publisher refuses such pairs, so
+    // surviving repeats mark an index of the old format that only a full build
+    // can rewrite.
+    const seenIds = new Set<string>();
+    for (const row of survivors) {
+      if (seenIds.has(row.id)) {
+        throw await VectorIndex.refused(outputDir, new VectorIndexRebuildRequired('repeated-ids',
+          `The saved search index holds several records with the id "${row.id}" (written by an older OpenLore).`));
+      }
+      seenIds.add(row.id);
+    }
     const vectorsByInput = new Map(existingRows.map(row => [JSON.stringify([row.id, row.text]), row.vector]));
     let reused = 0;
     let embedded = 0;
@@ -536,11 +618,11 @@ export class VectorIndex {
       // Pure deletion can retain the surviving vectors without a model call.
       records = survivors;
       savedModel = model;
-    } else if (dim > 0 && compatible && embedSvc) {
+    } else if (dim > 0) {
       const pending = candidates.filter(row => vectorsByInput.get(JSON.stringify([row.id, row.text]))?.length !== dim);
-      const vectors = await embedSvc.embed(pending.map(row => row.text));
+      const vectors = await embedSvc!.embed(pending.map(row => row.text));
       if (vectors.length !== pending.length || vectors.some(vector => vector.length !== dim)) {
-        throw new Error('The embedding backend returned vectors incompatible with the saved index. Run OpenLore analysis to rebuild it.');
+        throw await VectorIndex.refused(outputDir, new VectorIndexRebuildRequired('dimension-differs', 'The embedding backend returned vectors that do not match the saved semantic index.'));
       }
       for (const [i, row] of pending.entries()) vectorsByInput.set(JSON.stringify([row.id, row.text]), vectors[i]);
       const changed = candidates.map(row => ({ ...row, vector: vectorsByInput.get(JSON.stringify([row.id, row.text]))! }));
@@ -549,15 +631,59 @@ export class VectorIndex {
       reused = candidates.length - embedded;
       savedModel = model;
     } else {
-      // Keep keyword navigation available without mixing vectors from different models.
+      // A keyword-only index stays keyword-only.
       records = [...survivors, ...candidates].map(row => {
         const { vector: _vector, ...text } = row as VectorRecord;
         return text as VectorRecord;
       });
     }
-    await publishVectorIndex(dbPath, TABLE_NAME, records, savedModel, analysisFingerprint);
+    try {
+      await publishVectorIndex(dbPath, TABLE_NAME, records, savedModel, analysisFingerprint);
+    } catch (error) {
+      // The graph already holds this delta and will not offer it again: a failed
+      // publication leaves the index behind, which must not read as success.
+      if (!(error instanceof IndexPublicationError)) throw error;
+      const cause = /[.!?]$/.test(error.message) ? error.message : error.message + '.';
+      throw await VectorIndex.refused(outputDir, new VectorIndexRebuildRequired('publication-failed', cause));
+    }
     _bm25Cache.delete(dbPath);
     return { embedded, reused, total: records.length, hasEmbeddings: Boolean(records[0]?.vector?.length) };
+  }
+
+  /**
+   * Preflight for `reindex`: whether the saved semantic index can be kept current
+   * with this embedder, by the same rule updateFiles() applies (null — it can). A
+   * missing or unreadable index is not judged here; updateFiles() reports it.
+   */
+  static async incrementalUpdateBlocker(
+    outputDir: string, embedSvc: EmbeddingService | null | undefined,
+  ): Promise<VectorIndexRebuildRequired | null> {
+    if (!VectorIndex.exists(outputDir)) return null;
+    const behind = join(outputDir, BEHIND_FILE);
+    if (existsSync(behind)) {
+      const earlier = await readFile(behind, 'utf-8').then(raw => String(JSON.parse(raw)?.detail ?? ''), () => '');
+      return new VectorIndexRebuildRequired('vectors-behind',
+        'An earlier incremental update could not reach the saved semantic index' + (earlier ? ` (${earlier})` : '') + ', so it lacks those changes.');
+    }
+    let identity: IndexIdentity;
+    try {
+      identity = (await openStoredVectorIndex(join(outputDir, DB_FOLDER), TABLE_NAME)).identity;
+    } catch {
+      return null;
+    }
+    return incrementalUpdateBlocker(identity, embedSvc, true);
+  }
+
+  /** Record the refusal as a lag marker, then hand it back to be thrown. */
+  private static async refused(outputDir: string, refusal: VectorIndexRebuildRequired): Promise<VectorIndexRebuildRequired> {
+    // A pinned reader writes nothing. A marker that cannot be written leaves this
+    // run's refusal loud; only the memory for later runs is lost.
+    if (process.env.OPENLORE_PINNED_INDEX !== '1') {
+      await writeFile(join(outputDir, BEHIND_FILE),
+        JSON.stringify({ reason: refusal.reason, detail: refusal.detail, at: new Date().toISOString() }) + '\n', 'utf-8',
+      ).catch(() => {});
+    }
+    return refusal;
   }
 
   /**

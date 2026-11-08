@@ -3,7 +3,7 @@ import { EmbeddingService } from './embedding-service.js';
 import { readOpenLoreConfig } from '../services/config-manager.js';
 import { openloreReadTarget } from '../services/write-target.js';
 import {
-  IndexUnavailable, indexIssue, openStoredVectorIndex,
+  IndexUnavailable, embeddingModelMatch, indexIssue, openStoredVectorIndex,
   type BackendKind, type IndexIdentity, type IndexIssue, type IndexTable, type StoredIndex,
 } from './vector-store.js';
 
@@ -34,7 +34,7 @@ export function unavailableIndex(error: unknown): IndexCapability {
 
 function available(index: StoredIndex, embedder: EmbeddingService | null | undefined): IndexCapability {
   const identity = index.identity;
-  const reason = identity.dim > 0 && (!embedder?.modelName || identity.model !== embedder.modelName)
+  const reason = identity.dim > 0 && (!embedder || embeddingModelMatch(identity.model, embedder.modelName) === 'different')
     ? { code: 'embedding-mismatch' as const, message: 'The configured embedding model is unavailable or differs from this index. Keyword search is available.' }
     : null;
   return {
@@ -88,7 +88,16 @@ export async function searchWithStatus<T>(
 const TABLES: IndexTable[] = ['functions', 'specs', 'text_lines'];
 
 export async function inspectSearchIndexes(root: string, pinned: boolean) {
-  const output = openloreReadTarget(root, 'analysis');
+  let output: string;
+  try {
+    output = openloreReadTarget(root, 'analysis');
+  } catch {
+    // Only the perimeter refuses here: `.openlore` resolves outside the declared
+    // roots, so no table is searchable through it — the same verdict the MCP server
+    // gives. Same code as a refused index path inside openStoredVectorIndex.
+    const refused = unavailableIndex(new IndexUnavailable('index-invalid', 'The saved search index lies outside the roots this server may read.'));
+    return { schema_version: 1, indexes: Object.fromEntries(TABLES.map(table => [table, refused])) };
+  }
   const signal = AbortSignal.timeout(4000);
   const embedder = await configuredEmbedder(root).catch(() => null);
   const entries = await Promise.all(TABLES.map(async table => {

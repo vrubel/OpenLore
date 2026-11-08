@@ -13,10 +13,11 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
-import { handleOrient } from './orient.js';
+import { handleOrient, orientUnavailableReason, withSearchLanes } from './orient.js';
 import { handleSearchSpecs } from './semantic.js';
 import { handleAnalyzeImpact } from './graph.js';
 import { writeTarget } from '../write-target.js';
+import type { IndexCapability } from '../../analyzer/index-capabilities.js';
 
 // ============================================================================
 // INTERNAL TYPES  (narrow slices of handler outputs we actually use)
@@ -43,6 +44,7 @@ interface OrientResult {
     score: number;
   }>;
   matchingSpecs?: Array<{ domain: string; section: string; title: string; score: number; text: string }>;
+  indexes?: { functions?: IndexCapability | null };
   error?: string;
 }
 
@@ -55,6 +57,7 @@ interface SpecSearchResult {
     text: string;
     linkedFiles?: string[];
   }>;
+  index?: IndexCapability;
   error?: string;
 }
 
@@ -67,6 +70,12 @@ interface ImpactResult {
   metrics?: { fanIn: number; fanOut: number; isHub: boolean };
   upstreamChain?: Array<{ name?: string; filePath?: string }>;
   error?: string;
+}
+
+/** `orientErrors` of both handlers: an argument refusal or an unavailable code index. */
+function orientFailures(orient: OrientResult): string[] {
+  const reason = orientUnavailableReason(orient);
+  return reason ? [reason] : [];
 }
 
 // ============================================================================
@@ -339,7 +348,8 @@ export async function handleGenerateChangeProposal(
     ? Math.max(...impacts.map(i => i.riskScore ?? 0))
     : null;
 
-  return {
+  // orient's code lane goes to telemetry beside the result, never into it (D11).
+  return withSearchLanes({
     slug: safeSlug,
     proposalPath: join('openspec', 'changes', safeSlug, 'proposal.md'),
     domainsAffected: domains,
@@ -350,9 +360,10 @@ export async function handleGenerateChangeProposal(
       ? (maxRisk < 40 ? 'low' : maxRisk < 70 ? 'medium' : maxRisk < 85 ? 'high' : 'critical')
       : 'unknown',
     nextStep: `Review and complete openspec/changes/${safeSlug}/proposal.md, then run: openspec specs ${safeSlug}`,
-    orientErrors: orient.error ? [orient.error] : [],
+    orientErrors: orientFailures(orient),
     specSearchErrors: specSearch.error ? [specSearch.error] : [],
-  };
+    // Two lanes: orient's code lane and this tool's own spec search (D11).
+  }, [orient.indexes?.functions, specSearch.index]);
 }
 
 // ============================================================================
@@ -525,7 +536,7 @@ export async function handleAnnotateStory(
     : null;
   const domains = (orient.specDomains ?? []).map(d => d.domain);
 
-  return {
+  return withSearchLanes({
     storyFile: storyFilePath,
     domainsAffected: domains,
     functionsFound: (orient.relevantFunctions ?? []).length,
@@ -536,6 +547,6 @@ export async function handleAnnotateStory(
       : maxRisk < 85 ? 'high'
       : 'critical',
     blocked: maxRisk !== null && maxRisk >= 70,
-    orientErrors: orient.error ? [orient.error] : [],
-  };
+    orientErrors: orientFailures(orient),
+  }, [orient.indexes?.functions]);
 }
