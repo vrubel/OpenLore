@@ -110,3 +110,54 @@ describe('D3: one record per id before a Qdrant publication', () => {
     expect(rows.find(row => row.id === 'a')?.text).toBe('second a');
   });
 });
+
+describe('D5: a failed publication removes its own unpublished Qdrant collection', () => {
+  const records = (label: string): VectorRecord[] => [
+    { id: 'a', text: label + ' a', vector: [1, 0, 0, 0] },
+    { id: 'b', text: label + ' b', vector: [0, 1, 0, 0] },
+  ];
+  const published = async () => {
+    const { readFile } = await import('node:fs/promises');
+    const descriptor = JSON.parse(await readFile(join(dbPath(), 'functions.index.json'), 'utf8'));
+    return 'openlore_functions_' + String(descriptor.generation).replaceAll('-', '');
+  };
+  const failing = (method: string, suffix: string, status: number) => (call: { method: string; suffix: string }) =>
+    call.method === method && call.suffix === suffix
+      ? new Response('{"status":{"error":"unavailable"}}', { status })
+      : undefined;
+
+  it('deletes the new collection when its point upload fails; the published generation stays', async () => {
+    await publishVectorIndex(dbPath(), 'functions', records('first'), 'embed-model', null);
+    const first = await published();
+
+    qdrant.intercept = failing('PUT', '/points', 503);
+    await expect(publishVectorIndex(dbPath(), 'functions', records('second'), 'embed-model', null)).rejects.toThrow(/HTTP 503/);
+
+    expect([...qdrant.collections.keys()]).toEqual([first]);
+    expect(await published()).toBe(first);
+    qdrant.intercept = undefined;
+    const rows = await (await openStoredVectorIndex(dbPath(), 'functions')).backend.loadAll();
+    expect(rows.map(row => row.text).sort()).toEqual(['first a', 'first b']);
+  });
+
+  it('does not delete anything when the collection was never created', async () => {
+    await publishVectorIndex(dbPath(), 'functions', records('first'), 'embed-model', null);
+    const first = await published();
+
+    qdrant.intercept = failing('PUT', '', 503);
+    await expect(publishVectorIndex(dbPath(), 'functions', records('second'), 'embed-model', null)).rejects.toThrow(/HTTP 503/);
+
+    expect(qdrant.callsTo('DELETE', '')).toEqual([]);
+    expect([...qdrant.collections.keys()]).toEqual([first]);
+  });
+
+  it('keeps the original publication error when the cleanup itself fails', async () => {
+    const upload = failing('PUT', '/points', 503);
+    const cleanup = failing('DELETE', '', 500);
+    qdrant.intercept = call => upload(call) ?? cleanup(call);
+
+    const failure = publishVectorIndex(dbPath(), 'functions', records('only'), 'embed-model', null);
+    await expect(failure).rejects.toThrow(/HTTP 503/);
+    await expect(failure).rejects.not.toThrow(/HTTP 500/);
+  });
+});
