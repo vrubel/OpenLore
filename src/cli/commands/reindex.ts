@@ -40,6 +40,8 @@ import {
   ARTIFACT_FINGERPRINT,
 } from '../../constants.js';
 import { EdgeStore } from '../../core/services/edge-store.js';
+import { VectorIndex } from '../../core/analyzer/vector-index.js';
+import { configuredEmbedder } from '../../core/analyzer/index-capabilities.js';
 import { McpWatcher, SOURCE_EXTENSIONS, HTML_EXTENSIONS } from '../../core/services/mcp-watcher.js';
 import {
   getChangedFiles,
@@ -196,6 +198,20 @@ export const reindexCommand = new Command('reindex')
         }
       }
 
+      // A semantic index this run cannot keep current (no publication generation,
+      // another model, no embedder) fails every run — an empty delta included —
+      // until a full analysis rebuilds it; reporting "fresh" would hide it. Graph and
+      // signatures are still brought up to date; the marker stays. Same rule as
+      // VectorIndex.updateFiles().
+      const blocker = (options.embed ?? true)
+        ? await VectorIndex.incrementalUpdateBlocker(outputPath, await configuredEmbedder(rootPath).catch(() => null))
+        : null;
+      const failVectorIndex = (message: string, report: Record<string, unknown>): void => {
+        if (jsonOnly) process.stdout.write(JSON.stringify({ ...report, vectorIndex: 'rebuild-required' }) + '\n');
+        logger.error(`The semantic vector index was not updated: ${message}`);
+        process.exitCode = 1;
+      };
+
       // ── Compute the delta ──────────────────────────────────────────────────
       // Base ref precedence: explicit --since > last reindex marker > the commit
       // `analyze` recorded in fingerprint.json > HEAD (working-tree-only fallback).
@@ -221,6 +237,10 @@ export const reindexCommand = new Command('reindex')
       const head = await currentHead(rootPath);
 
       if (changed.length === 0 && deleted.length === 0) {
+        if (blocker) {
+          failVectorIndex(blocker.message, { base: diff.resolvedBase, changed: 0, deleted: 0 });
+          return;
+        }
         if (jsonOnly) {
           process.stdout.write(JSON.stringify({ base: diff.resolvedBase, changed: 0, deleted: 0, upToDate: true }) + '\n');
         } else {
@@ -243,18 +263,15 @@ export const reindexCommand = new Command('reindex')
       const applied = await watcher.reindexDelta({ changed, deleted });
       const durationMs = Date.now() - startTime;
 
-      // The semantic index refused the delta and was left unchanged: graph and
-      // signatures are applied, the index is not current. Fail (a control plane then
-      // runs the full analysis) and keep the marker — this run did not complete.
-      if (watcher.vectorRebuildRequired) {
-        if (jsonOnly) {
-          process.stdout.write(JSON.stringify({
-            base: diff.resolvedBase, changed: applied.changed, deleted: applied.deleted,
-            embed: options.embed ?? true, vectorIndex: 'rebuild-required', durationMs,
-          }) + '\n');
-        }
-        logger.error(`Graph and signatures were re-indexed, the semantic vector index was not: ${watcher.vectorRebuildRequired} Run "openlore analyze --embed --force".`);
-        process.exitCode = 1;
+      // The semantic index refused the delta (or was blocked up front) and was left
+      // unchanged: graph and signatures are applied, the index is not current. Fail
+      // (a control plane then runs the full analysis) and keep the marker.
+      const refusal = watcher.vectorRebuildRequired ?? blocker?.message;
+      if (refusal) {
+        failVectorIndex(refusal, {
+          base: diff.resolvedBase, changed: applied.changed, deleted: applied.deleted,
+          embed: options.embed ?? true, durationMs,
+        });
         return;
       }
 

@@ -23,7 +23,8 @@ import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { getSkeletonContent, isSkeletonWorthIncluding } from './code-shaper.js';
 import {
-  embeddingModelMatch, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex, type VectorBackend, type VectorRecord,
+  embeddingModelMatch, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex,
+  type IndexIdentity, type VectorBackend, type VectorRecord,
 } from './vector-store.js';
 import { searchVector, type SearchStatus } from './index-capabilities.js';
 
@@ -260,6 +261,28 @@ export class VectorIndexRebuildRequired extends Error {
     super(`${detail} The index was left unchanged; rebuild it with \`${VectorIndexRebuildRequired.recovery}\`.`);
     this.name = 'VectorIndexRebuildRequired';
   }
+}
+
+/**
+ * The one rule for keeping a saved semantic index valid under incremental updates,
+ * shared by updateFiles() and the `reindex` preflight. `adding`: new or changed
+ * records will need vectors (a pure deletion needs no embedder).
+ */
+function incrementalUpdateBlocker(
+  identity: IndexIdentity, embedSvc: EmbeddingService | null | undefined, adding: boolean,
+): VectorIndexRebuildRequired | null {
+  if (identity.dim === 0) return null;
+  if (!identity.generation) {
+    return new VectorIndexRebuildRequired('legacy-index', 'The saved semantic index was written by an older OpenLore and has no publication generation.');
+  }
+  if (!adding) return null;
+  if (!embedSvc) {
+    return new VectorIndexRebuildRequired('no-embedder', 'No embedding service is configured for the saved semantic index.');
+  }
+  if (embeddingModelMatch(identity.model, embedSvc.modelName) === 'different') {
+    return new VectorIndexRebuildRequired('model-differs', `The saved semantic index was built with embedding model "${identity.model}", the configured model is "${embedSvc.modelName}".`);
+  }
+  return null;
 }
 
 export class VectorIndex {
@@ -546,21 +569,12 @@ export class VectorIndex {
     }
 
     const previous = await openStoredVectorIndex(dbPath, TABLE_NAME);
-    const { model, dim, generation } = previous.identity;
+    const { model, dim } = previous.identity;
     // A semantic index is updated only while its vectors stay valid. Otherwise nothing
     // is published — neither a keyword-only nor a partial index — and a full analysis
     // must rebuild it; the published index stays as it was.
-    if (dim > 0) {
-      if (!generation) {
-        throw new VectorIndexRebuildRequired('legacy-index', 'The saved semantic index was written by an older OpenLore and has no publication generation.');
-      }
-      if (candidates.length > 0 && !embedSvc) {
-        throw new VectorIndexRebuildRequired('no-embedder', 'No embedding service is configured for the saved semantic index.');
-      }
-      if (candidates.length > 0 && embeddingModelMatch(model, embedSvc!.modelName) === 'different') {
-        throw new VectorIndexRebuildRequired('model-differs', `The saved semantic index was built with embedding model "${model}", the configured model is "${embedSvc!.modelName}".`);
-      }
-    }
+    const blocker = incrementalUpdateBlocker(previous.identity, embedSvc, candidates.length > 0);
+    if (blocker) throw blocker;
     const existingRows = await previous.backend.loadAll() as VectorRecord[];
     const survivors = existingRows.filter(row => !changedFilePaths.has(row.filePath as string));
     const vectorsByInput = new Map(existingRows.map(row => [JSON.stringify([row.id, row.text]), row.vector]));
@@ -594,6 +608,24 @@ export class VectorIndex {
     await publishVectorIndex(dbPath, TABLE_NAME, records, savedModel, analysisFingerprint);
     _bm25Cache.delete(dbPath);
     return { embedded, reused, total: records.length, hasEmbeddings: Boolean(records[0]?.vector?.length) };
+  }
+
+  /**
+   * Preflight for `reindex`: whether the saved semantic index can be kept current
+   * with this embedder, by the same rule updateFiles() applies (null — it can). A
+   * missing or unreadable index is not judged here; updateFiles() reports it.
+   */
+  static async incrementalUpdateBlocker(
+    outputDir: string, embedSvc: EmbeddingService | null | undefined,
+  ): Promise<VectorIndexRebuildRequired | null> {
+    if (!VectorIndex.exists(outputDir)) return null;
+    let identity: IndexIdentity;
+    try {
+      identity = (await openStoredVectorIndex(join(outputDir, DB_FOLDER), TABLE_NAME)).identity;
+    } catch {
+      return null;
+    }
+    return incrementalUpdateBlocker(identity, embedSvc, true);
   }
 
   /**
