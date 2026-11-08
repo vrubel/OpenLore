@@ -150,3 +150,86 @@ describe('D2: reindex on an index it cannot update semantically', () => {
     expect(existsSync(join(analysisDir, 'reindex-state.json'))).toBe(true);
   });
 });
+
+describe('D2: reindex refuses up front when the semantic index cannot be kept current', () => {
+  const RECOVERY = /openlore analyze --embed --force/;
+  const marker = () => existsSync(join(analysisDir, 'reindex-state.json'));
+
+  async function ru18Index(): Promise<void> {
+    await writeFile(join(vectorDir(), 'functions.records.json'), JSON.stringify({
+      id: 'a.ts::foo', name: 'foo', filePath: 'a.ts', className: '', language: 'TypeScript', signature: 'export function foo()',
+      docstring: '', fanIn: 0, fanOut: 0, isHub: false, isEntryPoint: false, text: 'foo', vector: [1, 0, 0, 0],
+    }) + '\n');
+    await writeFile(join(analysisDir, 'vector-index-meta.json'), JSON.stringify({ hasEmbeddings: true, dim: DIM, model: 'embed-model', builtAt: 'x', schemaVersion: 1 }));
+  }
+
+  async function generationIndex(modelName: string): Promise<void> {
+    const svc = { modelName, embed: vi.fn(async (texts: string[]) => texts.map(vector)) } as unknown as EmbeddingService;
+    const foo = {
+      id: 'a.ts::foo', name: 'foo', filePath: 'a.ts', language: 'TypeScript', isAsync: false,
+      signature: 'export function foo()', docstring: '', fanIn: 0, fanOut: 0, startIndex: 0, endIndex: 0,
+    } as FunctionNode;
+    await VectorIndex.build(analysisDir, [foo], [], new Set(), new Set(), svc);
+  }
+
+  it('ru18 semantic index, empty delta: exit 1 with the recovery command, marker and index untouched', async () => {
+    const base = await seedAnalysis();
+    await ru18Index();
+    const before = await folder();
+
+    const { exitCode, stderr } = await runReindex(['--since', base]);
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toMatch(RECOVERY);
+    expect(marker()).toBe(false);
+    expect(await folder()).toEqual(before);
+  });
+
+  it('ru18 semantic index: a repeated reindex after the refusal still fails', async () => {
+    const base = await seedAnalysis();
+    await ru18Index();
+    await commitChange();
+
+    expect((await runReindex(['--since', base])).exitCode).not.toBe(0);
+    const again = await runReindex(['--since', base]);
+
+    expect(again.exitCode).not.toBe(0);
+    expect(again.stderr).toMatch(RECOVERY);
+    expect(marker()).toBe(false);
+  });
+
+  it('index with a generation, a different configured model, empty delta: exit 1', async () => {
+    const base = await seedAnalysis();
+    await generationIndex('model-a');
+    vi.stubEnv('EMBED_MODEL', 'model-b');
+
+    const { exitCode, stderr } = await runReindex(['--since', base]);
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toMatch(RECOVERY);
+    expect(marker()).toBe(false);
+  });
+
+  it('index with a generation and vectors, no embedder configured, empty delta: exit 1', async () => {
+    const base = await seedAnalysis();
+    await generationIndex('embed-model');
+    vi.stubEnv('EMBED_BASE_URL', undefined);
+    vi.stubEnv('EMBED_MODEL', undefined);
+
+    const { exitCode, stderr } = await runReindex(['--since', base]);
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toMatch(RECOVERY);
+    expect(marker()).toBe(false);
+  });
+
+  it('control: an index with a generation of the same model, empty delta: exit 0 and the marker advances', async () => {
+    const base = await seedAnalysis();
+    await generationIndex('embed-model');
+
+    const { exitCode } = await runReindex(['--since', base]);
+
+    expect(exitCode).toBe(0);
+    expect(marker()).toBe(true);
+  });
+});
