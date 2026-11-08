@@ -1932,16 +1932,17 @@ interface SearchIndexState {
  * still work. Telemetry therefore reads the state from the result; otherwise the call
  * is logged as a successful empty search, indistinguishable from "nothing matched".
  *
- * The lane a tool answers from: orient — its code lane; the tools that search through
- * orient (generate_change_proposal, annotate_story) — orient's code lane, attached
- * beside their result by `withSearchLanes`, never inside it (their response is model
- * input); search_code — its index, or the code lane it fell back from to literal text;
- * suggest_insertion_points and search_specs — their index.
- * search_unified (its lanes) and working_set_context (one orient per target) search
- * several lanes as equals: an unavailable lane is reported (its mode and reason) even
- * when another answered — `degraded: 'partial'` — and otherwise the weakest answering
- * lane, so a degraded answer shows. Not a search result → null, and the telemetry
- * line keeps its former shape.
+ * The lane a tool answers from: orient — its code lane; search_code — its index, or
+ * the code lane it fell back from to literal text; suggest_insertion_points and
+ * search_specs — their index.
+ * Several lanes searched as equals: search_unified — its lanes; the tools that search
+ * through orient, with their lanes attached beside the result by `withSearchLanes`,
+ * never inside it (their response is model input): generate_change_proposal — orient's
+ * code lane and its own spec search; annotate_story — orient's code lane;
+ * working_set_context — one orient per target. An unavailable lane is reported (its
+ * mode and reason) even when another answered — `degraded: 'partial'` — and otherwise
+ * the weakest answering lane, so a degraded answer shows. Not a search result → null,
+ * and the telemetry line keeps its former shape.
  */
 function searchIndexState(tool: string, result: unknown): SearchIndexState | null {
   if (!result || typeof result !== 'object') return null;
@@ -1960,9 +1961,10 @@ function searchIndexState(tool: string, result: unknown): SearchIndexState | nul
     return weakest ? state(weakest, null) : null;
   };
   if (tool === 'orient') return single(lane(r.indexes?.functions));
-  if (tool === 'generate_change_proposal' || tool === 'annotate_story') return single(searchLanesOf(result)?.[0] ?? null);
   if (tool === 'search_unified') return several(Object.values(r.indexes ?? {}));
-  if (tool === 'working_set_context') return several(searchLanesOf(result) ?? []);
+  if (tool === 'generate_change_proposal' || tool === 'annotate_story' || tool === 'working_set_context') {
+    return several(searchLanesOf(result) ?? []);
+  }
   return single(lane(r.index) ?? lane(r.indexDiagnostics?.functions));
 }
 

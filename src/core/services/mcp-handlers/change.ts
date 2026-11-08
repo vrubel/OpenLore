@@ -57,6 +57,7 @@ interface SpecSearchResult {
     text: string;
     linkedFiles?: string[];
   }>;
+  index?: IndexCapability;
   error?: string;
 }
 
@@ -361,7 +362,8 @@ export async function handleGenerateChangeProposal(
     nextStep: `Review and complete openspec/changes/${safeSlug}/proposal.md, then run: openspec specs ${safeSlug}`,
     orientErrors: orientFailures(orient),
     specSearchErrors: specSearch.error ? [specSearch.error] : [],
-  }, [orient.indexes?.functions]);
+    // Two lanes: orient's code lane and this tool's own spec search (D11).
+  }, [orient.indexes?.functions, specSearch.index]);
 }
 
 // ============================================================================
