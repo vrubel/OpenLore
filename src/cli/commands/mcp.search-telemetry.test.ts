@@ -242,4 +242,27 @@ describe('openlore mcp: состояние поискового индекса �
         remediation: 'Register and `openlore analyze` at least one declared target (see `openlore spec-store status`).' },
     ]);
   }, 120_000);
+
+  // Повторный суд openlore#15, находка 1: generate_change_proposal ищет двумя
+  // полосами — orient (код) и собственный search_specs. Недоступная полоса
+  // спецификаций при ответившей полосе кода писалась как успешный вызов.
+  it('generate_change_proposal: недоступный индекс спецификаций при рабочем индексе кода различим', async () => {
+    const repo = mk('proposal-specs');
+    _resetVectorIndexCachesForTesting();
+    const built = await VectorIndex.build(join(repo, '.openlore', 'analysis'), NODES, SIGS, new Set(), new Set(), null);
+    expect(built.hasEmbeddings).toBe(false);                // полоса кода есть, полосы спецификаций нет
+    client = await connect(repo);
+
+    const res = await callJson(client, 'generate_change_proposal',
+      { directory: repo, description: 'authenticate a user', slug: 'auth-change' }) as Record<string, unknown>;
+    expect(res.functionsFound as number).toBeGreaterThan(0);
+    expect(res.specSearchErrors).toEqual([MISSING]);
+    // Ответ агенту — прежний набор полей (как на 7c17278): состояние полос в него не попадает.
+    expect(Object.keys(res).sort()).toEqual([
+      'domainsAffected', 'functionsFound', 'maxRiskScore', 'nextStep', 'orientErrors', 'proposalPath',
+      'requirementsTouched', 'riskLevel', 'slug', 'specSearchErrors',
+    ]);
+    const line = telemetry(repo, 'mcp').find(r => r.event === 'tool_call' && r.tool === 'generate_change_proposal');
+    expect(line).toMatchObject({ outcome: 'partial', index_mode: 'unavailable', index_reason: 'missing-index' });
+  }, 120_000);
 });
