@@ -261,8 +261,9 @@ function findSignatureEntry(
 
 /**
  * The saved semantic function index cannot take this incremental update without
- * dropping or mixing vectors. Nothing was published; the index is unchanged until a
- * full analysis rebuilds it. `name` identifies it across module boundaries.
+ * dropping or mixing vectors. Nothing was published for this update; a full
+ * analysis rebuilds the index. `detail` is the cause alone, `name` identifies the
+ * error across module boundaries.
  */
 export class VectorIndexRebuildRequired extends Error {
   static readonly recovery = 'openlore analyze --embed --force';
@@ -270,7 +271,7 @@ export class VectorIndexRebuildRequired extends Error {
     readonly reason: 'legacy-index' | 'no-embedder' | 'model-differs' | 'dimension-differs' | 'vectors-behind',
     readonly detail: string,
   ) {
-    super(`${detail} The index was left unchanged; rebuild it with \`${VectorIndexRebuildRequired.recovery}\`.`);
+    super(`${detail} Nothing was published for this update; rebuild the index with \`${VectorIndexRebuildRequired.recovery}\`.`);
     this.name = 'VectorIndexRebuildRequired';
   }
 }

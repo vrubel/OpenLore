@@ -40,7 +40,7 @@ import {
   ARTIFACT_FINGERPRINT,
 } from '../../constants.js';
 import { EdgeStore } from '../../core/services/edge-store.js';
-import { VectorIndex } from '../../core/analyzer/vector-index.js';
+import { VectorIndex, VectorIndexRebuildRequired } from '../../core/analyzer/vector-index.js';
 import { configuredEmbedder } from '../../core/analyzer/index-capabilities.js';
 import { McpWatcher, SOURCE_EXTENSIONS, HTML_EXTENSIONS } from '../../core/services/mcp-watcher.js';
 import {
@@ -198,17 +198,23 @@ export const reindexCommand = new Command('reindex')
         }
       }
 
-      // A semantic index this run cannot keep current (no publication generation,
-      // another model, no embedder) fails every run — an empty delta included —
-      // until a full analysis rebuilds it; reporting "fresh" would hide it. Graph and
-      // signatures are still brought up to date; the marker stays. Same rule as
-      // VectorIndex.updateFiles().
+      // A semantic index this run cannot keep current fails every run — an empty
+      // delta included — until a full analysis rebuilds it; reporting "fresh" would
+      // hide it. The preflight applies updateFiles()'s rule as if changes need
+      // vectors (no generation, another or one-sided unnamed model, no embedder),
+      // plus the lag marker an earlier refusal left. Graph and signatures are still
+      // brought up to date; the reindex marker stays.
       const blocker = (options.embed ?? true)
         ? await VectorIndex.incrementalUpdateBlocker(outputPath, await configuredEmbedder(rootPath).catch(() => null))
         : null;
-      const failVectorIndex = (message: string, report: Record<string, unknown>): void => {
-        if (jsonOnly) process.stdout.write(JSON.stringify({ ...report, vectorIndex: 'rebuild-required' }) + '\n');
-        logger.error(`The semantic vector index was not updated: ${message}`);
+      // The text says what this run did to the vector index: deletions may have been
+      // published before a change was refused.
+      const failVectorIndex = (cause: string, published: boolean, report: Record<string, unknown>): void => {
+        if (jsonOnly) process.stdout.write(JSON.stringify({ ...report, vectorIndex: 'rebuild-required', vectorIndexPublished: published }) + '\n');
+        const outcome = published
+          ? 'This run published an update of it, but cannot keep it current.'
+          : 'This run did not change it.';
+        logger.error(`The semantic vector index cannot be kept current incrementally: ${cause} ${outcome} Rebuild it with \`${VectorIndexRebuildRequired.recovery}\`.`);
         process.exitCode = 1;
       };
 
@@ -238,7 +244,7 @@ export const reindexCommand = new Command('reindex')
 
       if (changed.length === 0 && deleted.length === 0) {
         if (blocker) {
-          failVectorIndex(blocker.message, { base: diff.resolvedBase, changed: 0, deleted: 0 });
+          failVectorIndex(blocker.detail, false, { base: diff.resolvedBase, changed: 0, deleted: 0 });
           return;
         }
         if (jsonOnly) {
@@ -263,12 +269,12 @@ export const reindexCommand = new Command('reindex')
       const applied = await watcher.reindexDelta({ changed, deleted });
       const durationMs = Date.now() - startTime;
 
-      // The semantic index refused the delta (or was blocked up front) and was left
-      // unchanged: graph and signatures are applied, the index is not current. Fail
-      // (a control plane then runs the full analysis) and keep the marker.
-      const refusal = watcher.vectorRebuildRequired ?? blocker?.message;
+      // The semantic index refused part of the delta (or was blocked up front):
+      // graph and signatures are applied, the index is not current. Fail (a control
+      // plane then runs the full analysis) and keep the marker.
+      const refusal = watcher.vectorRebuildRequired ?? blocker?.detail;
       if (refusal) {
-        failVectorIndex(refusal, {
+        failVectorIndex(refusal, watcher.vectorIndexPublished, {
           base: diff.resolvedBase, changed: applied.changed, deleted: applied.deleted,
           embed: options.embed ?? true, durationMs,
         });
