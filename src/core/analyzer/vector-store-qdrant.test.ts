@@ -140,15 +140,32 @@ describe('D5: a failed publication removes its own unpublished Qdrant collection
     expect(rows.map(row => row.text).sort()).toEqual(['first a', 'first b']);
   });
 
-  it('does not delete anything when the collection was never created', async () => {
+  it('deletes its own collection when Qdrant created it but the confirmation was lost', async () => {
+    await publishVectorIndex(dbPath(), 'functions', records('first'), 'embed-model', null);
+    const first = await published();
+
+    // The server creates the collection, the client sees a gateway timeout.
+    qdrant.intercept = (call, answer) => call.method === 'PUT' && call.suffix === ''
+      ? (answer(), new Response('{"status":{"error":"gateway timeout"}}', { status: 504 }))
+      : undefined;
+    await expect(publishVectorIndex(dbPath(), 'functions', records('second'), 'embed-model', null)).rejects.toThrow(/HTTP 504/);
+
+    expect([...qdrant.collections.keys()]).toEqual([first]);
+    expect(await published()).toBe(first);
+  });
+
+  it('a create refused outright leaves only the published generation, intact', async () => {
     await publishVectorIndex(dbPath(), 'functions', records('first'), 'embed-model', null);
     const first = await published();
 
     qdrant.intercept = failing('PUT', '', 503);
     await expect(publishVectorIndex(dbPath(), 'functions', records('second'), 'embed-model', null)).rejects.toThrow(/HTTP 503/);
 
-    expect(qdrant.callsTo('DELETE', '')).toEqual([]);
+    expect(qdrant.callsTo('DELETE', '').map(call => call.collection)).not.toContain(first);
     expect([...qdrant.collections.keys()]).toEqual([first]);
+    qdrant.intercept = undefined;
+    const rows = await (await openStoredVectorIndex(dbPath(), 'functions')).backend.loadAll();
+    expect(rows.map(row => row.text).sort()).toEqual(['first a', 'first b']);
   });
 
   it('keeps the original publication error when the cleanup itself fails', async () => {

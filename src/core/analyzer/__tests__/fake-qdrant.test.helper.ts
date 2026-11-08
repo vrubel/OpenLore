@@ -10,7 +10,9 @@
  *   vi.stubEnv('QDRANT_URL', qdrant.url);
  *   vi.stubGlobal('fetch', qdrant.fetch);
  *
- * `intercept` подменяет ответ на отдельный запрос (сбой Qdrant), `fallback` —
+ * `intercept` подменяет ответ на отдельный запрос (сбой Qdrant); его второй
+ * аргумент `answer()` сначала выполняет запрос как обычно — так моделируется
+ * сервер, который сделал работу, но ответ клиенту потерян. `fallback` —
  * обработчик запросов не к Qdrant (например, к поддельному embedder).
  *
  * Имя `*.test.helper.ts`: vitest не берёт его как тест (маска `*.test.ts`), а
@@ -70,7 +72,7 @@ function cosine(a: number[], b: number[]): number {
 export class FakeQdrant {
   readonly collections = new Map<string, FakeCollection>();
   readonly calls: FakeCall[] = [];
-  intercept?: (call: FakeCall) => Response | undefined;
+  intercept?: (call: FakeCall, answer: () => Response) => Response | undefined;
   fallback?: (url: URL, init: RequestInit) => Promise<Response>;
 
   constructor(readonly url = 'http://qdrant.test') {}
@@ -102,7 +104,7 @@ export class FakeQdrant {
       body: typeof init.body === 'string' ? JSON.parse(init.body) as FakeBody : {},
     };
     this.calls.push(call);
-    const intercepted = this.intercept?.(call);
+    const intercepted = this.intercept?.(call, () => this.answer(call));
     if (intercepted) return intercepted;
     return this.answer(call);
   };
