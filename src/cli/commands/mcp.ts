@@ -1915,6 +1915,14 @@ function applyRootAllowlist(options: McpServerOptions): void {
   }
 }
 
+/** Search-index fields of a telemetry line, plus how much of the search the call lost. */
+interface SearchIndexState {
+  index_mode: IndexCapability['mode'];
+  index_reason: string | null;
+  /** 'unavailable' — every lane the call searched is; 'partial' — some lane is, another answered. */
+  degraded: 'unavailable' | 'partial' | null;
+}
+
 /**
  * Search-index state a search tool's result reports, for telemetry (PDLC-2785, D11).
  *
@@ -1925,27 +1933,34 @@ function applyRootAllowlist(options: McpServerOptions): void {
  *
  * The lane a tool answers from: orient — its code lane; search_code — its index, or
  * the code lane it fell back from to literal text; suggest_insertion_points and
- * search_specs — their index; search_unified — unavailable only when every lane it
- * consulted is, otherwise its weakest answering lane, so a degraded answer shows.
- * Not a search result → null, and the telemetry line keeps its former shape.
+ * search_specs — their index. search_unified searches several lanes as equals: an
+ * unavailable lane is reported (its mode and reason) even when another answered —
+ * `degraded: 'partial'` — and otherwise the weakest answering lane, so a degraded
+ * answer shows. Not a search result → null, and the telemetry line keeps its former shape.
  */
-function searchIndexState(tool: string, result: unknown): { index_mode: IndexCapability['mode']; index_reason: string | null } | null {
+function searchIndexState(tool: string, result: unknown): SearchIndexState | null {
   if (!result || typeof result !== 'object') return null;
   const r = result as { index?: unknown; indexes?: Record<string, unknown>; indexDiagnostics?: { functions?: unknown } };
   const lane = (value: unknown): IndexCapability | null =>
     value && typeof value === 'object' && typeof (value as IndexCapability).mode === 'string' ? value as IndexCapability : null;
-  let primary: IndexCapability | null;
-  if (tool === 'orient') {
-    primary = lane(r.indexes?.functions);
-  } else if (tool === 'search_unified') {
+  const state = (c: IndexCapability, degraded: SearchIndexState['degraded']): SearchIndexState =>
+    ({ index_mode: c.mode, index_reason: c.reason?.code ?? null, degraded });
+  const single = (c: IndexCapability | null): SearchIndexState | null =>
+    c ? state(c, c.mode === 'unavailable' ? 'unavailable' : null) : null;
+  if (tool === 'orient') return single(lane(r.indexes?.functions));
+  if (tool === 'search_unified') {
     const lanes = Object.values(r.indexes ?? {}).map(lane).filter((c): c is IndexCapability => c !== null);
-    const answered = lanes.filter(c => c.mode !== 'unavailable');
-    primary = answered.length ? answered.find(c => c.mode === 'text') ?? answered[0] : lanes[0] ?? null;
-  } else {
-    primary = lane(r.index) ?? lane(r.indexDiagnostics?.functions);
+    const down = lanes.find(c => c.mode === 'unavailable');
+    if (down) return state(down, lanes.every(c => c.mode === 'unavailable') ? 'unavailable' : 'partial');
+    const weakest = lanes.find(c => c.mode === 'text') ?? lanes[0];
+    return weakest ? state(weakest, null) : null;
   }
-  return primary ? { index_mode: primary.mode, index_reason: primary.reason?.code ?? null } : null;
+  return single(lane(r.index) ?? lane(r.indexDiagnostics?.functions));
 }
+
+/** The two fields a telemetry line carries; `degraded` speaks through `outcome` instead. */
+const indexFields = (s: SearchIndexState | null) =>
+  s ? { index_mode: s.index_mode, index_reason: s.index_reason } : {};
 
 /**
  * Собрать настроенный openlore MCP Server (ТРАНСПОРТ-АГНОСТИЧНО): те же tool-хендлеры, что у stdio.
@@ -2248,7 +2263,7 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
             files: Array.isArray(r['relevantFiles']) ? r['relevantFiles'].length : 0,
             spec_domains: Array.isArray(r['specDomains']) ? r['specDomains'].length : 0,
             insertion_points: Array.isArray(r['insertionPoints']) ? r['insertionPoints'].length : 0,
-            ...searchIndexState(name, result),
+            ...indexFields(searchIndexState(name, result)),
           });
         }
       })(), name);
@@ -2284,8 +2299,8 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
       emit(directory, 'mcp', {
         event: 'tool_call', tool: name, ms: Date.now() - _t0, agent: agentName, agent_version: agentVersion,
         bytes: Buffer.byteLength(text, 'utf8'),
-        outcome: searchState?.index_mode === 'unavailable' ? 'unavailable' : truncated ? 'truncated' : 'ok',
-        ...searchState,
+        outcome: searchState?.degraded ?? (truncated ? 'truncated' : 'ok'),
+        ...indexFields(searchState),
         panic_level: tracker?.panicLevel ?? 0,
         panic_score: tracker?.panicScore ?? 0,
       });
