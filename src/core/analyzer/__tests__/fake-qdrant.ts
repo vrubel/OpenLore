@@ -26,12 +26,24 @@ export interface FakeCollection {
   points: Map<string, FakePoint>;
 }
 
+/** Поля тел запросов QdrantBackend, которые разбирает подделка. */
+export interface FakeBody {
+  vectors?: { size: number; distance: string };
+  points?: FakePoint[];
+  vector?: number[];
+  limit?: number;
+  offset?: string | number | null;
+  with_payload?: boolean | string[];
+  with_vector?: boolean;
+  exact?: boolean;
+}
+
 export interface FakeCall {
   method: string;
   /** Путь после `/collections/<имя>`: '', '/points', '/points/count', … */
   suffix: string;
   collection: string;
-  body: any;
+  body: FakeBody;
 }
 
 const json = (status: number, body: unknown): Response =>
@@ -83,7 +95,7 @@ export class FakeQdrant {
       method: (init.method ?? 'GET').toUpperCase(),
       collection: decodeURIComponent(match[1]),
       suffix: match[2] ?? '',
-      body: typeof init.body === 'string' ? JSON.parse(init.body) : undefined,
+      body: typeof init.body === 'string' ? JSON.parse(init.body) as FakeBody : {},
     };
     this.calls.push(call);
     const intercepted = this.intercept?.(call);
@@ -96,7 +108,7 @@ export class FakeQdrant {
     const route = method + ' ' + suffix;
     if (route === 'PUT ') {
       if (collection) return json(409, { status: { error: 'Collection `' + name + '` already exists!' } });
-      this.collections.set(name, { size: body.vectors.size, distance: body.vectors.distance, points: new Map() });
+      this.collections.set(name, { size: body.vectors!.size, distance: body.vectors!.distance, points: new Map() });
       return ok(true);
     }
     if (route === 'DELETE ') return ok(this.collections.delete(name));
@@ -109,7 +121,7 @@ export class FakeQdrant {
           config: { params: { vectors: { size: collection.size, distance: collection.distance } } },
         });
       case 'PUT /points':
-        for (const point of body.points as FakePoint[]) {
+        for (const point of body.points ?? []) {
           if (point.vector.length !== collection.size) return json(400, { status: { error: 'Wrong input: vector dimension error' } });
           collection.points.set(String(point.id), point);
         }
@@ -118,9 +130,10 @@ export class FakeQdrant {
         return ok({ count: collection.points.size });
       case 'POST /points/scroll': {
         const points = sorted();
-        const start = body.offset == null ? 0 : points.findIndex(point => String(point.id) === String(body.offset));
-        const page = points.slice(Math.max(start, 0), Math.max(start, 0) + body.limit);
-        const next = points[Math.max(start, 0) + body.limit];
+        const limit = body.limit ?? 10;
+        const start = Math.max(body.offset == null ? 0 : points.findIndex(point => String(point.id) === String(body.offset)), 0);
+        const page = points.slice(start, start + limit);
+        const next = points[start + limit];
         return ok({
           points: page.map(point => ({
             id: point.id,
@@ -132,9 +145,9 @@ export class FakeQdrant {
       }
       case 'POST /points/search':
         return ok(sorted()
-          .map(point => ({ id: point.id, score: cosine(point.vector, body.vector), payload: { ...point.payload } }))
+          .map(point => ({ id: point.id, score: cosine(point.vector, body.vector ?? []), payload: { ...point.payload } }))
           .sort((a, b) => b.score - a.score)
-          .slice(0, body.limit));
+          .slice(0, body.limit ?? 10));
       default:
         return json(404, { status: { error: 'unsupported fake route ' + route } });
     }
