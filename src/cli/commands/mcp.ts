@@ -65,6 +65,7 @@ import type { EpistemicTracker } from '../../core/services/mcp-handlers/epistemi
 import type { PanicResponseMode } from '../../types/index.js';
 import { readPanicState, mutatePanicStateLocked, getPanicSignalText } from '../../core/services/mcp-handlers/panic-response.js';
 import { emit } from '../../core/services/telemetry.js';
+import type { IndexCapability } from '../../core/analyzer/index-capabilities.js';
 import { readOpenLoreConfig } from '../../core/services/config-manager.js';
 import { MCP_TOOL_MAX_BYTES } from '../../constants.js';
 import {
@@ -1937,6 +1938,38 @@ function applyRootAllowlist(options: McpServerOptions): void {
 }
 
 /**
+ * Search-index state a search tool's result reports, for telemetry (PDLC-2785, D11).
+ *
+ * Search handlers answer an unavailable index with an ordinary result that carries
+ * the reason (`mode: 'unavailable'`), not by throwing: the agent keeps the lanes that
+ * still work. Telemetry therefore reads the state from the result; otherwise the call
+ * is logged as a successful empty search, indistinguishable from "nothing matched".
+ *
+ * The lane a tool answers from: orient — its code lane; search_code — its index, or
+ * the code lane it fell back from to literal text; suggest_insertion_points and
+ * search_specs — their index; search_unified — unavailable only when every lane it
+ * consulted is, otherwise its weakest answering lane, so a degraded answer shows.
+ * Not a search result → null, and the telemetry line keeps its former shape.
+ */
+function searchIndexState(tool: string, result: unknown): { index_mode: IndexCapability['mode']; index_reason: string | null } | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as { index?: unknown; indexes?: Record<string, unknown>; indexDiagnostics?: { functions?: unknown } };
+  const lane = (value: unknown): IndexCapability | null =>
+    value && typeof value === 'object' && typeof (value as IndexCapability).mode === 'string' ? value as IndexCapability : null;
+  let primary: IndexCapability | null;
+  if (tool === 'orient') {
+    primary = lane(r.indexes?.functions);
+  } else if (tool === 'search_unified') {
+    const lanes = Object.values(r.indexes ?? {}).map(lane).filter((c): c is IndexCapability => c !== null);
+    const answered = lanes.filter(c => c.mode !== 'unavailable');
+    primary = answered.length ? answered.find(c => c.mode === 'text') ?? answered[0] : lanes[0] ?? null;
+  } else {
+    primary = lane(r.index) ?? lane(r.indexDiagnostics?.functions);
+  }
+  return primary ? { index_mode: primary.mode, index_reason: primary.reason?.code ?? null } : null;
+}
+
+/**
  * Собрать настроенный openlore MCP Server (ТРАНСПОРТ-АГНОСТИЧНО): те же tool-хендлеры, что у stdio.
  * Каждый вызов = СВЕЖЕЕ per-connection состояние (tracker/agentName/autoWatcher в замыкании) — в HTTP
  * session-режиме на каждую сессию поднимается свой Server, состояние сессий не пересекается.
@@ -2237,6 +2270,7 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
             files: Array.isArray(r['relevantFiles']) ? r['relevantFiles'].length : 0,
             spec_domains: Array.isArray(r['specDomains']) ? r['specDomains'].length : 0,
             insertion_points: Array.isArray(r['insertionPoints']) ? r['insertionPoints'].length : 0,
+            ...searchIndexState(name, result),
           });
         }
       })(), name);
@@ -2267,10 +2301,13 @@ function buildOpenloreServer(options: McpServerOptions = {}): Server {
       }
 
       const { text, truncated } = capStructuredResult(result, MCP_TOOL_MAX_BYTES);
+      const searchState = searchIndexState(name, result);
 
       emit(directory, 'mcp', {
         event: 'tool_call', tool: name, ms: Date.now() - _t0, agent: agentName, agent_version: agentVersion,
-        bytes: Buffer.byteLength(text, 'utf8'), outcome: truncated ? 'truncated' : 'ok',
+        bytes: Buffer.byteLength(text, 'utf8'),
+        outcome: searchState?.index_mode === 'unavailable' ? 'unavailable' : truncated ? 'truncated' : 'ok',
+        ...searchState,
         panic_level: tracker?.panicLevel ?? 0,
         panic_score: tracker?.panicScore ?? 0,
       });
