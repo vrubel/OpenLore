@@ -23,7 +23,7 @@ import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { getSkeletonContent, isSkeletonWorthIncluding } from './code-shaper.js';
 import {
-  embeddingModelMatch, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex,
+  embeddingVectorsReusable, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex,
   type IndexIdentity, type VectorBackend, type VectorRecord,
 } from './vector-store.js';
 import { searchVector, type SearchStatus } from './index-capabilities.js';
@@ -279,8 +279,9 @@ function incrementalUpdateBlocker(
   if (!embedSvc) {
     return new VectorIndexRebuildRequired('no-embedder', 'No embedding service is configured for the saved semantic index.');
   }
-  if (embeddingModelMatch(identity.model, embedSvc.modelName) === 'different') {
-    return new VectorIndexRebuildRequired('model-differs', `The saved semantic index was built with embedding model "${identity.model}", the configured model is "${embedSvc.modelName}".`);
+  if (!embeddingVectorsReusable(identity.model, embedSvc.modelName)) {
+    const name = (model: string | null | undefined) => model ? `"${model}"` : 'an unnamed model';
+    return new VectorIndexRebuildRequired('model-differs', `The saved semantic index was built with ${name(identity.model)}, the configured embedder uses ${name(embedSvc.modelName)}.`);
   }
   return null;
 }
@@ -393,7 +394,7 @@ export class VectorIndex {
     if (incremental && VectorIndex.exists(outputDir)) {
       try {
         const existing = await openStoredVectorIndex(dbPath, TABLE_NAME);
-        if (existing.identity.generation && embeddingModelMatch(existing.identity.model, embedSvc.modelName) !== 'different') {
+        if (existing.identity.generation && embeddingVectorsReusable(existing.identity.model, embedSvc.modelName)) {
           for (const row of await existing.backend.loadAll()) {
             const vector = Array.from((row.vector ?? []) as ArrayLike<number>);
             if (vector.length === existing.identity.dim && vector.length > 0) {
