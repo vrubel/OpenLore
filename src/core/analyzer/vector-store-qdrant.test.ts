@@ -95,19 +95,25 @@ describe('D3: one record per id before a Qdrant publication', () => {
     expect(ids).toEqual(expect.arrayContaining(['src/other.ts::other', 'src/user.ts::createUser', 'src/user.ts::User']));
   });
 
-  it('publishVectorIndex() counts and digests the same unique set it stores', async () => {
+  it('publishVectorIndex() stores an exact repeat once; count and digest agree with Qdrant', async () => {
     const records: VectorRecord[] = [
-      { id: 'a', text: 'first a', vector: [1, 0, 0, 0] },
+      { id: 'a', text: 'a', vector: [1, 0, 0, 0] },
       { id: 'b', text: 'b', vector: [0, 1, 0, 0] },
-      { id: 'a', text: 'second a', vector: [0, 0, 1, 0] },
+      { id: 'a', text: 'a', vector: [1, 0, 0, 0] },
     ];
     await publishVectorIndex(dbPath(), 'functions', records, 'embed-model', null);
 
-    const stored = await openStoredVectorIndex(dbPath(), 'functions');
-    const rows = await stored.backend.loadAll();
+    const rows = await (await openStoredVectorIndex(dbPath(), 'functions')).backend.loadAll();
     expect(rows.map(row => row.id).sort()).toEqual(['a', 'b']);
-    // The later record wins, as a Qdrant upsert of the same point would.
-    expect(rows.find(row => row.id === 'a')?.text).toBe('second a');
+  });
+
+  it('publishVectorIndex() refuses two different records with one id instead of dropping one', async () => {
+    const records: VectorRecord[] = [
+      { id: 'a', text: 'first a', vector: [1, 0, 0, 0] },
+      { id: 'a', text: 'second a', vector: [0, 0, 1, 0] },
+    ];
+    await expect(publishVectorIndex(dbPath(), 'functions', records, 'embed-model', null)).rejects.toThrow(/share the id "a"/);
+    expect(qdrant.collections.size).toBe(0);
   });
 });
 
