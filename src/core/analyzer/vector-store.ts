@@ -374,9 +374,11 @@ export async function publishVectorIndex(
     renameSync(tmp, target);
   } catch (error) {
     discardLocalGeneration(db, descriptor);
-    // Only this publication's own collection, and only once Qdrant created it; the
-    // published generation is untouched. A failed cleanup must not mask the cause.
-    if (remote?.created) await remote.drop().catch(() => {});
+    // This publication's own collection: its name is unique to the new generation,
+    // so deleting it is safe even when Qdrant created it without confirming (a lost
+    // or timed-out answer); a missing collection is fine. The published generation
+    // is untouched, and a failed cleanup must not mask the cause.
+    if (remote) await remote.drop().catch(() => {});
     throw new IndexPublicationError(error);
   } finally {
     try { unlinkSync(tmp); } catch (error) {
@@ -614,8 +616,6 @@ const RECORD_FIELD = '_openlore_record_sha256';
 
 class QdrantBackend implements VectorBackend {
   readonly proof: string | null;
-  /** Qdrant confirmed creating this generation's collection (set by build()). */
-  created = false;
   /** `points_count` from the last collection info read by verify(). */
   pointsCount: unknown = null;
   private readonly url: string;
@@ -715,7 +715,6 @@ class QdrantBackend implements VectorBackend {
     if (!descriptor) throw new Error('A Qdrant build requires a new publication generation.');
     const created = await this.req('PUT', '', { vectors: { size: descriptor.dim, distance: descriptor.distance } });
     if (created !== true) throw new IndexUnavailable('index-invalid', 'Qdrant did not create a new search generation.', 'qdrant');
-    this.created = true;
     for (let i = 0; i < records.length; i += 256) {
       const points = records.slice(i, i + 256).map(({ vector, ...payload }) => ({
         id: QdrantBackend.pid(payload.id), vector, payload: { ...payload, [PROOF_FIELD]: this.proof, [RECORD_FIELD]: sourceDigest([payload]) },
