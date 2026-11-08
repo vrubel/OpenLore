@@ -241,11 +241,26 @@ export const reindexCommand = new Command('reindex')
 
       const watcher = new McpWatcher({ rootPath, outputPath, embed: options.embed ?? true });
       const applied = await watcher.reindexDelta({ changed, deleted });
+      const durationMs = Date.now() - startTime;
+
+      // The semantic index refused the delta and was left unchanged: graph and
+      // signatures are applied, the index is not current. Fail (a control plane then
+      // runs the full analysis) and keep the marker — this run did not complete.
+      if (watcher.vectorRebuildRequired) {
+        if (jsonOnly) {
+          process.stdout.write(JSON.stringify({
+            base: diff.resolvedBase, changed: applied.changed, deleted: applied.deleted,
+            embed: options.embed ?? true, vectorIndex: 'rebuild-required', durationMs,
+          }) + '\n');
+        }
+        logger.error(`Graph and signatures were re-indexed, the semantic vector index was not: ${watcher.vectorRebuildRequired} Run "openlore analyze --embed --force".`);
+        process.exitCode = 1;
+        return;
+      }
 
       // Advance the marker to the current HEAD so the next reindex diffs from here.
       if (head) await writeState(outputPath, head);
 
-      const durationMs = Date.now() - startTime;
       if (jsonOnly) {
         process.stdout.write(JSON.stringify({
           base: diff.resolvedBase,

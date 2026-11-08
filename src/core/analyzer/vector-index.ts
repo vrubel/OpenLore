@@ -249,6 +249,19 @@ function findSignatureEntry(
 // VECTOR INDEX
 // ============================================================================
 
+/**
+ * The saved semantic function index cannot take this incremental update without
+ * dropping or mixing vectors. Nothing was published; the index is unchanged until a
+ * full analysis rebuilds it. `name` identifies it across module boundaries.
+ */
+export class VectorIndexRebuildRequired extends Error {
+  static readonly recovery = 'openlore analyze --embed --force';
+  constructor(readonly reason: 'legacy-index' | 'no-embedder' | 'model-differs' | 'dimension-differs', detail: string) {
+    super(`${detail} The index was left unchanged; rebuild it with \`${VectorIndexRebuildRequired.recovery}\`.`);
+    this.name = 'VectorIndexRebuildRequired';
+  }
+}
+
 export class VectorIndex {
   /**
    * Build (or rebuild) the vector index from call graph nodes + signatures.
@@ -454,6 +467,9 @@ export class VectorIndex {
    *    rebuilt rows.
    *  - BM25-only index: overwrite survivors + the changed files' documents and
    *    patch the cached BM25 corpus in place rather than dropping it wholesale.
+   *  - An embedded index whose vectors cannot stay valid (no publication
+   *    generation, a different model, no embedder, another dimension) is not
+   *    touched: VectorIndexRebuildRequired, and a full analysis rebuilds it.
    *
    * Note: PDLC never runs watch (it re-runs a full `analyze`), so the O(corpus)
    * overwrite cost here is acceptable; the result is identical to a row-level
@@ -530,10 +546,23 @@ export class VectorIndex {
     }
 
     const previous = await openStoredVectorIndex(dbPath, TABLE_NAME);
+    const { model, dim, generation } = previous.identity;
+    // A semantic index is updated only while its vectors stay valid. Otherwise nothing
+    // is published — neither a keyword-only nor a partial index — and a full analysis
+    // must rebuild it; the published index stays as it was.
+    if (dim > 0) {
+      if (!generation) {
+        throw new VectorIndexRebuildRequired('legacy-index', 'The saved semantic index was written by an older OpenLore and has no publication generation.');
+      }
+      if (candidates.length > 0 && !embedSvc) {
+        throw new VectorIndexRebuildRequired('no-embedder', 'No embedding service is configured for the saved semantic index.');
+      }
+      if (candidates.length > 0 && embeddingModelMatch(model, embedSvc!.modelName) === 'different') {
+        throw new VectorIndexRebuildRequired('model-differs', `The saved semantic index was built with embedding model "${model}", the configured model is "${embedSvc!.modelName}".`);
+      }
+    }
     const existingRows = await previous.backend.loadAll() as VectorRecord[];
     const survivors = existingRows.filter(row => !changedFilePaths.has(row.filePath as string));
-    const { model, dim, generation } = previous.identity;
-    const compatible = Boolean(generation && embedSvc && embeddingModelMatch(model, embedSvc.modelName) !== 'different');
     const vectorsByInput = new Map(existingRows.map(row => [JSON.stringify([row.id, row.text]), row.vector]));
     let reused = 0;
     let embedded = 0;
@@ -543,11 +572,11 @@ export class VectorIndex {
       // Pure deletion can retain the surviving vectors without a model call.
       records = survivors;
       savedModel = model;
-    } else if (dim > 0 && compatible && embedSvc) {
+    } else if (dim > 0) {
       const pending = candidates.filter(row => vectorsByInput.get(JSON.stringify([row.id, row.text]))?.length !== dim);
-      const vectors = await embedSvc.embed(pending.map(row => row.text));
+      const vectors = await embedSvc!.embed(pending.map(row => row.text));
       if (vectors.length !== pending.length || vectors.some(vector => vector.length !== dim)) {
-        throw new Error('The embedding backend returned vectors incompatible with the saved index. Run OpenLore analysis to rebuild it.');
+        throw new VectorIndexRebuildRequired('dimension-differs', 'The embedding backend returned vectors that do not match the saved semantic index.');
       }
       for (const [i, row] of pending.entries()) vectorsByInput.set(JSON.stringify([row.id, row.text]), vectors[i]);
       const changed = candidates.map(row => ({ ...row, vector: vectorsByInput.get(JSON.stringify([row.id, row.text]))! }));
@@ -556,7 +585,7 @@ export class VectorIndex {
       reused = candidates.length - embedded;
       savedModel = model;
     } else {
-      // Keep keyword navigation available without mixing vectors from different models.
+      // A keyword-only index stays keyword-only.
       records = [...survivors, ...candidates].map(row => {
         const { vector: _vector, ...text } = row as VectorRecord;
         return text as VectorRecord;
