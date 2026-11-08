@@ -161,3 +161,51 @@ describe('D5: a failed publication removes its own unpublished Qdrant collection
     await expect(failure).rejects.not.toThrow(/HTTP 500/);
   });
 });
+
+describe('D16: a legacy Qdrant index (ru18 marker, no generation) is cached while unchanged', () => {
+  const point = (name: string, vector: number[]) => ({
+    id: 'pid-' + name, vector,
+    payload: { id: `src/${name}.ts::${name}`, name, filePath: `src/${name}.ts`, language: 'TypeScript', text: `${name} handler`, fanIn: 0, fanOut: 0 },
+  });
+  const fullScans = () => qdrant.callsTo('POST', '/points/scroll').filter(call => call.body.with_vector === true).length;
+  const names = async (query: string) =>
+    (await VectorIndex.search(outputDir, query, null, { limit: 5 })).map(result => result.record.name);
+  let legacy: ReturnType<FakeQdrant['seed']>;
+  let marker: string;
+
+  beforeEach(async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { createHash } = await import('node:crypto');
+    await mkdir(dbPath(), { recursive: true });
+    const name = 'openlore_functions_' + createHash('sha1').update(dbPath()).digest('hex').slice(0, 12);
+    marker = join(dbPath(), '.qdrant-functions');
+    await writeFile(marker, name + '\n');
+    await writeFile(join(outputDir, 'vector-index-meta.json'), JSON.stringify({
+      hasEmbeddings: true, dim: DIM, model: 'embed-model', builtAt: '2026-01-01T00:00:00.000Z', schemaVersion: 1,
+    }));
+    legacy = qdrant.seed(name, DIM, [point('alpha', [1, 0, 0, 0]), point('beta', [0, 1, 0, 0])]);
+  });
+
+  it('loads the collection once for repeated searches', async () => {
+    expect((await openStoredVectorIndex(dbPath(), 'functions')).identity.generation).toBeNull();
+    expect(await names('alpha')).toEqual(['alpha']);
+    expect(await names('beta')).toEqual(['beta']);
+    expect(fullScans()).toBe(1);
+  });
+
+  it('reloads when the collection point count changes', async () => {
+    expect(await names('alpha')).toEqual(['alpha']);
+    legacy.points.set('pid-gamma', point('gamma', [0, 0, 1, 0]));
+    expect(await names('gamma')).toEqual(['gamma']);
+    expect(fullScans()).toBe(2);
+  });
+
+  it('reloads when an older OpenLore rewrites the marker after a rebuild', async () => {
+    const { utimes } = await import('node:fs/promises');
+    expect(await names('alpha')).toEqual(['alpha']);
+    legacy.points.set('pid-alpha', { ...point('alpha', [1, 0, 0, 0]), payload: { ...point('alpha', [1, 0, 0, 0]).payload, text: 'alpha renamed' } });
+    await utimes(marker, new Date('2026-02-02T00:00:00Z'), new Date('2026-02-02T00:00:00Z'));
+    expect(await names('renamed')).toEqual(['alpha']);
+    expect(fullScans()).toBe(2);
+  });
+});
