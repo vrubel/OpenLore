@@ -17,6 +17,7 @@ import { handleOrient, orientUnavailableReason } from './orient.js';
 import { handleSearchSpecs } from './semantic.js';
 import { handleAnalyzeImpact } from './graph.js';
 import { writeTarget } from '../write-target.js';
+import type { IndexCapability } from '../../analyzer/index-capabilities.js';
 
 // ============================================================================
 // INTERNAL TYPES  (narrow slices of handler outputs we actually use)
@@ -43,7 +44,7 @@ interface OrientResult {
     score: number;
   }>;
   matchingSpecs?: Array<{ domain: string; section: string; title: string; score: number; text: string }>;
-  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
+  indexes?: { functions?: IndexCapability | null };
   error?: string;
 }
 
@@ -74,6 +75,17 @@ interface ImpactResult {
 function orientFailures(orient: OrientResult): string[] {
   const reason = orientUnavailableReason(orient);
   return reason ? [reason] : [];
+}
+
+/**
+ * Orient's code-lane state, carried in the handler's own result under orient's own
+ * name (`indexes.functions`): MCP telemetry reads the search state from the result,
+ * and these tools search through orient (PDLC-2785, D11). Absent when orient refused
+ * the arguments and searched nothing.
+ */
+function orientIndexes(orient: OrientResult): { indexes?: { functions: IndexCapability } } {
+  const functions = orient.indexes?.functions;
+  return functions ? { indexes: { functions } } : {};
 }
 
 // ============================================================================
@@ -359,6 +371,7 @@ export async function handleGenerateChangeProposal(
     nextStep: `Review and complete openspec/changes/${safeSlug}/proposal.md, then run: openspec specs ${safeSlug}`,
     orientErrors: orientFailures(orient),
     specSearchErrors: specSearch.error ? [specSearch.error] : [],
+    ...orientIndexes(orient),
   };
 }
 
@@ -544,5 +557,6 @@ export async function handleAnnotateStory(
       : 'critical',
     blocked: maxRisk !== null && maxRisk >= 70,
     orientErrors: orientFailures(orient),
+    ...orientIndexes(orient),
   };
 }

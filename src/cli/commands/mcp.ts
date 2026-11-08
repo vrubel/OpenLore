@@ -1931,12 +1931,15 @@ interface SearchIndexState {
  * still work. Telemetry therefore reads the state from the result; otherwise the call
  * is logged as a successful empty search, indistinguishable from "nothing matched".
  *
- * The lane a tool answers from: orient — its code lane; search_code — its index, or
- * the code lane it fell back from to literal text; suggest_insertion_points and
- * search_specs — their index. search_unified searches several lanes as equals: an
- * unavailable lane is reported (its mode and reason) even when another answered —
- * `degraded: 'partial'` — and otherwise the weakest answering lane, so a degraded
- * answer shows. Not a search result → null, and the telemetry line keeps its former shape.
+ * The lane a tool answers from: orient, and the tools that search through it
+ * (generate_change_proposal, annotate_story) — orient's code lane, which they carry
+ * as `indexes.functions`; search_code — its index, or the code lane it fell back from
+ * to literal text; suggest_insertion_points and search_specs — their index.
+ * search_unified (its lanes) and working_set_context (one orient per target) search
+ * several lanes as equals: an unavailable lane is reported (its mode and reason) even
+ * when another answered — `degraded: 'partial'` — and otherwise the weakest answering
+ * lane, so a degraded answer shows. Not a search result → null, and the telemetry
+ * line keeps its former shape.
  */
 function searchIndexState(tool: string, result: unknown): SearchIndexState | null {
   if (!result || typeof result !== 'object') return null;
@@ -1947,13 +1950,20 @@ function searchIndexState(tool: string, result: unknown): SearchIndexState | nul
     ({ index_mode: c.mode, index_reason: c.reason?.code ?? null, degraded });
   const single = (c: IndexCapability | null): SearchIndexState | null =>
     c ? state(c, c.mode === 'unavailable' ? 'unavailable' : null) : null;
-  if (tool === 'orient') return single(lane(r.indexes?.functions));
-  if (tool === 'search_unified') {
-    const lanes = Object.values(r.indexes ?? {}).map(lane).filter((c): c is IndexCapability => c !== null);
+  const several = (values: unknown[]): SearchIndexState | null => {
+    const lanes = values.map(lane).filter((c): c is IndexCapability => c !== null);
     const down = lanes.find(c => c.mode === 'unavailable');
     if (down) return state(down, lanes.every(c => c.mode === 'unavailable') ? 'unavailable' : 'partial');
     const weakest = lanes.find(c => c.mode === 'text') ?? lanes[0];
     return weakest ? state(weakest, null) : null;
+  };
+  if (tool === 'orient' || tool === 'generate_change_proposal' || tool === 'annotate_story') {
+    return single(lane(r.indexes?.functions));
+  }
+  if (tool === 'search_unified') return several(Object.values(r.indexes ?? {}));
+  if (tool === 'working_set_context') {
+    const targets = (result as { targets?: unknown }).targets;
+    return several(Array.isArray(targets) ? targets.map(t => (t as { index?: unknown } | null)?.index) : []);
   }
   return single(lane(r.index) ?? lane(r.indexDiagnostics?.functions));
 }

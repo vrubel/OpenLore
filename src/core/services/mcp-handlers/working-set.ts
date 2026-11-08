@@ -32,6 +32,7 @@ import { isPathAllowed } from './root-allowlist.js';
 import { handleSpecStoreStatus, type SpecStoreStatusReport } from './spec-store.js';
 import { handleOrient, orientUnavailableReason } from './orient.js';
 import { applyTokenBudget, omissionNote } from './progressive.js';
+import type { IndexCapability } from '../../analyzer/index-capabilities.js';
 
 /** Default token budget for the whole merged briefing when none is supplied. */
 const DEFAULT_WORKING_SET_BUDGET = 8_000;
@@ -101,6 +102,8 @@ export interface WorkingSetTargetBrief {
   specDomains: string[];
   /** In-scope anchored decisions/constraints with a freshness verdict. */
   anchoredIntent: AnchoredIntent[];
+  /** Orient's code-lane state for this target, when orientation searched it (telemetry reads it, D11). */
+  index?: IndexCapability;
 }
 
 export interface WorkingSetContextReport {
@@ -137,7 +140,7 @@ interface OrientFnView {
 export interface OrientView {
   error?: string;
   /** Per-lane search state; `functions.mode: 'unavailable'` means no code context (see orientUnavailableReason). */
-  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
+  indexes?: { functions?: IndexCapability | null };
   relevantFunctions?: OrientFnView[];
   callPaths?: Array<{ function: string; filePath: string; callers?: Array<{ name: string }> }>;
   specDomains?: Array<{ domain: string }>;
@@ -209,6 +212,7 @@ export function briefTargetFromOrient(
       })),
       specDomains: fnDomains,
       anchoredIntent,
+      ...(orient.indexes?.functions ? { index: orient.indexes.functions } : {}),
     },
   };
 }
@@ -469,7 +473,10 @@ export async function handleWorkingSetContext(
 
     const unavailable = orientUnavailableReason(orient);
     if (unavailable) {
-      targets.push({ target: t.name, briefed: false, reason: unavailable, insertionPoints: [], specDomains: [], anchoredIntent: [] });
+      targets.push({
+        target: t.name, briefed: false, reason: unavailable, insertionPoints: [], specDomains: [], anchoredIntent: [],
+        ...(orient.indexes?.functions ? { index: orient.indexes.functions } : {}),
+      });
       findings.push({
         code: 'orient-unavailable', severity: 'warn', subject: t.name,
         message: `Target "${t.name}" could not be oriented: ${unavailable}`,
