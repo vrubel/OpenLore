@@ -315,9 +315,12 @@ export class VectorIndex {
     for (const fsm of signatures) {
       for (const entry of fsm.entries) {
         const syntheticId = `${fsm.path}::${entry.name}`;
-        if (nodeIds.has(syntheticId)) continue; // already covered by call graph
+        // Already covered by the call graph or by an earlier entry of the same
+        // name (`export const User` + `export type User`): one record per id.
+        if (nodeIds.has(syntheticId)) continue;
         // Skip if any call graph node from this file matches the name
         if (nodes.some(n => n.filePath === fsm.path && n.name === entry.name)) continue;
+        nodeIds.add(syntheticId);
         const sig = entry.signature ?? '';
         const doc = entry.docstring ?? '';
         candidates.push({
@@ -501,8 +504,10 @@ export class VectorIndex {
       if (!changedFilePaths.has(fsm.path)) continue;
       for (const entry of fsm.entries) {
         const syntheticId = `${fsm.path}::${entry.name}`;
+        // One record per id, as in build(): the first entry of a repeated name wins.
         if (nodeIds.has(syntheticId)) continue;
         if (nodes.some((n) => n.filePath === fsm.path && n.name === entry.name)) continue;
+        nodeIds.add(syntheticId);
         const sig = entry.signature ?? '';
         const doc = entry.docstring ?? '';
         candidates.push({

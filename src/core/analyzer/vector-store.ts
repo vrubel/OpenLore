@@ -89,6 +89,13 @@ export class IndexUnavailable extends Error {
   }
 }
 
+/** A new search generation could not be stored; the published generation stays current. */
+export class IndexPublicationError extends Error {
+  constructor(cause: unknown) {
+    super('Publishing the search index failed: ' + (cause instanceof Error ? cause.message : String(cause)), { cause });
+  }
+}
+
 export function indexIssue(error: unknown): IndexIssue {
   return error instanceof IndexUnavailable
     ? { code: error.code, message: error.message }
@@ -306,6 +313,10 @@ export async function publishVectorIndex(
     throw new IndexUnavailable('index-invalid', 'A pinned index reader cannot publish search data.');
   }
   db = assertPathAllowed(db, 'write');
+  // One record per id: Qdrant keeps one point per id, so the count and the source
+  // digest must describe the set every backend stores. A later record replaces an
+  // earlier one, as a repeated upsert does.
+  records = [...new Map(records.map(row => [row.id, row])).values()];
   const dim = records[0]?.vector?.length ?? 0;
   if (records.some(row => (row.vector?.length ?? 0) !== dim || row.vector?.some(value => !Number.isFinite(value)))) {
     throw new IndexUnavailable('embedding-mismatch', 'Cannot publish a search index with mixed or invalid vector dimensions.');
@@ -341,7 +352,7 @@ export async function publishVectorIndex(
     renameSync(tmp, target);
   } catch (error) {
     discardLocalGeneration(db, descriptor);
-    throw error;
+    throw new IndexPublicationError(error);
   } finally {
     try { unlinkSync(tmp); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
