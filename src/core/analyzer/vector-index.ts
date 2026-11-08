@@ -16,7 +16,8 @@
  *   const results = await VectorIndex.search(outputDir, "authenticate user with JWT", embedSvc);
  */
 
-import { writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { FunctionNode } from './call-graph.js';
 import type { FileSignatureMap } from './signature-extractor.js';
@@ -86,6 +87,14 @@ export interface VectorIndexMeta {
 async function writeMeta(outputDir: string, meta: VectorIndexMeta): Promise<void> {
   await writeFile(join(outputDir, META_FILE), JSON.stringify(meta, null, 2) + '\n', 'utf-8');
 }
+
+/**
+ * Lag marker, sibling to the meta sidecar: an incremental update was refused, so
+ * the graph holds changes the semantic index lacks. Graph hashes are already
+ * stored, so a repeated incremental pass would not retry those files; the marker
+ * keeps every `reindex` failing until a full build() removes it.
+ */
+const BEHIND_FILE = 'vector-index-behind.json';
 
 /** Convert a raw LanceDB row to a FunctionRecord (without the vector field). */
 function rowToRecord(row: Record<string, unknown>): Omit<FunctionRecord, 'vector'> {
@@ -257,7 +266,10 @@ function findSignatureEntry(
  */
 export class VectorIndexRebuildRequired extends Error {
   static readonly recovery = 'openlore analyze --embed --force';
-  constructor(readonly reason: 'legacy-index' | 'no-embedder' | 'model-differs' | 'dimension-differs', detail: string) {
+  constructor(
+    readonly reason: 'legacy-index' | 'no-embedder' | 'model-differs' | 'dimension-differs' | 'vectors-behind',
+    readonly detail: string,
+  ) {
     super(`${detail} The index was left unchanged; rebuild it with \`${VectorIndexRebuildRequired.recovery}\`.`);
     this.name = 'VectorIndexRebuildRequired';
   }
@@ -386,6 +398,7 @@ export class VectorIndex {
         hasEmbeddings: false, dim: 0, model: null,
         builtAt: new Date().toISOString(), schemaVersion: META_SCHEMA_VERSION,
       });
+      await rm(join(outputDir, BEHIND_FILE), { force: true });   // the index now matches the analysis
       _bm25Cache.delete(dbPath);
       return { embedded: 0, reused: 0, total: candidates.length, hasEmbeddings: false };
     }
@@ -466,6 +479,8 @@ export class VectorIndex {
       builtAt: new Date().toISOString(),
       schemaVersion: META_SCHEMA_VERSION,
     });
+
+    await rm(join(outputDir, BEHIND_FILE), { force: true });   // the index now matches the analysis
 
     // Invalidate search caches — index was just rebuilt
     _bm25Cache.delete(dbPath);
@@ -575,7 +590,7 @@ export class VectorIndex {
     // is published — neither a keyword-only nor a partial index — and a full analysis
     // must rebuild it; the published index stays as it was.
     const blocker = incrementalUpdateBlocker(previous.identity, embedSvc, candidates.length > 0);
-    if (blocker) throw blocker;
+    if (blocker) throw await VectorIndex.refused(outputDir, blocker);
     const existingRows = await previous.backend.loadAll() as VectorRecord[];
     const survivors = existingRows.filter(row => !changedFilePaths.has(row.filePath as string));
     const vectorsByInput = new Map(existingRows.map(row => [JSON.stringify([row.id, row.text]), row.vector]));
@@ -591,7 +606,7 @@ export class VectorIndex {
       const pending = candidates.filter(row => vectorsByInput.get(JSON.stringify([row.id, row.text]))?.length !== dim);
       const vectors = await embedSvc!.embed(pending.map(row => row.text));
       if (vectors.length !== pending.length || vectors.some(vector => vector.length !== dim)) {
-        throw new VectorIndexRebuildRequired('dimension-differs', 'The embedding backend returned vectors that do not match the saved semantic index.');
+        throw await VectorIndex.refused(outputDir, new VectorIndexRebuildRequired('dimension-differs', 'The embedding backend returned vectors that do not match the saved semantic index.'));
       }
       for (const [i, row] of pending.entries()) vectorsByInput.set(JSON.stringify([row.id, row.text]), vectors[i]);
       const changed = candidates.map(row => ({ ...row, vector: vectorsByInput.get(JSON.stringify([row.id, row.text]))! }));
@@ -620,6 +635,12 @@ export class VectorIndex {
     outputDir: string, embedSvc: EmbeddingService | null | undefined,
   ): Promise<VectorIndexRebuildRequired | null> {
     if (!VectorIndex.exists(outputDir)) return null;
+    const behind = join(outputDir, BEHIND_FILE);
+    if (existsSync(behind)) {
+      const earlier = await readFile(behind, 'utf-8').then(raw => String(JSON.parse(raw)?.detail ?? ''), () => '');
+      return new VectorIndexRebuildRequired('vectors-behind',
+        'An earlier incremental update could not reach the saved semantic index' + (earlier ? ` (${earlier})` : '') + ', so it lacks those changes.');
+    }
     let identity: IndexIdentity;
     try {
       identity = (await openStoredVectorIndex(join(outputDir, DB_FOLDER), TABLE_NAME)).identity;
@@ -627,6 +648,18 @@ export class VectorIndex {
       return null;
     }
     return incrementalUpdateBlocker(identity, embedSvc, true);
+  }
+
+  /** Record the refusal as a lag marker, then hand it back to be thrown. */
+  private static async refused(outputDir: string, refusal: VectorIndexRebuildRequired): Promise<VectorIndexRebuildRequired> {
+    // A pinned reader writes nothing. A marker that cannot be written leaves this
+    // run's refusal loud; only the memory for later runs is lost.
+    if (process.env.OPENLORE_PINNED_INDEX !== '1') {
+      await writeFile(join(outputDir, BEHIND_FILE),
+        JSON.stringify({ reason: refusal.reason, detail: refusal.detail, at: new Date().toISOString() }) + '\n', 'utf-8',
+      ).catch(() => {});
+    }
+    return refusal;
   }
 
   /**
