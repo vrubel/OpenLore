@@ -16,6 +16,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { VectorIndex, _resetVectorIndexCachesForTesting } from '../../core/analyzer/vector-index.js';
 import { SpecVectorIndex } from '../../core/analyzer/spec-vector-index.js';
+import { addRepo } from '../../core/federation/registry.js';
 import type { FunctionNode } from '../../core/analyzer/call-graph.js';
 import type { FileSignatureMap } from '../../core/analyzer/signature-extractor.js';
 
@@ -142,5 +143,46 @@ describe('openlore mcp: состояние поискового индекса �
     expect((await call(client, 'search_unified', { directory: repo, query: 'authenticate' })).isError).toBeFalsy();
     const line = telemetry(repo, 'mcp').find(r => r.event === 'tool_call' && r.tool === 'search_unified');
     expect(line).toMatchObject({ outcome: 'partial', index_mode: 'unavailable', index_reason: 'missing-index' });
+  }, 120_000);
+
+  // Суд по openlore#15, находка 4: инструменты, которые зовут orient внутри себя,
+  // писали outcome 'ok' без полей индекса, когда поиск по коду был недоступен.
+  it('инструменты поверх orient: недоступный индекс кода — тот же исход и поля, что у orient', async () => {
+    const root = mk('consumers');
+    const api = join(root, 'api');
+    const home = join(root, 'home');
+    const store = join(root, 'plans');
+    mkdirSync(join(api, '.openlore', 'analysis'), { recursive: true });
+    // Проиндексирован для реестра, но таблица поиска не опубликована.
+    writeFileSync(join(api, '.openlore', 'analysis', 'fingerprint.json'), JSON.stringify({ hash: 'h' }));
+    mkdirSync(join(api, 'stories'), { recursive: true });
+    writeFileSync(join(api, 'stories', 'US-1.md'), '# US-1\n\n## Tasks\n\n- [ ] do it\n');
+    mkdirSync(join(home, '.openlore'), { recursive: true });
+    writeFileSync(join(home, '.openlore', 'config.json'), JSON.stringify({
+      version: '1.0.0', projectType: 'library', openspecPath: 'openspec',
+      analysis: { maxFiles: 1000, includePatterns: [], excludePatterns: [] },
+      generation: { model: 'x', domains: 'auto' },
+      createdAt: new Date().toISOString(), lastRun: null,
+      specStore: { name: 'plans', path: store, targets: ['api'] },
+    }));
+    addRepo(home, api, { name: 'api' });
+    mkdirSync(join(store, 'openspec', 'changes', 'feat-x'), { recursive: true });
+    writeFileSync(join(store, 'openspec', 'changes', 'feat-x', 'proposal.md'), '# Feat X\n\n## Why\n\nReason for X.');
+    client = await connect(root);                           // периметр по умолчанию — весь root
+
+    const calls: Array<[string, string, Record<string, unknown>]> = [
+      ['generate_change_proposal', api, { description: 'Add payment retry', slug: 'add-payment-retry' }],
+      ['annotate_story', api, { storyFilePath: 'stories/US-1.md', description: 'Add payment retry' }],
+      ['working_set_context', home, { change: 'feat-x' }],
+    ];
+    for (const [tool, directory, args] of calls) {
+      const res = await call(client, tool, { directory, ...args });
+      expect(res.isError, `${tool}: ${res.text}`).toBeFalsy();
+      expect(res.text, `${tool}: агент видит недоступность`).toMatch(/No saved search index/);
+      const line = telemetry(directory, 'mcp').find(r => r.event === 'tool_call' && r.tool === tool);
+      expect(line, `${tool}: строка tool_call`).toMatchObject({
+        outcome: 'unavailable', index_mode: 'unavailable', index_reason: 'missing-index',
+      });
+    }
   }, 120_000);
 });
