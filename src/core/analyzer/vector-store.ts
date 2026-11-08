@@ -195,10 +195,13 @@ function readLegacyMeta(db: string, table: IndexTable): { dim: number; model: st
   return { dim: meta.dim, model: meta.hasEmbeddings ? meta.model || null : null };
 }
 
-function localKey(db: string, table: string, kind: 'file' | 'lance'): string {
-  const path = kind === 'file' ? filePath(db, table) : lancePath(db, table);
+function statKey(path: string): number[] {
   const stat = statSync(assertPathAllowed(path, 'read'));
-  return JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
+}
+
+function localKey(db: string, table: string, kind: 'file' | 'lance'): string {
+  return JSON.stringify(statKey(kind === 'file' ? filePath(db, table) : lancePath(db, table)));
 }
 
 function localBackend(db: string, table: string, kind: 'file' | 'lance', expected?: Descriptor): FileBackend | LanceBackend {
@@ -259,7 +262,11 @@ export async function openStoredVectorIndex(
         throw new IndexUnavailable('collection-binding-mismatch', 'The legacy Qdrant vector schema differs from its index metadata.', kind);
       }
       const identity = { table, generation: null, source_sha256: null, model: meta?.model ?? null, dim };
-      return { backend: remote, kind, identity, cacheKey: randomUUID() };
+      // No generation proves this collection unchanged. A legacy build rewrites the
+      // marker when it finishes and changes the point count while it runs, so the
+      // marker's stat and the reported point count are a cheap signal to reload on.
+      const state = [name, statKey(markerPath(db, table)), remote.pointsCount, dim, meta];
+      return { backend: remote, kind, identity, cacheKey: 'legacy:qdrant:' + JSON.stringify(state) };
     }
     if (!file && !lance) {
       throw new IndexUnavailable('missing-index', 'No saved search index for this table. Run OpenLore analysis to build it.');
@@ -596,6 +603,8 @@ class QdrantBackend implements VectorBackend {
   readonly proof: string | null;
   /** Qdrant confirmed creating this generation's collection (set by build()). */
   created = false;
+  /** `points_count` from the last collection info read by verify(). */
+  pointsCount: unknown = null;
   private readonly url: string;
   private readonly base: string;
 
@@ -672,6 +681,7 @@ class QdrantBackend implements VectorBackend {
       expected ? this.req('POST', '/points/count', { exact: true }, signal, true) : null,
       expected ? this.req('POST', '/points/scroll', { limit: 1, with_payload: [PROOF_FIELD], with_vector: false }, signal, true) : null,
     ]);
+    this.pointsCount = info?.points_count ?? null;
     const vectors = info?.config?.params?.vectors;
     const dim = vectors?.size;
     if (!Number.isSafeInteger(dim) || dim <= 0 || vectors.distance !== 'Cosine' ||
