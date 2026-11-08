@@ -296,6 +296,29 @@ describe('handleWorkingSetContext', () => {
     expect(report.findings.some(f => f.code === 'no-briefable-targets')).toBe(true);
   });
 
+  // PDLC-2785 D12: orient no longer RETURNS `error` when its code search is
+  // unavailable — it answers with `indexes.functions.mode: 'unavailable'` and empty
+  // lists. An indexed target (fingerprint present) whose search table was never
+  // published is exactly that; the real orient runs here, no mock of its shape.
+  it('an indexed target whose code search is unavailable is not briefed (orient-unavailable)', async () => {
+    const api = makeRepo('api', 'h');              // indexed for the registry, no search table
+    addRepo(home, api, { name: 'api' });
+    const store = makeRepo('plans', null);
+    writeBinding({ name: 'plans', path: store, targets: ['api'] });
+    writeChange(store, 'feat-x', '# Feat X\n\n## Why\n\nReason for X.');
+
+    const report = await handleWorkingSetContext(home, 'feat-x');
+    const target = report.targets.find(t => t.target === 'api');
+    expect(target?.briefed).toBe(false);
+    expect(target?.reason).toMatch(/No saved search index/);
+    const finding = report.findings.find(f => f.code === 'orient-unavailable');
+    expect(finding?.subject).toBe('api');
+    expect(finding?.message).toMatch(/No saved search index/);
+    expect(report.ready).toBe(false);
+    expect(report.findings.some(f => f.code === 'no-briefable-targets')).toBe(true);
+    expect(() => assertConclusionShape('working_set_context', report)).not.toThrow();
+  });
+
   it('surfaces declared scope and an unsound binding as a warning while still reporting', async () => {
     const api = makeRepo('api', null);
     addRepo(home, api, { name: 'api' });
