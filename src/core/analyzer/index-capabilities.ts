@@ -3,7 +3,7 @@ import { EmbeddingService } from './embedding-service.js';
 import { readOpenLoreConfig } from '../services/config-manager.js';
 import { openloreReadTarget } from '../services/write-target.js';
 import {
-  IndexUnavailable, indexIssue, openStoredVectorIndex,
+  IndexUnavailable, embeddingModelMatch, indexIssue, openStoredVectorIndex,
   type BackendKind, type IndexIdentity, type IndexIssue, type IndexTable, type StoredIndex,
 } from './vector-store.js';
 
@@ -34,7 +34,7 @@ export function unavailableIndex(error: unknown): IndexCapability {
 
 function available(index: StoredIndex, embedder: EmbeddingService | null | undefined): IndexCapability {
   const identity = index.identity;
-  const reason = identity.dim > 0 && (!embedder?.modelName || identity.model !== embedder.modelName)
+  const reason = identity.dim > 0 && (!embedder || embeddingModelMatch(identity.model, embedder.modelName) === 'different')
     ? { code: 'embedding-mismatch' as const, message: 'The configured embedding model is unavailable or differs from this index. Keyword search is available.' }
     : null;
   return {

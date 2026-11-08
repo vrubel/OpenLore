@@ -83,6 +83,19 @@ export interface IndexIssue {
   message: string;
 }
 
+export type EmbeddingModelMatch = 'same' | 'different' | 'unknown';
+
+/**
+ * The one embedding-model rule shared by the index writer and the reader. A name
+ * missing on either side is unknown (the distributed embedder carries its own
+ * model, `EMBEDDER_URL` without `EMBED_MODEL`), and unknown is not different: the
+ * vector dimension is still checked wherever stored and new vectors meet.
+ */
+export function embeddingModelMatch(stored: string | null | undefined, configured: string | null | undefined): EmbeddingModelMatch {
+  if (!stored || !configured) return 'unknown';
+  return stored === configured ? 'same' : 'different';
+}
+
 export class IndexUnavailable extends Error {
   constructor(readonly code: IndexIssue['code'], message: string, readonly backend: BackendKind | null = null) {
     super(message);

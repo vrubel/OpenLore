@@ -22,7 +22,9 @@ import type { FunctionNode } from './call-graph.js';
 import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { getSkeletonContent, isSkeletonWorthIncluding } from './code-shaper.js';
-import { hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex, type VectorBackend, type VectorRecord } from './vector-store.js';
+import {
+  embeddingModelMatch, hasStoredVectorIndex, openStoredVectorIndex, publishVectorIndex, type VectorBackend, type VectorRecord,
+} from './vector-store.js';
 import { searchVector, type SearchStatus } from './index-capabilities.js';
 
 // ============================================================================
@@ -352,10 +354,10 @@ export class VectorIndex {
     }
 
     const cachedVectors = new Map<string, number[]>();
-    if (incremental && embedSvc.modelName && VectorIndex.exists(outputDir)) {
+    if (incremental && VectorIndex.exists(outputDir)) {
       try {
         const existing = await openStoredVectorIndex(dbPath, TABLE_NAME);
-        if (existing.identity.generation && existing.identity.model === embedSvc.modelName) {
+        if (existing.identity.generation && embeddingModelMatch(existing.identity.model, embedSvc.modelName) !== 'different') {
           for (const row of await existing.backend.loadAll()) {
             const vector = Array.from((row.vector ?? []) as ArrayLike<number>);
             if (vector.length === existing.identity.dim && vector.length > 0) {
@@ -531,7 +533,7 @@ export class VectorIndex {
     const existingRows = await previous.backend.loadAll() as VectorRecord[];
     const survivors = existingRows.filter(row => !changedFilePaths.has(row.filePath as string));
     const { model, dim, generation } = previous.identity;
-    const compatible = Boolean(generation && model && embedSvc?.modelName === model);
+    const compatible = Boolean(generation && embedSvc && embeddingModelMatch(model, embedSvc.modelName) !== 'different');
     const vectorsByInput = new Map(existingRows.map(row => [JSON.stringify([row.id, row.text]), row.vector]));
     let reused = 0;
     let embedded = 0;
