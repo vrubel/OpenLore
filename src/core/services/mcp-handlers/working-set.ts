@@ -30,7 +30,7 @@ import { resolve, join, basename } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
 import { isPathAllowed } from './root-allowlist.js';
 import { handleSpecStoreStatus, type SpecStoreStatusReport } from './spec-store.js';
-import { handleOrient, orientUnavailableReason } from './orient.js';
+import { handleOrient, orientUnavailableReason, withSearchLanes } from './orient.js';
 import { applyTokenBudget, omissionNote } from './progressive.js';
 import type { IndexCapability } from '../../analyzer/index-capabilities.js';
 
@@ -102,8 +102,6 @@ export interface WorkingSetTargetBrief {
   specDomains: string[];
   /** In-scope anchored decisions/constraints with a freshness verdict. */
   anchoredIntent: AnchoredIntent[];
-  /** Orient's code-lane state for this target, when orientation searched it (telemetry reads it, D11). */
-  index?: IndexCapability;
 }
 
 export interface WorkingSetContextReport {
@@ -212,7 +210,6 @@ export function briefTargetFromOrient(
       })),
       specDomains: fnDomains,
       anchoredIntent,
-      ...(orient.indexes?.functions ? { index: orient.indexes.functions } : {}),
     },
   };
 }
@@ -440,6 +437,8 @@ export async function handleWorkingSetContext(
   const briefable = status.targets.filter(t => t.resolved && t.state === 'indexed' && t.path);
   const targets: WorkingSetTargetBrief[] = [];
   const allItems: WorkingSetItem[] = [];
+  // Orient's code lane per oriented target — for telemetry, beside the report (D11).
+  const searched: Array<IndexCapability | null | undefined> = [];
 
   for (const t of status.targets) {
     if (!briefable.includes(t)) {
@@ -460,6 +459,7 @@ export async function handleWorkingSetContext(
     let orient: OrientView;
     try {
       orient = (await handleOrient(t.path!, intent, limit)) as OrientView;
+      searched.push(orient.indexes?.functions);
     } catch (err) {
       const reason = `Orientation failed: ${err instanceof Error ? err.message : String(err)}`;
       targets.push({ target: t.name, briefed: false, reason, insertionPoints: [], specDomains: [], anchoredIntent: [] });
@@ -473,10 +473,7 @@ export async function handleWorkingSetContext(
 
     const unavailable = orientUnavailableReason(orient);
     if (unavailable) {
-      targets.push({
-        target: t.name, briefed: false, reason: unavailable, insertionPoints: [], specDomains: [], anchoredIntent: [],
-        ...(orient.indexes?.functions ? { index: orient.indexes.functions } : {}),
-      });
+      targets.push({ target: t.name, briefed: false, reason: unavailable, insertionPoints: [], specDomains: [], anchoredIntent: [] });
       findings.push({
         code: 'orient-unavailable', severity: 'warn', subject: t.name,
         message: `Target "${t.name}" could not be oriented: ${unavailable}`,
@@ -511,7 +508,7 @@ export async function handleWorkingSetContext(
     : `Working set for change "${id}" on store "${store.name}": no briefable targets` +
       (errors ? `, ${errors} blocking issue(s)` : '') + '.';
 
-  return {
+  return withSearchLanes({
     bound: true,
     store,
     change: {
@@ -525,5 +522,5 @@ export async function handleWorkingSetContext(
     findings,
     ready,
     summary,
-  };
+  }, searched);
 }

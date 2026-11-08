@@ -13,7 +13,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
-import { handleOrient, orientUnavailableReason } from './orient.js';
+import { handleOrient, orientUnavailableReason, withSearchLanes } from './orient.js';
 import { handleSearchSpecs } from './semantic.js';
 import { handleAnalyzeImpact } from './graph.js';
 import { writeTarget } from '../write-target.js';
@@ -75,17 +75,6 @@ interface ImpactResult {
 function orientFailures(orient: OrientResult): string[] {
   const reason = orientUnavailableReason(orient);
   return reason ? [reason] : [];
-}
-
-/**
- * Orient's code-lane state, carried in the handler's own result under orient's own
- * name (`indexes.functions`): MCP telemetry reads the search state from the result,
- * and these tools search through orient (PDLC-2785, D11). Absent when orient refused
- * the arguments and searched nothing.
- */
-function orientIndexes(orient: OrientResult): { indexes?: { functions: IndexCapability } } {
-  const functions = orient.indexes?.functions;
-  return functions ? { indexes: { functions } } : {};
 }
 
 // ============================================================================
@@ -358,7 +347,8 @@ export async function handleGenerateChangeProposal(
     ? Math.max(...impacts.map(i => i.riskScore ?? 0))
     : null;
 
-  return {
+  // orient's code lane goes to telemetry beside the result, never into it (D11).
+  return withSearchLanes({
     slug: safeSlug,
     proposalPath: join('openspec', 'changes', safeSlug, 'proposal.md'),
     domainsAffected: domains,
@@ -371,8 +361,7 @@ export async function handleGenerateChangeProposal(
     nextStep: `Review and complete openspec/changes/${safeSlug}/proposal.md, then run: openspec specs ${safeSlug}`,
     orientErrors: orientFailures(orient),
     specSearchErrors: specSearch.error ? [specSearch.error] : [],
-    ...orientIndexes(orient),
-  };
+  }, [orient.indexes?.functions]);
 }
 
 // ============================================================================
@@ -545,7 +534,7 @@ export async function handleAnnotateStory(
     : null;
   const domains = (orient.specDomains ?? []).map(d => d.domain);
 
-  return {
+  return withSearchLanes({
     storyFile: storyFilePath,
     domainsAffected: domains,
     functionsFound: (orient.relevantFunctions ?? []).length,
@@ -557,6 +546,5 @@ export async function handleAnnotateStory(
       : 'critical',
     blocked: maxRisk !== null && maxRisk >= 70,
     orientErrors: orientFailures(orient),
-    ...orientIndexes(orient),
-  };
+  }, [orient.indexes?.functions]);
 }

@@ -180,6 +180,29 @@ export function orientUnavailableReason(result: {
   return functions.reason?.message ?? 'The code search index is unavailable.';
 }
 
+/**
+ * Search lanes a tool's result was built from, kept OFF the result (PDLC-2785, D11).
+ *
+ * Tools that search through orient (generate_change_proposal, annotate_story,
+ * working_set_context) must let MCP telemetry see orient's code-lane state, but their
+ * response is model input and must not change. A WeakMap keyed by the result object
+ * is invisible to `JSON.stringify` (the MCP response is the serialized result) and
+ * dies with the object. The serve daemon returns a parsed copy, so a call delegated
+ * there carries no lanes and is logged as before.
+ */
+const searchLanes = new WeakMap<object, IndexCapability[]>();
+
+/** Attach the lanes `result` was searched with; returns `result` unchanged. */
+export function withSearchLanes<T extends object>(result: T, lanes: Array<IndexCapability | null | undefined>): T {
+  searchLanes.set(result, lanes.filter((c): c is IndexCapability => c != null));
+  return result;
+}
+
+/** The lanes attached by {@link withSearchLanes}, or undefined. */
+export function searchLanesOf(result: unknown): IndexCapability[] | undefined {
+  return result !== null && typeof result === 'object' ? searchLanes.get(result) : undefined;
+}
+
 // ============================================================================
 // HANDLER
 // ============================================================================

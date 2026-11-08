@@ -66,6 +66,7 @@ import type { PanicResponseMode } from '../../types/index.js';
 import { readPanicState, mutatePanicStateLocked, getPanicSignalText } from '../../core/services/mcp-handlers/panic-response.js';
 import { emit } from '../../core/services/telemetry.js';
 import type { IndexCapability } from '../../core/analyzer/index-capabilities.js';
+import { searchLanesOf } from '../../core/services/mcp-handlers/orient.js';
 import { readOpenLoreConfig } from '../../core/services/config-manager.js';
 import { MCP_TOOL_MAX_BYTES } from '../../constants.js';
 import {
@@ -1931,10 +1932,11 @@ interface SearchIndexState {
  * still work. Telemetry therefore reads the state from the result; otherwise the call
  * is logged as a successful empty search, indistinguishable from "nothing matched".
  *
- * The lane a tool answers from: orient, and the tools that search through it
- * (generate_change_proposal, annotate_story) — orient's code lane, which they carry
- * as `indexes.functions`; search_code — its index, or the code lane it fell back from
- * to literal text; suggest_insertion_points and search_specs — their index.
+ * The lane a tool answers from: orient — its code lane; the tools that search through
+ * orient (generate_change_proposal, annotate_story) — orient's code lane, attached
+ * beside their result by `withSearchLanes`, never inside it (their response is model
+ * input); search_code — its index, or the code lane it fell back from to literal text;
+ * suggest_insertion_points and search_specs — their index.
  * search_unified (its lanes) and working_set_context (one orient per target) search
  * several lanes as equals: an unavailable lane is reported (its mode and reason) even
  * when another answered — `degraded: 'partial'` — and otherwise the weakest answering
@@ -1957,14 +1959,10 @@ function searchIndexState(tool: string, result: unknown): SearchIndexState | nul
     const weakest = lanes.find(c => c.mode === 'text') ?? lanes[0];
     return weakest ? state(weakest, null) : null;
   };
-  if (tool === 'orient' || tool === 'generate_change_proposal' || tool === 'annotate_story') {
-    return single(lane(r.indexes?.functions));
-  }
+  if (tool === 'orient') return single(lane(r.indexes?.functions));
+  if (tool === 'generate_change_proposal' || tool === 'annotate_story') return single(searchLanesOf(result)?.[0] ?? null);
   if (tool === 'search_unified') return several(Object.values(r.indexes ?? {}));
-  if (tool === 'working_set_context') {
-    const targets = (result as { targets?: unknown }).targets;
-    return several(Array.isArray(targets) ? targets.map(t => (t as { index?: unknown } | null)?.index) : []);
-  }
+  if (tool === 'working_set_context') return several(searchLanesOf(result) ?? []);
   return single(lane(r.index) ?? lane(r.indexDiagnostics?.functions));
 }
 
