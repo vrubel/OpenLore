@@ -334,9 +334,18 @@ export async function publishVectorIndex(
   }
   db = assertPathAllowed(db, 'write');
   // One record per id: Qdrant keeps one point per id, so the count and the source
-  // digest must describe the set every backend stores. A later record replaces an
-  // earlier one, as a repeated upsert does.
-  records = [...new Map(records.map(row => [row.id, row])).values()];
+  // digest must describe the set every backend stores. An exact repeat is stored
+  // once; two different records with one id are a producer error, refused loudly
+  // rather than losing one of them.
+  const byId = new Map<string, VectorRecord>();
+  for (const row of records) {
+    const prior = byId.get(row.id);
+    if (!prior) byId.set(row.id, row);
+    else if (JSON.stringify(prior) !== JSON.stringify(row)) {
+      throw new IndexPublicationError(new Error(`Two different search records share the id "${row.id}"; ids must be unique before publication.`));
+    }
+  }
+  records = [...byId.values()];
   const dim = records[0]?.vector?.length ?? 0;
   if (records.some(row => (row.vector?.length ?? 0) !== dim || row.vector?.some(value => !Number.isFinite(value)))) {
     throw new IndexUnavailable('embedding-mismatch', 'Cannot publish a search index with mixed or invalid vector dimensions.');
