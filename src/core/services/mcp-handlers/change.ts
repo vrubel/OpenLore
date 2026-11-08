@@ -13,7 +13,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { validateDirectory, safeJoin } from './utils.js';
-import { handleOrient } from './orient.js';
+import { handleOrient, orientUnavailableReason } from './orient.js';
 import { handleSearchSpecs } from './semantic.js';
 import { handleAnalyzeImpact } from './graph.js';
 import { writeTarget } from '../write-target.js';
@@ -43,6 +43,7 @@ interface OrientResult {
     score: number;
   }>;
   matchingSpecs?: Array<{ domain: string; section: string; title: string; score: number; text: string }>;
+  indexes?: { functions?: { mode: string; reason: { message: string } | null } | null };
   error?: string;
 }
 
@@ -67,6 +68,12 @@ interface ImpactResult {
   metrics?: { fanIn: number; fanOut: number; isHub: boolean };
   upstreamChain?: Array<{ name?: string; filePath?: string }>;
   error?: string;
+}
+
+/** `orientErrors` of both handlers: an argument refusal or an unavailable code index. */
+function orientFailures(orient: OrientResult): string[] {
+  const reason = orientUnavailableReason(orient);
+  return reason ? [reason] : [];
 }
 
 // ============================================================================
@@ -350,7 +357,7 @@ export async function handleGenerateChangeProposal(
       ? (maxRisk < 40 ? 'low' : maxRisk < 70 ? 'medium' : maxRisk < 85 ? 'high' : 'critical')
       : 'unknown',
     nextStep: `Review and complete openspec/changes/${safeSlug}/proposal.md, then run: openspec specs ${safeSlug}`,
-    orientErrors: orient.error ? [orient.error] : [],
+    orientErrors: orientFailures(orient),
     specSearchErrors: specSearch.error ? [specSearch.error] : [],
   };
 }
@@ -536,6 +543,6 @@ export async function handleAnnotateStory(
       : maxRisk < 85 ? 'high'
       : 'critical',
     blocked: maxRisk !== null && maxRisk >= 70,
-    orientErrors: orient.error ? [orient.error] : [],
+    orientErrors: orientFailures(orient),
   };
 }
